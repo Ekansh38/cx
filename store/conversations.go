@@ -52,6 +52,11 @@ func (s *Store) ListConversations() ([]*Conversation, error) {
 	return convs, err
 }
 
+func (s *Store) UpdateTitle(id int64, title string) error {
+	_, err := s.db.Exec(`UPDATE conversations SET title = ? WHERE id = ?`, title, id)
+	return err
+}
+
 func (s *Store) UpdateSummary(convID int64, summary string, msgCount int) error {
 	_, err := s.db.Exec(
 		`UPDATE conversations SET summary = ?, message_count = ?, updated_at = ? WHERE id = ?`,

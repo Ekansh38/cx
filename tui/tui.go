@@ -283,6 +283,11 @@ func (t *TUI) ReadLine() (string, error) {
 	}
 }
 
+func (t *TUI) SetStatus(s string) {
+	t.status = s
+	fmt.Print(pos(t.statRow(), 1) + clearLine + t.status)
+}
+
 func (t *TUI) Close() {
 	if t.closed {
 		return
