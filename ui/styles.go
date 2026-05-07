@@ -16,12 +16,11 @@ var (
 
 	// Separator line
 	sepStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("238"))
-
-	// Status bar: dim, no background
-	statusStyle = lipgloss.NewStyle().
-			Faint(true).
 			Foreground(lipgloss.Color("240"))
+
+	// Status bar: plain dim gray, no background
+	statusStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("243"))
 
 	// Command completions shown on separator row
 	completionStyle = lipgloss.NewStyle().
@@ -40,10 +39,9 @@ var (
 	pickerRowStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("252"))
 
-	// Dim text for picker meta info (age)
+	// Dim text for picker meta info (age) and :help output
 	dimStyle = lipgloss.NewStyle().
-			Faint(true).
-			Foreground(lipgloss.Color("240"))
+			Foreground(lipgloss.Color("246"))
 
 	// Picker title
 	pickerTitleStyle = lipgloss.NewStyle().
