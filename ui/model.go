@@ -36,6 +36,7 @@ type tokenMsg string
 type streamEndMsg string
 type titleUpdatedMsg string
 type editorDoneMsg string
+type streamTickMsg struct{}
 
 // ── search result ─────────────────────────────────────────────────────────────
 
@@ -145,6 +146,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case streamTickMsg:
+		if m.streaming {
+			m.refreshContent()
+			if m.atBottom {
+				m.viewport.GotoBottom()
+			}
+			return m, streamTick()
+		}
+		return m, nil
+
 	case tokenMsg:
 		m.streamBuf.WriteString(string(msg))
 		m.refreshContent()
@@ -160,8 +171,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streamCh = nil
 
 		if content != "" {
-			m.store.AddMessage(m.conv.ID, "assistant", content)
-			m.messages = append(m.messages, &store.Message{Role: "assistant", Content: content})
+			if saved, err := m.store.AddMessage(m.conv.ID, "assistant", content); err == nil {
+				m.messages = append(m.messages, saved)
+			} else {
+				m.messages = append(m.messages, &store.Message{Role: "assistant", Content: content})
+			}
 		}
 		m.streamBuf.Reset()
 		m.refreshContent()
@@ -217,8 +231,11 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 			partial := m.streamBuf.String()
 			m.streamBuf.Reset()
 			if partial != "" {
-				m.store.AddMessage(m.conv.ID, "assistant", partial+" [cancelled]")
-				m.messages = append(m.messages, &store.Message{Role: "assistant", Content: partial + " [cancelled]"})
+				if saved, err := m.store.AddMessage(m.conv.ID, "assistant", partial+" [cancelled]"); err == nil {
+					m.messages = append(m.messages, saved)
+				} else {
+					m.messages = append(m.messages, &store.Message{Role: "assistant", Content: partial + " [cancelled]"})
+				}
 			}
 			m.refreshContent()
 			m.viewport.GotoBottom()
@@ -306,8 +323,11 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	m.store.AddMessage(m.conv.ID, "user", input)
-	m.messages = append(m.messages, &store.Message{Role: "user", Content: input})
+	if saved, err := m.store.AddMessage(m.conv.ID, "user", input); err == nil {
+		m.messages = append(m.messages, saved)
+	} else {
+		m.messages = append(m.messages, &store.Message{Role: "user", Content: input})
+	}
 	m.refreshContent()
 	m.viewport.GotoBottom()
 	m.atBottom = true
@@ -335,10 +355,10 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m.enterSearch()
 
 	case ":clear":
-		// Remove display-only messages; keep persisted ones in DB
+		// Remove display-only system annotations (ID=0); keep all persisted messages
 		var kept []*store.Message
 		for _, msg := range m.messages {
-			if msg.Role != "system" || msg.ID != 0 {
+			if msg.ID != 0 {
 				kept = append(kept, msg)
 			}
 		}
@@ -441,6 +461,7 @@ func (m Model) startStream() (Model, tea.Cmd) {
 	return m, tea.Batch(
 		runStream(ctx, m.provider, m.model, msgs, ch),
 		listenToken(ch),
+		streamTick(),
 	)
 }
 
@@ -455,6 +476,12 @@ func runStream(ctx context.Context, prov llm.Provider, model string, msgs []llm.
 		close(ch)
 		return streamEndMsg(content)
 	}
+}
+
+func streamTick() tea.Cmd {
+	return tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg {
+		return streamTickMsg{}
+	})
 }
 
 func listenToken(ch <-chan string) tea.Cmd {
@@ -971,19 +998,14 @@ func (m Model) searchView() string {
 				preview = string([]rune(preview)[:maxPreview-1]) + "…"
 			}
 
-			roleTag := dimStyle.Render(fmt.Sprintf("[%-4s]", role))
-			titleTag := dimStyle.Render(fmt.Sprintf("  %-*s  ", maxTitle, convTitle))
-			previewText := preview
+			age := dimStyle.Render(timeAgo(r.msg.CreatedAt))
+			roleTag := fmt.Sprintf("[%-4s]", role)
+			line := fmt.Sprintf("  %s  %-*s  %s  %s", roleTag, maxTitle, convTitle, preview, age)
 
-			line := roleTag + titleTag + previewText
 			if i == m.searchCursor {
-				sb.WriteString(pickerSelectedStyle.Render(fmt.Sprintf("  %-*s", m.width-2, preview)) + "\n")
-				// show full context on selected
-				_ = line
-				context := roleTag + titleTag + dimStyle.Render(timeAgo(r.msg.CreatedAt))
-				sb.WriteString("  " + context + "\n")
+				sb.WriteString(pickerSelectedStyle.Render(line) + "\n")
 			} else {
-				sb.WriteString(pickerRowStyle.Render("  ") + line + "\n")
+				sb.WriteString(pickerRowStyle.Render(line) + "\n")
 			}
 		}
 		if len(filtered) > maxVisible {
