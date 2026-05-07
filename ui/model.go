@@ -85,6 +85,7 @@ type Model struct {
 // New creates the initial bubbletea model.
 func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*store.Message, prov llm.Provider, modelName, sysPrompt string) Model {
 	ti := textinput.New()
+	ti.Prompt = ""   // we render our own "> " prefix
 	ti.Placeholder = "message..."
 	ti.Focus()
 	ti.CharLimit = 0
