@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
 	"cx/config"
@@ -19,23 +20,31 @@ import (
 	"cx/store"
 )
 
-// ── states ──────────────────────────────────────────────────────────────────
+// ── states ───────────────────────────────────────────────────────────────────
 
 type appState int
 
 const (
 	stateChat   appState = iota
 	statePicker          // conversation picker overlay
+	stateSearch          // inline message search
 )
 
-// ── messages (tea.Msg types) ─────────────────────────────────────────────────
+// ── tea.Msg types ─────────────────────────────────────────────────────────────
 
-type tokenMsg string         // one streaming token
-type streamEndMsg string     // full content when stream finishes (empty = cancelled/err)
-type titleUpdatedMsg string  // auto-generated title
-type editorDoneMsg string    // content returned from $EDITOR
+type tokenMsg string
+type streamEndMsg string
+type titleUpdatedMsg string
+type editorDoneMsg string
 
-// ── commands (available in : mode) ───────────────────────────────────────────
+// ── search result ─────────────────────────────────────────────────────────────
+
+type searchResult struct {
+	conv *store.Conversation
+	msg  *store.Message
+}
+
+// ── available :commands ───────────────────────────────────────────────────────
 
 var commands = []string{
 	":clear", ":debug", ":grep", ":help",
@@ -43,7 +52,7 @@ var commands = []string{
 	":q", ":quit", ":rename ",
 }
 
-// ── Model ────────────────────────────────────────────────────────────────────
+// ── Model ─────────────────────────────────────────────────────────────────────
 
 type Model struct {
 	// core
@@ -60,32 +69,38 @@ type Model struct {
 	ready  bool
 
 	// chat view
-	viewport viewport.Model
-	input    textinput.Model
-	atBottom bool // whether viewport was at bottom before last update
+	viewport    viewport.Model
+	input       textinput.Model
+	atBottom    bool
+	autoTitled  bool   // prevent re-triggering auto-title
+	errMsg      string // shown on separator row, cleared on next input
 
 	// streaming
-	streaming  bool
-	streamCh   <-chan string
+	streaming    bool
+	streamCh     <-chan string
 	cancelStream context.CancelFunc
-	streamBuf  strings.Builder
+	streamBuf    strings.Builder
 
-	// picker view
+	// picker state
 	state        appState
 	pickerConvs  []*store.Conversation
 	pickerFilter string
 	pickerCursor int
 
-	// misc
+	// search state
+	searchInput    string
+	searchAll      []searchResult
+	searchCursor   int
+
+	// system
 	systemPrompt string
-	errMsg       string
-	statusExtra  string // shown in status bar during special states
 }
 
-// New creates the initial bubbletea model.
+// ── constructor ───────────────────────────────────────────────────────────────
+
 func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*store.Message, prov llm.Provider, modelName, sysPrompt string) Model {
 	ti := textinput.New()
-	ti.Prompt = ""   // we render our own "> " prefix
+	ti.Prompt = "" // we render our own "> " prefix
 	ti.Placeholder = "message..."
 	ti.Focus()
 	ti.CharLimit = 0
@@ -108,7 +123,7 @@ func (m Model) Init() tea.Cmd {
 	return textinput.Blink
 }
 
-// ── Update ───────────────────────────────────────────────────────────────────
+// ── Update ────────────────────────────────────────────────────────────────────
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -119,13 +134,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.ready {
 			m.viewport = viewport.New(msg.Width, m.viewportHeight())
 			m.ready = true
-			m.refreshContent()
-			m.viewport.GotoBottom()
 		} else {
 			m.viewport.Width = msg.Width
 			m.viewport.Height = m.viewportHeight()
 		}
 		m.input.Width = msg.Width - 3
+		m.refreshContent() // re-wrap on every resize
+		if m.atBottom {
+			m.viewport.GotoBottom()
+		}
 		return m, nil
 
 	case tokenMsg:
@@ -141,20 +158,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.streaming = false
 		m.cancelStream = nil
 		m.streamCh = nil
-		m.statusExtra = ""
 
 		if content != "" {
 			m.store.AddMessage(m.conv.ID, "assistant", content)
-			newMsg := &store.Message{Role: "assistant", Content: content}
-			m.messages = append(m.messages, newMsg)
+			m.messages = append(m.messages, &store.Message{Role: "assistant", Content: content})
 		}
 		m.streamBuf.Reset()
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		m.atBottom = true
 
-		// Auto-title after first exchange if still "Untitled"
-		if m.conv.Title == "Untitled" && len(m.messages) >= 2 {
+		if !m.autoTitled && m.conv.Title == "Untitled" && len(m.messages) >= 2 {
+			m.autoTitled = true
 			return m, m.autoTitleCmd()
 		}
 		return m, nil
@@ -169,10 +184,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		if m.state == statePicker {
+		switch m.state {
+		case statePicker:
 			return m.updatePicker(msg)
+		case stateSearch:
+			return m.updateSearch(msg)
+		default:
+			return m.updateChat(msg)
 		}
-		return m.updateChat(msg)
 	}
 
 	return m, nil
@@ -181,11 +200,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ── Chat key handling ─────────────────────────────────────────────────────────
 
 func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
+	// Clear error on any meaningful key
+	if msg.Type == tea.KeyRunes || msg.Type == tea.KeyBackspace || msg.Type == tea.KeyDelete {
+		m.errMsg = ""
+	}
+
 	switch msg.Type {
 
 	case tea.KeyCtrlC:
 		if m.streaming {
 			m.cancelStream()
+			m.streaming = false
+			m.streamCh = nil
+			m.cancelStream = nil
+			// Keep whatever was streamed so far
+			partial := m.streamBuf.String()
+			m.streamBuf.Reset()
+			if partial != "" {
+				m.store.AddMessage(m.conv.ID, "assistant", partial+" [cancelled]")
+				m.messages = append(m.messages, &store.Message{Role: "assistant", Content: partial + " [cancelled]"})
+			}
+			m.refreshContent()
+			m.viewport.GotoBottom()
 			return m, nil
 		}
 		return m, tea.Quit
@@ -220,7 +256,7 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m.openEditor()
 
 	case tea.KeyCtrlG:
-		return m.grepMode()
+		return m.enterSearch()
 
 	case tea.KeyCtrlU:
 		m.viewport.HalfViewUp()
@@ -253,40 +289,36 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Pass everything else to the textinput
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
 }
 
-// handleInput processes a submitted message (plain text or :command).
+// ── Input handling ────────────────────────────────────────────────────────────
+
 func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	if strings.HasPrefix(input, ":") {
 		return m.handleCommand(input)
 	}
 
-	// Regular message — send to model
 	if m.provider == nil {
-		m.errMsg = "no provider configured for model " + m.model
+		m.errMsg = "no provider — set GEMINI_API_KEY, OPENAI_API_KEY, or configure ollama"
 		return m, nil
 	}
 
-	// Persist user message
 	m.store.AddMessage(m.conv.ID, "user", input)
 	m.messages = append(m.messages, &store.Message{Role: "user", Content: input})
 	m.refreshContent()
 	m.viewport.GotoBottom()
 	m.atBottom = true
-
 	return m.startStream()
 }
 
-// handleCommand processes ":command" inputs.
 func (m Model) handleCommand(input string) (Model, tea.Cmd) {
-	cmd := strings.TrimSpace(input)
-	parts := strings.SplitN(cmd, " ", 2)
+	parts := strings.SplitN(strings.TrimSpace(input), " ", 2)
+	verb := parts[0]
 
-	switch parts[0] {
+	switch verb {
 	case ":q", ":quit":
 		if m.streaming {
 			m.cancelStream()
@@ -300,19 +332,26 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m.enterPicker()
 
 	case ":grep":
-		return m.grepMode()
+		return m.enterSearch()
 
 	case ":clear":
-		m.messages = nil
+		// Remove display-only messages; keep persisted ones in DB
+		var kept []*store.Message
+		for _, msg := range m.messages {
+			if msg.Role != "system" || msg.ID != 0 {
+				kept = append(kept, msg)
+			}
+		}
+		m.messages = kept
 		m.refreshContent()
 		return m, nil
 
 	case ":debug":
-		m.appendSystemLine("system prompt:\n\n" + m.systemPrompt)
+		m.injectSystemLine("── system prompt ──\n\n" + m.systemPrompt)
 		return m, nil
 
 	case ":models":
-		m.appendSystemLine("configured providers:\n  gemini  (GEMINI_API_KEY)\n  openai  (OPENAI_API_KEY)\n  ollama  (default)")
+		m.injectSystemLine("providers:\n  gemini   GEMINI_API_KEY  →  gemini-2.0-flash, gemini-1.5-pro\n  openai   OPENAI_API_KEY  →  gpt-4o, gpt-4o-mini\n  ollama   (local)         →  llama3.2, qwen2.5:32b, ...")
 		return m, nil
 
 	case ":rename":
@@ -323,11 +362,12 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		title := strings.TrimSpace(parts[1])
 		m.store.UpdateTitle(m.conv.ID, title)
 		m.conv.Title = title
+		m.autoTitled = true // don't auto-overwrite a manual rename
 		return m, nil
 
 	case ":model":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-			m.appendSystemLine("current model: " + m.model)
+			m.injectSystemLine("current model: " + m.model)
 			return m, nil
 		}
 		newModel := strings.TrimSpace(parts[1])
@@ -339,20 +379,22 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.model = newModel
 		m.provider = prov
 		m.store.UpdateModel(m.conv.ID, newModel)
+		m.injectSystemLine("switched to " + newModel)
 		return m, nil
 
 	case ":help":
-		m.appendSystemLine(helpText)
+		m.injectSystemLine(helpText)
 		return m, nil
 
 	default:
-		m.errMsg = "unknown command: " + parts[0] + "  (type :help)"
+		m.errMsg = "unknown command: " + verb + "  (tab to complete, :help for list)"
 		return m, nil
 	}
 }
 
-// appendSystemLine adds a synthetic "system" line into the viewport display only.
-func (m *Model) appendSystemLine(text string) {
+// injectSystemLine adds a display-only note into the viewport (not persisted).
+func (m *Model) injectSystemLine(text string) {
+	// ID=0 marks display-only messages
 	m.messages = append(m.messages, &store.Message{Role: "system", Content: text})
 	m.refreshContent()
 	m.viewport.GotoBottom()
@@ -360,27 +402,29 @@ func (m *Model) appendSystemLine(text string) {
 }
 
 const helpText = `keybindings
-  ctrl+c     cancel stream / quit
-  ctrl+l     conversation picker
-  ctrl+n     new conversation
-  ctrl+e     open $EDITOR for long messages
-  ctrl+g     grep all messages
-  ctrl+u     scroll up half page
-  ctrl+d     scroll down half page
-  ↑ ↓        scroll one line
-  tab        autocomplete command
+  ctrl+c       cancel stream / quit
+  ctrl+l       conversation picker
+  ctrl+n       new conversation
+  ctrl+g       search all messages
+  ctrl+e       open $EDITOR for long input
+  ctrl+u / d   scroll half page
+  ↑ ↓          scroll one line
+  tab          autocomplete :command
 
 commands  (type : to see completions)
-  :q / :quit           quit
-  :new                 new conversation
-  :list                conversation picker
-  :grep                search messages
-  :rename <title>      rename this conversation
-  :model <name>        switch model (e.g. gemini-2.0-flash, gpt-4o)
-  :models              list providers
-  :clear               clear view (history kept)
-  :debug               show system prompt
-  :help                this help`
+  :help                 this help
+  :q / :quit            quit
+  :new                  new conversation
+  :list                 conversation picker
+  :grep                 search messages
+  :rename <title>       rename this conversation
+  :model <name>         switch model mid-conversation
+  :models               list available providers
+  :clear                clear injected notes (history kept)
+  :debug                show current system prompt
+
+memory
+  edit ~/.config/cx/memory.md — injected into every conversation`
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
 
@@ -391,18 +435,15 @@ func (m Model) startStream() (Model, tea.Cmd) {
 	m.streaming = true
 	m.cancelStream = cancel
 	m.streamCh = ch
-	m.statusExtra = "···"
 	m.streamBuf.Reset()
 
 	msgs := m.buildLLMMessages()
-
 	return m, tea.Batch(
 		runStream(ctx, m.provider, m.model, msgs, ch),
 		listenToken(ch),
 	)
 }
 
-// runStream starts the LLM call in a goroutine; sends streamEndMsg when done.
 func runStream(ctx context.Context, prov llm.Provider, model string, msgs []llm.Message, ch chan<- string) tea.Cmd {
 	return func() tea.Msg {
 		content, _ := prov.Stream(ctx, model, msgs, func(token string) {
@@ -416,12 +457,11 @@ func runStream(ctx context.Context, prov llm.Provider, model string, msgs []llm.
 	}
 }
 
-// listenToken returns a Cmd that waits for one token from ch.
 func listenToken(ch <-chan string) tea.Cmd {
 	return func() tea.Msg {
 		t, ok := <-ch
 		if !ok {
-			return nil // streamEndMsg already sent by runStream
+			return nil
 		}
 		return tokenMsg(t)
 	}
@@ -431,7 +471,7 @@ func (m Model) buildLLMMessages() []llm.Message {
 	out := []llm.Message{{Role: "system", Content: m.systemPrompt}}
 	for _, msg := range m.messages {
 		if msg.Role == "system" {
-			continue // skip display-only system messages
+			continue // skip display-only injections
 		}
 		out = append(out, llm.Message{Role: msg.Role, Content: msg.Content})
 	}
@@ -442,13 +482,10 @@ func (m Model) buildLLMMessages() []llm.Message {
 
 func (m Model) autoTitleCmd() tea.Cmd {
 	msgs := m.buildLLMMessages()
-	prov := m.provider
-	model := m.model
-	st := m.store
-	convID := m.conv.ID
+	prov, model, st, convID := m.provider, m.model, m.store, m.conv.ID
 
 	return func() tea.Msg {
-		titlePrompt := append(msgs, llm.Message{
+		prompt := append(msgs, llm.Message{
 			Role:    "user",
 			Content: "Give this conversation a short title (4 words max, no quotes, no punctuation). Reply with only the title.",
 		})
@@ -456,18 +493,17 @@ func (m Model) autoTitleCmd() tea.Cmd {
 		defer cancel()
 
 		ch := make(chan string, 64)
-		var sb strings.Builder
-		done := make(chan struct{})
 		go func() {
-			prov.Stream(ctx, model, titlePrompt, func(t string) {
+			prov.Stream(ctx, model, prompt, func(t string) {
 				select {
 				case ch <- t:
 				case <-ctx.Done():
 				}
 			})
 			close(ch)
-			close(done)
 		}()
+
+		var sb strings.Builder
 		for t := range ch {
 			sb.WriteString(t)
 		}
@@ -475,7 +511,6 @@ func (m Model) autoTitleCmd() tea.Cmd {
 		if title == "" {
 			return nil
 		}
-		// Take only the first line, cap at 60 chars
 		if i := strings.Index(title, "\n"); i >= 0 {
 			title = title[:i]
 		}
@@ -515,12 +550,12 @@ func (m Model) updatePicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if len(filtered) == 0 {
 			return m.newConversation()
 		}
-		selected := filtered[m.pickerCursor]
-		if selected.ID == m.conv.ID {
+		sel := filtered[m.pickerCursor]
+		if sel.ID == m.conv.ID {
 			m.state = stateChat
 			return m, nil
 		}
-		return m.switchConversation(selected.ID)
+		return m.switchConversation(sel.ID)
 
 	case tea.KeyUp:
 		if m.pickerCursor > 0 {
@@ -537,20 +572,18 @@ func (m Model) updatePicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	case tea.KeyBackspace, tea.KeyDelete:
 		if len(m.pickerFilter) > 0 {
-			// Remove last rune
 			_, size := utf8.DecodeLastRuneInString(m.pickerFilter)
 			m.pickerFilter = m.pickerFilter[:len(m.pickerFilter)-size]
 			m.pickerCursor = 0
 		}
 		return m, nil
 
-	default:
-		if msg.Type == tea.KeyRunes && len(msg.Runes) > 0 {
-			m.pickerFilter += string(msg.Runes)
-			m.pickerCursor = 0
-		}
+	case tea.KeyRunes:
+		m.pickerFilter += string(msg.Runes)
+		m.pickerCursor = 0
 		return m, nil
 	}
+	return m, nil
 }
 
 func (m Model) filteredConvs() []*store.Conversation {
@@ -582,8 +615,7 @@ func (m Model) switchConversation(id int64) (Model, tea.Cmd) {
 	}
 	prov, err := llm.ForModel(conv.Model, m.cfg)
 	if err != nil {
-		// non-fatal: keep old provider
-		prov = m.provider
+		prov = m.provider // keep old provider if model unknown
 	}
 
 	m.conv = conv
@@ -592,7 +624,9 @@ func (m Model) switchConversation(id int64) (Model, tea.Cmd) {
 	m.provider = prov
 	m.streaming = false
 	m.streamBuf.Reset()
+	m.autoTitled = conv.Title != "Untitled"
 	m.state = stateChat
+	m.errMsg = ""
 
 	m.refreshContent()
 	m.viewport.GotoBottom()
@@ -611,7 +645,9 @@ func (m Model) newConversation() (Model, tea.Cmd) {
 	m.messages = nil
 	m.streaming = false
 	m.streamBuf.Reset()
+	m.autoTitled = false
 	m.state = stateChat
+	m.errMsg = ""
 
 	m.refreshContent()
 	m.viewport.GotoBottom()
@@ -619,63 +655,104 @@ func (m Model) newConversation() (Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── Grep (shell out to fzf) ───────────────────────────────────────────────────
+// ── Search (ctrl+g / :grep) ───────────────────────────────────────────────────
 
-func (m Model) grepMode() (Model, tea.Cmd) {
+func (m Model) enterSearch() (Model, tea.Cmd) {
 	convs, _ := m.store.ListConversations()
-	msgs, _ := m.store.SearchMessages("")
-
-	// Build fzf input: "convID\tdisplay line"
-	var sb strings.Builder
-	convMap := make(map[int64]*store.Conversation)
+	convMap := make(map[int64]*store.Conversation, len(convs))
 	for _, c := range convs {
 		convMap[c.ID] = c
 	}
-	for _, msg := range msgs {
-		title := "?"
-		if c, ok := convMap[msg.ConvID]; ok {
-			title = c.Title
+
+	allMsgs, _ := m.store.SearchMessages("") // load everything
+	var results []searchResult
+	for _, msg := range allMsgs {
+		if msg.Role == "system" {
+			continue
 		}
-		preview := msg.Content
-		if len(preview) > 80 {
-			preview = preview[:80]
+		c := convMap[msg.ConvID]
+		if c == nil {
+			continue
 		}
-		preview = strings.ReplaceAll(preview, "\n", " ")
-		fmt.Fprintf(&sb, "%d\t[%s]  %-20s  %s\n", msg.ConvID, msg.Role, title, preview)
+		results = append(results, searchResult{conv: c, msg: msg})
 	}
 
-	input := sb.String()
-	if input == "" {
-		m.errMsg = "no messages to search"
-		return m, nil
-	}
-
-	fzfCmd := exec.Command("fzf", "--with-nth=2..", "--delimiter=\t", "--reverse", "--height=50%")
-	fzfCmd.Stdin = strings.NewReader(input)
-
-	return m, tea.ExecProcess(fzfCmd, func(err error) tea.Msg {
-		if err != nil {
-			return nil // user escaped fzf
-		}
-		return nil // handled differently below — see note
-	})
-	// NOTE: fzf output goes to its own stdout — we can't capture it here because
-	// tea.ExecProcess connects fzf's stdout to the terminal. For now grep just
-	// lets users view messages; switching conv via grep is a future improvement.
+	m.state = stateSearch
+	m.searchInput = ""
+	m.searchAll = results
+	m.searchCursor = 0
+	return m, nil
 }
 
-// ── Editor (Ctrl+E) ───────────────────────────────────────────────────────────
+func (m Model) updateSearch(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.state = stateChat
+		return m, nil
+
+	case tea.KeyEnter:
+		filtered := m.filteredSearch()
+		if len(filtered) == 0 {
+			m.state = stateChat
+			return m, nil
+		}
+		sel := filtered[m.searchCursor]
+		return m.switchConversation(sel.conv.ID)
+
+	case tea.KeyUp:
+		if m.searchCursor > 0 {
+			m.searchCursor--
+		}
+		return m, nil
+
+	case tea.KeyDown:
+		filtered := m.filteredSearch()
+		if m.searchCursor < len(filtered)-1 {
+			m.searchCursor++
+		}
+		return m, nil
+
+	case tea.KeyBackspace, tea.KeyDelete:
+		if len(m.searchInput) > 0 {
+			_, size := utf8.DecodeLastRuneInString(m.searchInput)
+			m.searchInput = m.searchInput[:len(m.searchInput)-size]
+			m.searchCursor = 0
+		}
+		return m, nil
+
+	case tea.KeyRunes:
+		m.searchInput += string(msg.Runes)
+		m.searchCursor = 0
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) filteredSearch() []searchResult {
+	if m.searchInput == "" {
+		return m.searchAll
+	}
+	q := strings.ToLower(m.searchInput)
+	var out []searchResult
+	for _, r := range m.searchAll {
+		if strings.Contains(strings.ToLower(r.msg.Content), q) ||
+			strings.Contains(strings.ToLower(r.conv.Title), q) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// ── Editor (ctrl+e) ───────────────────────────────────────────────────────────
 
 func (m Model) openEditor() (Model, tea.Cmd) {
-	current := m.input.Value()
-
 	tmp, err := os.CreateTemp("", "cx-*.md")
 	if err != nil {
-		m.errMsg = "could not create temp file"
+		m.errMsg = "could not create temp file: " + err.Error()
 		return m, nil
 	}
 	tmpName := tmp.Name()
-	tmp.WriteString(current)
+	tmp.WriteString(m.input.Value())
 	tmp.Close()
 
 	editor := os.Getenv("EDITOR")
@@ -683,8 +760,7 @@ func (m Model) openEditor() (Model, tea.Cmd) {
 		editor = "vim"
 	}
 
-	editorCmd := exec.Command(editor, tmpName)
-	return m, tea.ExecProcess(editorCmd, func(err error) tea.Msg {
+	return m, tea.ExecProcess(exec.Command(editor, tmpName), func(err error) tea.Msg {
 		defer os.Remove(tmpName)
 		if err != nil {
 			return nil
@@ -693,8 +769,7 @@ func (m Model) openEditor() (Model, tea.Cmd) {
 		if readErr != nil {
 			return nil
 		}
-		content := strings.TrimRight(string(data), "\r\n")
-		return editorDoneMsg(content)
+		return editorDoneMsg(strings.TrimRight(string(data), "\r\n"))
 	})
 }
 
@@ -704,31 +779,30 @@ func (m Model) View() string {
 	if !m.ready {
 		return "\n  loading..."
 	}
-
-	if m.state == statePicker {
+	switch m.state {
+	case statePicker:
 		return m.pickerView()
+	case stateSearch:
+		return m.searchView()
+	default:
+		return m.chatView()
 	}
-	return m.chatView()
 }
 
 func (m Model) chatView() string {
-	sep := m.sepView()
-	input := m.inputView()
-	status := m.statusView()
-
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		m.viewport.View(),
-		sep,
-		input,
-		status,
+		m.sepView(),
+		m.inputView(),
+		m.statusView(),
 	)
 }
 
 func (m Model) sepView() string {
-	inputVal := m.input.Value()
-	if strings.HasPrefix(inputVal, ":") {
-		matches := completionsFor(inputVal)
+	val := m.input.Value()
+	if strings.HasPrefix(val, ":") {
+		matches := completionsFor(val)
 		if len(matches) > 0 {
 			return completionStyle.Render("  " + strings.Join(matches, "   "))
 		}
@@ -740,23 +814,29 @@ func (m Model) sepView() string {
 }
 
 func (m Model) inputView() string {
-	return promptStyle.Render("> ") + m.input.View()
+	prefix := promptStyle.Render("> ")
+	if m.streaming {
+		prefix = dimStyle.Render("  ") // indent, no prompt while streaming
+	}
+	return prefix + m.input.View()
 }
 
 func (m Model) statusView() string {
-	extra := m.statusExtra
-	if m.streaming && extra == "" {
-		extra = "···"
-	}
-
+	modelPart := m.model
 	titlePart := m.conv.Title
-	if extra != "" {
-		titlePart = extra
+	if m.streaming {
+		titlePart = "···"
 	}
 
-	left := fmt.Sprintf("  %s  ·  #%d  ·  %s", m.model, m.conv.ID, titlePart)
-	right := time.Now().Format("15:04") + "  "
+	left := fmt.Sprintf("  %s  ·  #%d  ·  %s", modelPart, m.conv.ID, titlePart)
 
+	// Scroll position indicator
+	var scrollPart string
+	if !m.atBottom {
+		scrollPart = "↑  "
+	}
+
+	right := scrollPart + time.Now().Format("15:04") + "  "
 	pad := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if pad < 1 {
 		pad = 1
@@ -768,65 +848,169 @@ func (m Model) statusView() string {
 
 func (m Model) pickerView() string {
 	filtered := m.filteredConvs()
+	maxVisible := m.height - 8
+	if maxVisible < 1 {
+		maxVisible = 1
+	}
+
+	// Scroll window around cursor
+	start := 0
+	if m.pickerCursor >= maxVisible {
+		start = m.pickerCursor - maxVisible + 1
+	}
+	end := start + maxVisible
+	if end > len(filtered) {
+		end = len(filtered)
+	}
 
 	var sb strings.Builder
 	sb.WriteString("\n")
 	sb.WriteString(pickerTitleStyle.Render("  conversations") + "\n\n")
 
-	// Filter input
-	filterDisplay := m.pickerFilter
-	if filterDisplay == "" {
-		filterDisplay = dimStyle.Render("type to filter...")
+	// Filter input line
+	filterText := m.pickerFilter
+	if filterText == "" {
+		filterText = dimStyle.Render("type to filter...")
 	}
-	sb.WriteString(promptStyle.Render("  > ") + filterDisplay + "\n")
+	sb.WriteString(promptStyle.Render("  > ") + filterText + "\n")
 	sb.WriteString(sepStyle.Render(strings.Repeat("─", m.width)) + "\n")
 
 	if len(filtered) == 0 {
-		sb.WriteString(dimStyle.Render("  no matches\n"))
+		sb.WriteString(dimStyle.Render("  no matches") + "\n")
 	} else {
-		for i, c := range filtered {
+		for i := start; i < end; i++ {
+			c := filtered[i]
 			age := timeAgo(c.UpdatedAt)
 			title := c.Title
-			if len(title) > m.width-20 {
-				title = title[:m.width-23] + "..."
+			maxTitle := m.width - 14
+			if maxTitle < 10 {
+				maxTitle = 10
+			}
+			if utf8.RuneCountInString(title) > maxTitle {
+				title = string([]rune(title)[:maxTitle-1]) + "…"
 			}
 
-			prefix := "  "
-			if c.ID == m.conv.ID {
-				prefix = "● "
+			isCurrent := c.ID == m.conv.ID
+			isSelected := i == m.pickerCursor
+
+			dot := "  "
+			if isCurrent {
+				dot = "● "
 			}
+			line := fmt.Sprintf("%s%-*s  %s", dot, maxTitle, title, age)
 
-			line := fmt.Sprintf("%s%-*s  %s", prefix, m.width-20, title, age)
-
-			if i == m.pickerCursor {
+			if isSelected {
 				sb.WriteString(pickerSelectedStyle.Render(line) + "\n")
 			} else {
 				sb.WriteString(pickerRowStyle.Render(line) + "\n")
 			}
 		}
+		if len(filtered) > maxVisible {
+			sb.WriteString(dimStyle.Render(fmt.Sprintf("  … %d more", len(filtered)-maxVisible)) + "\n")
+		}
 	}
 
 	sb.WriteString("\n")
 	sb.WriteString(dimStyle.Render("  ↑↓ navigate   enter select   ctrl+n new   esc cancel"))
+	return sb.String()
+}
 
+// ── Search view ───────────────────────────────────────────────────────────────
+
+func (m Model) searchView() string {
+	filtered := m.filteredSearch()
+	maxVisible := m.height - 9
+	if maxVisible < 1 {
+		maxVisible = 1
+	}
+
+	start := 0
+	if m.searchCursor >= maxVisible {
+		start = m.searchCursor - maxVisible + 1
+	}
+	end := start + maxVisible
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n")
+	sb.WriteString(pickerTitleStyle.Render("  search messages") + "\n\n")
+
+	filterText := m.searchInput
+	if filterText == "" {
+		filterText = dimStyle.Render("type to search...")
+	}
+	sb.WriteString(promptStyle.Render("  > ") + filterText + "\n")
+	sb.WriteString(sepStyle.Render(strings.Repeat("─", m.width)) + "\n")
+
+	if len(m.searchAll) == 0 {
+		sb.WriteString(dimStyle.Render("  no messages yet") + "\n")
+	} else if len(filtered) == 0 {
+		sb.WriteString(dimStyle.Render("  no matches") + "\n")
+	} else {
+		for i := start; i < end; i++ {
+			r := filtered[i]
+			role := r.msg.Role
+			convTitle := r.conv.Title
+			maxTitle := 20
+			if utf8.RuneCountInString(convTitle) > maxTitle {
+				convTitle = string([]rune(convTitle)[:maxTitle-1]) + "…"
+			}
+
+			// Preview: first line, truncated
+			preview := r.msg.Content
+			if nl := strings.Index(preview, "\n"); nl >= 0 {
+				preview = preview[:nl]
+			}
+			maxPreview := m.width - maxTitle - 22
+			if maxPreview < 20 {
+				maxPreview = 20
+			}
+			if utf8.RuneCountInString(preview) > maxPreview {
+				preview = string([]rune(preview)[:maxPreview-1]) + "…"
+			}
+
+			roleTag := dimStyle.Render(fmt.Sprintf("[%-4s]", role))
+			titleTag := dimStyle.Render(fmt.Sprintf("  %-*s  ", maxTitle, convTitle))
+			previewText := preview
+
+			line := roleTag + titleTag + previewText
+			if i == m.searchCursor {
+				sb.WriteString(pickerSelectedStyle.Render(fmt.Sprintf("  %-*s", m.width-2, preview)) + "\n")
+				// show full context on selected
+				_ = line
+				context := roleTag + titleTag + dimStyle.Render(timeAgo(r.msg.CreatedAt))
+				sb.WriteString("  " + context + "\n")
+			} else {
+				sb.WriteString(pickerRowStyle.Render("  ") + line + "\n")
+			}
+		}
+		if len(filtered) > maxVisible {
+			sb.WriteString(dimStyle.Render(fmt.Sprintf("  … %d more", len(filtered)-maxVisible)) + "\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(dimStyle.Render("  ↑↓ navigate   enter jump to conv   esc cancel"))
 	return sb.String()
 }
 
 // ── Content rendering ─────────────────────────────────────────────────────────
 
-// refreshContent re-renders all messages into the viewport.
 func (m *Model) refreshContent() {
 	if !m.ready {
 		return
 	}
 	var sb strings.Builder
+	sb.WriteString("\n") // top padding
 	for _, msg := range m.messages {
 		sb.WriteString(m.renderMsg(msg))
 		sb.WriteString("\n\n")
 	}
 	if m.streaming && m.streamBuf.Len() > 0 {
 		sb.WriteString(wordWrap(m.streamBuf.String(), m.viewport.Width))
-		sb.WriteString("▊")
+		sb.WriteString(" ▊")
 	}
 	m.viewport.SetContent(sb.String())
 }
@@ -851,35 +1035,57 @@ func (m Model) renderMsg(msg *store.Message) string {
 		return strings.Join(lines, "\n")
 
 	case "system":
-		// Display-only system annotations (e.g. :help output)
-		return dimStyle.Render(wordWrap(msg.Content, w))
+		// Display-only annotations (:help, :debug output, etc.)
+		lines := strings.Split(wordWrap(msg.Content, w), "\n")
+		for i, l := range lines {
+			lines[i] = dimStyle.Render(l)
+		}
+		return strings.Join(lines, "\n")
 
 	default: // assistant
-		return wordWrap(msg.Content, w)
+		return m.renderMarkdown(msg.Content, w)
 	}
+}
+
+// renderMarkdown renders content with glamour; falls back to plain wrap on error.
+func (m Model) renderMarkdown(content string, width int) string {
+	r, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(width),
+	)
+	if err != nil {
+		return wordWrap(content, width)
+	}
+	out, err := r.Render(content)
+	if err != nil {
+		return wordWrap(content, width)
+	}
+	// Glamour adds a trailing newline; trim it since we add our own separator
+	return strings.TrimRight(out, "\n")
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func (m Model) viewportHeight() int {
-	h := m.height - 3 // viewport + sep + input + status
+	h := m.height - 3 // history + sep + input + status = 4 rows; viewport gets the rest
 	if h < 1 {
 		h = 1
 	}
 	return h
 }
 
-// wordWrap wraps text at width characters, preserving existing newlines.
+// wordWrap wraps text at width, preserving explicit newlines.
 func wordWrap(text string, width int) string {
 	if width <= 0 {
 		return text
 	}
 	var result strings.Builder
-	for i, paragraph := range strings.Split(text, "\n") {
+	paragraphs := strings.Split(text, "\n")
+	for i, p := range paragraphs {
 		if i > 0 {
 			result.WriteByte('\n')
 		}
-		result.WriteString(wrapParagraph(paragraph, width))
+		result.WriteString(wrapParagraph(p, width))
 	}
 	return result.String()
 }
@@ -897,14 +1103,15 @@ func wrapParagraph(text string, width int) string {
 	curLen := 0
 	for _, w := range words {
 		wLen := utf8.RuneCountInString(w)
-		if curLen == 0 {
+		switch {
+		case curLen == 0:
 			cur.WriteString(w)
 			curLen = wLen
-		} else if curLen+1+wLen <= width {
+		case curLen+1+wLen <= width:
 			cur.WriteByte(' ')
 			cur.WriteString(w)
 			curLen += 1 + wLen
-		} else {
+		default:
 			lines = append(lines, cur.String())
 			cur.Reset()
 			cur.WriteString(w)
@@ -917,7 +1124,6 @@ func wrapParagraph(text string, width int) string {
 	return strings.Join(lines, "\n")
 }
 
-// completionsFor returns commands that match the given prefix.
 func completionsFor(input string) []string {
 	if !strings.HasPrefix(input, ":") {
 		return nil
@@ -931,12 +1137,11 @@ func completionsFor(input string) []string {
 	return out
 }
 
-// timeAgo returns a human-readable relative time.
 func timeAgo(unix int64) string {
 	d := time.Since(time.Unix(unix, 0))
 	switch {
 	case d < time.Minute:
-		return "just now"
+		return "now"
 	case d < time.Hour:
 		return fmt.Sprintf("%dm", int(d.Minutes()))
 	case d < 24*time.Hour:
