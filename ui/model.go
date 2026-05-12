@@ -80,7 +80,7 @@ type Model struct {
 	streaming    bool
 	streamCh     <-chan string
 	cancelStream context.CancelFunc
-	streamBuf    strings.Builder
+	streamBuf    *strings.Builder
 
 	// picker state
 	state        appState
@@ -117,6 +117,7 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 		systemPrompt: sysPrompt,
 		atBottom:     true,
 		state:        stateChat,
+		streamBuf:    &strings.Builder{},
 	}
 }
 
