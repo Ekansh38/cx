@@ -34,7 +34,8 @@ const (
 // ── tea.Msg types ─────────────────────────────────────────────────────────────
 
 type tokenMsg string
-type streamEndMsg string
+type streamEndMsg struct{ content string }
+type streamErrMsg string
 type titleUpdatedMsg string
 type editorDoneMsg string
 type streamTickMsg struct{}
@@ -174,8 +175,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, listenToken(m.streamCh)
 
+	case streamErrMsg:
+		m.streaming = false
+		m.cancelStream = nil
+		m.streamCh = nil
+		m.streamBuf.Reset()
+		m.errMsg = string(msg)
+		return m, nil
+
 	case streamEndMsg:
-		content := string(msg)
+		content := msg.content
 		m.streaming = false
 		m.cancelStream = nil
 		m.streamCh = nil
@@ -523,14 +532,17 @@ func (m Model) startStream() (Model, tea.Cmd) {
 
 func runStream(ctx context.Context, prov llm.Provider, model string, msgs []llm.Message, ch chan<- string) tea.Cmd {
 	return func() tea.Msg {
-		content, _ := prov.Stream(ctx, model, msgs, func(token string) {
+		content, err := prov.Stream(ctx, model, msgs, func(token string) {
 			select {
 			case ch <- token:
 			case <-ctx.Done():
 			}
 		})
 		close(ch)
-		return streamEndMsg(content)
+		if err != nil && ctx.Err() == nil {
+			return streamErrMsg(err.Error())
+		}
+		return streamEndMsg{content: content}
 	}
 }
 
