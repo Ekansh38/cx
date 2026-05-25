@@ -647,6 +647,40 @@ func (m Model) updatePicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case tea.KeyCtrlN:
 		return m.newConversation()
 
+	case tea.KeyCtrlD:
+		filtered := m.filteredConvs()
+		if len(filtered) == 0 {
+			return m, nil
+		}
+		sel := filtered[m.pickerCursor]
+		// Delete from DB
+		if err := m.store.DeleteConversation(sel.ID); err != nil {
+			m.errMsg = err.Error()
+			m.state = stateChat
+			return m, nil
+		}
+		// If we deleted the active conversation, switch to a new one
+		if sel.ID == m.conv.ID {
+			m.conv = nil
+		}
+		// Refresh the picker list
+		convs, _ := m.store.ListConversations()
+		if len(convs) == 0 {
+			return m.newConversation()
+		}
+		m.pickerConvs = convs
+		if m.pickerCursor >= len(m.filteredConvs()) {
+			m.pickerCursor = len(m.filteredConvs()) - 1
+		}
+		if m.pickerCursor < 0 {
+			m.pickerCursor = 0
+		}
+		// If active conversation was deleted, load the first available
+		if m.conv == nil {
+			return m.switchConversation(convs[0].ID)
+		}
+		return m, nil
+
 	case tea.KeyEnter:
 		filtered := m.filteredConvs()
 		if len(filtered) == 0 {
@@ -1176,7 +1210,7 @@ func (m Model) pickerView() string {
 	}
 
 	sb.WriteString("\n")
-	sb.WriteString(dimStyle.Render("  ↑↓ navigate   enter select   ctrl+n new   esc cancel"))
+	sb.WriteString(dimStyle.Render("  ↑↓ navigate   enter select   ctrl+n new   ctrl+d delete   esc cancel"))
 	return sb.String()
 }
 

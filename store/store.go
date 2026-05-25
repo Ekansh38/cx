@@ -196,6 +196,12 @@ func (s *Store) SearchMessages(query string) ([]*Message, error) {
 	return msgs, rows.Err()
 }
 
+// DeleteConversation removes a conversation and its messages (via ON DELETE CASCADE).
+func (s *Store) DeleteConversation(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM conversations WHERE id = ?`, id)
+	return err
+}
+
 // WipeAll deletes every conversation and message from the database.
 func (s *Store) WipeAll() error {
 	_, err := s.db.Exec(`DELETE FROM conversations`)
