@@ -25,9 +25,10 @@ import (
 type appState int
 
 const (
-	stateChat   appState = iota
-	statePicker          // conversation picker overlay
-	stateSearch          // inline message search
+	stateChat        appState = iota
+	statePicker               // conversation picker overlay
+	stateSearch               // inline message search
+	stateModelPicker          // model switcher
 )
 
 // ── tea.Msg types ─────────────────────────────────────────────────────────────
@@ -37,6 +38,8 @@ type streamEndMsg string
 type titleUpdatedMsg string
 type editorDoneMsg string
 type streamTickMsg struct{}
+type modelsLoadedMsg []llm.ModelInfo
+type modelsErrorMsg string
 
 // ── search result ─────────────────────────────────────────────────────────────
 
@@ -89,9 +92,15 @@ type Model struct {
 	pickerCursor int
 
 	// search state
-	searchInput    string
-	searchAll      []searchResult
-	searchCursor   int
+	searchInput  string
+	searchAll    []searchResult
+	searchCursor int
+
+	// model picker state
+	modelList     []llm.ModelInfo
+	modelFilter   string
+	modelCursor   int
+	modelLoading  bool
 
 	// system
 	systemPrompt string
@@ -198,12 +207,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.CursorEnd()
 		return m, nil
 
+	case modelsLoadedMsg:
+		m.modelList = []llm.ModelInfo(msg)
+		m.modelLoading = false
+		return m, nil
+
+	case modelsErrorMsg:
+		m.errMsg = string(msg)
+		m.state = stateChat
+		m.modelLoading = false
+		return m, nil
+
 	case tea.KeyMsg:
 		switch m.state {
 		case statePicker:
 			return m.updatePicker(msg)
 		case stateSearch:
 			return m.updateSearch(msg)
+		case stateModelPicker:
+			return m.updateModelPicker(msg)
 		default:
 			return m.updateChat(msg)
 		}
@@ -275,6 +297,9 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	case tea.KeyCtrlG:
 		return m.enterSearch()
+
+	case tea.KeyCtrlT:
+		return m.enterModelPicker()
 
 	case tea.KeyCtrlU:
 		m.viewport.HalfViewUp()
@@ -397,8 +422,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m, nil
 
 	case ":models":
-		m.injectSystemLine("providers:\n  gemini   GEMINI_API_KEY  →  gemini-2.0-flash, gemini-1.5-pro\n  openai   OPENAI_API_KEY  →  gpt-4o, gpt-4o-mini\n  ollama   (local)         →  llama3.2, qwen2.5:32b, ...")
-		return m, nil
+		return m.enterModelPicker()
 
 	case ":rename":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
@@ -456,6 +480,7 @@ const helpText = `keybindings
   ctrl+l       conversation picker
   ctrl+n       new conversation
   ctrl+g       search all messages
+  ctrl+t       model switcher
   ctrl+e       open $EDITOR for long input
   ctrl+u / d   scroll half page
   ↑ ↓          scroll one line
@@ -469,7 +494,7 @@ commands  (type : to see completions)
   :grep                 search messages
   :rename <title>       rename this conversation
   :model <name>         switch model mid-conversation
-  :models               list available providers
+  :models               model switcher (fetches from OpenRouter)
   :clear                clear injected notes (history kept)
   :debug                show current system prompt
   :wipe                 delete ALL conversations and messages (asks confirm)
@@ -801,6 +826,167 @@ func (m Model) filteredSearch() []searchResult {
 	return out
 }
 
+// ── Model picker (ctrl+t / :models) ──────────────────────────────────────────
+
+func (m Model) enterModelPicker() (Model, tea.Cmd) {
+	m.state = stateModelPicker
+	m.modelFilter = ""
+	m.modelCursor = 0
+
+	// If we already fetched models, reuse them
+	if len(m.modelList) > 0 {
+		return m, nil
+	}
+
+	// Fetch async
+	m.modelLoading = true
+	apiKey := m.cfg.OpenRouter.APIKey
+	return m, func() tea.Msg {
+		models, err := llm.FetchOpenRouterModels(apiKey)
+		if err != nil {
+			return modelsErrorMsg("failed to fetch models: " + err.Error())
+		}
+		return modelsLoadedMsg(models)
+	}
+}
+
+func (m Model) updateModelPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.state = stateChat
+		return m, nil
+
+	case tea.KeyEnter:
+		filtered := m.filteredModels()
+		if len(filtered) == 0 {
+			return m, nil
+		}
+		sel := filtered[m.modelCursor]
+		prov, err := llm.ForModel(sel.ID, m.cfg)
+		if err != nil {
+			m.errMsg = err.Error()
+			m.state = stateChat
+			return m, nil
+		}
+		m.model = sel.ID
+		m.provider = prov
+		m.store.UpdateModel(m.conv.ID, sel.ID)
+		m.state = stateChat
+		m.injectSystemLine("switched to " + sel.ID)
+		return m, nil
+
+	case tea.KeyUp:
+		if m.modelCursor > 0 {
+			m.modelCursor--
+		}
+		return m, nil
+
+	case tea.KeyDown:
+		filtered := m.filteredModels()
+		if m.modelCursor < len(filtered)-1 {
+			m.modelCursor++
+		}
+		return m, nil
+
+	case tea.KeyBackspace, tea.KeyDelete:
+		if len(m.modelFilter) > 0 {
+			_, size := utf8.DecodeLastRuneInString(m.modelFilter)
+			m.modelFilter = m.modelFilter[:len(m.modelFilter)-size]
+			m.modelCursor = 0
+		}
+		return m, nil
+
+	case tea.KeyRunes:
+		m.modelFilter += string(msg.Runes)
+		m.modelCursor = 0
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) filteredModels() []llm.ModelInfo {
+	if m.modelFilter == "" {
+		return m.modelList
+	}
+	q := strings.ToLower(m.modelFilter)
+	var out []llm.ModelInfo
+	for _, mi := range m.modelList {
+		if strings.Contains(strings.ToLower(mi.ID), q) ||
+			strings.Contains(strings.ToLower(mi.Name), q) {
+			out = append(out, mi)
+		}
+	}
+	return out
+}
+
+func (m Model) modelPickerView() string {
+	var sb strings.Builder
+	sb.WriteString("\n")
+	sb.WriteString(pickerTitleStyle.Render("  models") + "\n\n")
+
+	filterText := m.modelFilter
+	if filterText == "" {
+		filterText = dimStyle.Render("type to filter...")
+	}
+	sb.WriteString(promptStyle.Render("  > ") + filterText + "\n")
+	sb.WriteString(sepStyle.Render(strings.Repeat("─", m.width)) + "\n")
+
+	if m.modelLoading {
+		sb.WriteString(dimStyle.Render("  fetching models from OpenRouter...") + "\n")
+	} else {
+		filtered := m.filteredModels()
+		if len(filtered) == 0 {
+			sb.WriteString(dimStyle.Render("  no matches") + "\n")
+		} else {
+			maxVisible := m.height - 9
+			if maxVisible < 1 {
+				maxVisible = 1
+			}
+			start := 0
+			if m.modelCursor >= maxVisible {
+				start = m.modelCursor - maxVisible + 1
+			}
+			end := start + maxVisible
+			if end > len(filtered) {
+				end = len(filtered)
+			}
+
+			for i := start; i < end; i++ {
+				mi := filtered[i]
+				isCurrent := mi.ID == m.model
+
+				dot := "  "
+				if isCurrent {
+					dot = "● "
+				}
+
+				name := mi.ID
+				maxName := m.width - 6
+				if maxName < 20 {
+					maxName = 20
+				}
+				if utf8.RuneCountInString(name) > maxName {
+					name = string([]rune(name)[:maxName-1]) + "…"
+				}
+
+				line := dot + name
+				if i == m.modelCursor {
+					sb.WriteString(pickerSelectedStyle.Render(line) + "\n")
+				} else {
+					sb.WriteString(pickerRowStyle.Render(line) + "\n")
+				}
+			}
+			if len(filtered) > maxVisible {
+				sb.WriteString(dimStyle.Render(fmt.Sprintf("  … %d more", len(filtered)-maxVisible)) + "\n")
+			}
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(dimStyle.Render("  ↑↓ navigate   enter select   esc cancel"))
+	return sb.String()
+}
+
 // ── Editor (ctrl+e) ───────────────────────────────────────────────────────────
 
 func (m Model) openEditor() (Model, tea.Cmd) {
@@ -842,6 +1028,8 @@ func (m Model) View() string {
 		return m.pickerView()
 	case stateSearch:
 		return m.searchView()
+	case stateModelPicker:
+		return m.modelPickerView()
 	default:
 		return m.chatView()
 	}
