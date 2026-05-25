@@ -52,9 +52,10 @@ type searchResult struct {
 // ── available :commands ───────────────────────────────────────────────────────
 
 var commands = []string{
-	":clear", ":debug", ":grep", ":help",
-	":list", ":model ", ":models", ":new",
-	":q", ":quit", ":rename ", ":wipe",
+	":clear", ":copy", ":debug", ":delete",
+	":grep", ":help", ":list", ":model ",
+	":models", ":new", ":q", ":quit",
+	":r", ":rename ", ":retry", ":wipe",
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -429,7 +430,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 	case ":debug":
 		msgs := m.buildLLMMessages()
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("── debug: %s via %s ──\n", m.model, m.cfg.OpenRouter.BaseURL))
+		sb.WriteString(fmt.Sprintf("── debug: %s ──\n", m.model))
 		sb.WriteString(fmt.Sprintf("── %d messages in payload ──\n\n", len(msgs)))
 		for i, msg := range msgs {
 			sb.WriteString(fmt.Sprintf("[%d] %s:\n%s\n\n", i, msg.Role, msg.Content))
@@ -472,6 +473,64 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.injectSystemLine(helpText)
 		return m, nil
 
+	case ":copy":
+		// Copy last assistant message to clipboard
+		var last string
+		for i := len(m.messages) - 1; i >= 0; i-- {
+			if m.messages[i].Role == "assistant" {
+				last = m.messages[i].Content
+				break
+			}
+		}
+		if last == "" {
+			m.errMsg = "no assistant message to copy"
+			return m, nil
+		}
+		cmd := exec.Command("pbcopy")
+		cmd.Stdin = strings.NewReader(last)
+		if err := cmd.Run(); err != nil {
+			m.errMsg = "copy failed: " + err.Error()
+			return m, nil
+		}
+		m.errMsg = ""
+		m.injectSystemLine("copied to clipboard")
+		return m, nil
+
+	case ":delete":
+		if err := m.store.DeleteConversation(m.conv.ID); err != nil {
+			m.errMsg = "delete failed: " + err.Error()
+			return m, nil
+		}
+		// Switch to most recent remaining, or create new
+		convs, _ := m.store.ListConversations()
+		if len(convs) == 0 {
+			return m.newConversation()
+		}
+		return m.switchConversation(convs[0].ID)
+
+	case ":retry", ":r":
+		if m.streaming {
+			return m, nil
+		}
+		// Find last user message
+		var lastUserIdx int = -1
+		for i := len(m.messages) - 1; i >= 0; i-- {
+			if m.messages[i].Role == "user" {
+				lastUserIdx = i
+				break
+			}
+		}
+		if lastUserIdx < 0 {
+			m.errMsg = "no message to retry"
+			return m, nil
+		}
+		// Remove any assistant reply after it (keep the user message)
+		m.messages = m.messages[:lastUserIdx+1]
+		m.refreshContent()
+		m.viewport.GotoBottom()
+		m.atBottom = true
+		return m.startStream()
+
 	case ":wipe":
 		m.injectSystemLine("this will delete ALL conversations and messages.\ntype  :wipe confirm  to proceed, or anything else to cancel.")
 		return m, nil
@@ -508,11 +567,14 @@ commands  (type : to see completions)
   :new                  new conversation
   :list                 conversation picker
   :grep                 search messages
+  :copy                 copy last assistant message to clipboard
+  :retry / :r           re-send last message (gets a new response)
+  :delete               delete current conversation
   :rename <title>       rename this conversation
   :model <name>         switch model mid-conversation
   :models               model switcher (fetches from OpenRouter)
   :clear                clear injected notes (history kept)
-  :debug                show current system prompt
+  :debug                show full API payload
   :wipe                 delete ALL conversations and messages (asks confirm)
 
 memory
@@ -646,40 +708,6 @@ func (m Model) updatePicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	case tea.KeyCtrlN:
 		return m.newConversation()
-
-	case tea.KeyCtrlD:
-		filtered := m.filteredConvs()
-		if len(filtered) == 0 {
-			return m, nil
-		}
-		sel := filtered[m.pickerCursor]
-		// Delete from DB
-		if err := m.store.DeleteConversation(sel.ID); err != nil {
-			m.errMsg = err.Error()
-			m.state = stateChat
-			return m, nil
-		}
-		// If we deleted the active conversation, switch to a new one
-		if sel.ID == m.conv.ID {
-			m.conv = nil
-		}
-		// Refresh the picker list
-		convs, _ := m.store.ListConversations()
-		if len(convs) == 0 {
-			return m.newConversation()
-		}
-		m.pickerConvs = convs
-		if m.pickerCursor >= len(m.filteredConvs()) {
-			m.pickerCursor = len(m.filteredConvs()) - 1
-		}
-		if m.pickerCursor < 0 {
-			m.pickerCursor = 0
-		}
-		// If active conversation was deleted, load the first available
-		if m.conv == nil {
-			return m.switchConversation(convs[0].ID)
-		}
-		return m, nil
 
 	case tea.KeyEnter:
 		filtered := m.filteredConvs()
@@ -1210,7 +1238,7 @@ func (m Model) pickerView() string {
 	}
 
 	sb.WriteString("\n")
-	sb.WriteString(dimStyle.Render("  ↑↓ navigate   enter select   ctrl+n new   ctrl+d delete   esc cancel"))
+	sb.WriteString(dimStyle.Render("  ↑↓ navigate   enter select   ctrl+n new   esc cancel"))
 	return sb.String()
 }
 
