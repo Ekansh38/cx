@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -486,9 +487,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			m.errMsg = "no assistant message to copy"
 			return m, nil
 		}
-		cmd := exec.Command("pbcopy")
-		cmd.Stdin = strings.NewReader(last)
-		if err := cmd.Run(); err != nil {
+		if err := copyToClipboard(last); err != nil {
 			m.errMsg = "copy failed: " + err.Error()
 			return m, nil
 		}
@@ -1457,6 +1456,23 @@ func completionsFor(input string) []string {
 		}
 	}
 	return out
+}
+
+func copyToClipboard(text string) error {
+	var name string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		name = "pbcopy"
+	case "linux":
+		name = "xclip"
+		args = []string{"-selection", "clipboard"}
+	default:
+		name = "pbcopy" // best effort
+	}
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
 }
 
 func timeAgo(unix int64) string {
