@@ -9,11 +9,13 @@ import (
 )
 
 type Config struct {
-	Model      string     `toml:"model"`
-	Gemini     ProviderCf `toml:"gemini"`
-	OpenAI     ProviderCf `toml:"openai"`
-	Ollama     ProviderCf `toml:"ollama"`
-	OpenRouter ProviderCf `toml:"openrouter"`
+	Model            string     `toml:"model"`
+	MemoryModel      string     `toml:"memory_model"`
+	MaxContextTokens int        `toml:"max_context_tokens"`
+	Gemini           ProviderCf `toml:"gemini"`
+	OpenAI           ProviderCf `toml:"openai"`
+	Ollama           ProviderCf `toml:"ollama"`
+	OpenRouter       ProviderCf `toml:"openrouter"`
 }
 
 type ProviderCf struct {
@@ -23,8 +25,10 @@ type ProviderCf struct {
 
 func Load() (*Config, error) {
 	cfg := &Config{
-		Model:  "llama3.2",
-		Ollama: ProviderCf{BaseURL: "http://localhost:11434/v1"},
+		Model:            "llama3.2",
+		MemoryModel:      "google/gemini-2.0-flash-001",
+		MaxContextTokens: 128000,
+		Ollama:           ProviderCf{BaseURL: "http://localhost:11434/v1"},
 	}
 
 	path := filepath.Join(Dir(), "config.toml")
