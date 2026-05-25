@@ -49,6 +49,11 @@ func (p *openAIProvider) Stream(ctx context.Context, model string, msgs []Messag
 	if p.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
+	// OpenRouter requires these for some accounts
+	if strings.Contains(p.baseURL, "openrouter.ai") {
+		req.Header.Set("HTTP-Referer", "https://github.com/Ekansh38/cx")
+		req.Header.Set("X-OpenRouter-Title", "cx")
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
