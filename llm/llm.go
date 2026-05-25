@@ -2,11 +2,60 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"sort"
 	"strings"
 
 	"cx/config"
 )
+
+// ModelInfo describes an available model from a remote provider.
+type ModelInfo struct {
+	ID   string // e.g. "anthropic/claude-opus-4"
+	Name string // human-readable name
+}
+
+// FetchOpenRouterModels returns models from the OpenRouter /models endpoint.
+func FetchOpenRouterModels(apiKey string) ([]ModelInfo, error) {
+	req, err := http.NewRequest(http.MethodGet, "https://openrouter.ai/api/v1/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("OpenRouter %s: %s", resp.Status, b)
+	}
+
+	var result struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	models := make([]ModelInfo, 0, len(result.Data))
+	for _, m := range result.Data {
+		models = append(models, ModelInfo{ID: m.ID, Name: m.Name})
+	}
+	sort.Slice(models, func(i, j int) bool {
+		return models[i].ID < models[j].ID
+	})
+	return models, nil
+}
 
 // Message is a single chat message.
 type Message struct {
