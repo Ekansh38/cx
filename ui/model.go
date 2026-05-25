@@ -427,7 +427,14 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m, nil
 
 	case ":debug":
-		m.injectSystemLine("── system prompt ──\n\n" + m.systemPrompt)
+		msgs := m.buildLLMMessages()
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("── debug: %s via %s ──\n", m.model, m.cfg.OpenRouter.BaseURL))
+		sb.WriteString(fmt.Sprintf("── %d messages in payload ──\n\n", len(msgs)))
+		for i, msg := range msgs {
+			sb.WriteString(fmt.Sprintf("[%d] %s:\n%s\n\n", i, msg.Role, msg.Content))
+		}
+		m.injectSystemLine(sb.String())
 		return m, nil
 
 	case ":models":
