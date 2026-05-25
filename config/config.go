@@ -9,10 +9,11 @@ import (
 )
 
 type Config struct {
-	Model  string     `toml:"model"`
-	Gemini ProviderCf `toml:"gemini"`
-	OpenAI ProviderCf `toml:"openai"`
-	Ollama ProviderCf `toml:"ollama"`
+	Model      string     `toml:"model"`
+	Gemini     ProviderCf `toml:"gemini"`
+	OpenAI     ProviderCf `toml:"openai"`
+	Ollama     ProviderCf `toml:"ollama"`
+	OpenRouter ProviderCf `toml:"openrouter"`
 }
 
 type ProviderCf struct {
@@ -39,6 +40,9 @@ func Load() (*Config, error) {
 	}
 	if k := os.Getenv("OPENAI_API_KEY"); k != "" {
 		cfg.OpenAI.APIKey = k
+	}
+	if k := os.Getenv("OPENROUTER_API_KEY"); k != "" {
+		cfg.OpenRouter.APIKey = k
 	}
 
 	if cfg.Ollama.BaseURL == "" {

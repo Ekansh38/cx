@@ -25,6 +25,17 @@ func ForModel(model string, cfg *config.Config) (Provider, error) {
 	m := strings.ToLower(model)
 
 	switch {
+	case strings.Contains(m, "/"):
+		// OpenRouter models are always "provider/model" (e.g. anthropic/claude-opus-4)
+		if cfg.OpenRouter.APIKey == "" {
+			return nil, fmt.Errorf("no OpenRouter API key — set OPENROUTER_API_KEY or [openrouter] api_key in config.toml")
+		}
+		baseURL := cfg.OpenRouter.BaseURL
+		if baseURL == "" {
+			baseURL = "https://openrouter.ai/api/v1"
+		}
+		return &openAIProvider{apiKey: cfg.OpenRouter.APIKey, baseURL: baseURL}, nil
+
 	case strings.HasPrefix(m, "gemini"):
 		if cfg.Gemini.APIKey == "" {
 			return nil, fmt.Errorf("no Gemini API key — set GEMINI_API_KEY or [gemini] api_key in config.toml")

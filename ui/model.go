@@ -50,7 +50,7 @@ type searchResult struct {
 var commands = []string{
 	":clear", ":debug", ":grep", ":help",
 	":list", ":model ", ":models", ":new",
-	":q", ":quit", ":rename ",
+	":q", ":quit", ":rename ", ":wipe",
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -336,8 +336,33 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 }
 
 func (m Model) handleCommand(input string) (Model, tea.Cmd) {
-	parts := strings.SplitN(strings.TrimSpace(input), " ", 2)
+	input = strings.TrimSpace(input)
+	parts := strings.SplitN(input, " ", 2)
 	verb := parts[0]
+
+	switch input {
+	case ":wipe confirm":
+		if err := m.store.WipeAll(); err != nil {
+			m.errMsg = "wipe failed: " + err.Error()
+			return m, nil
+		}
+		conv, err := m.store.CreateConversation(m.model)
+		if err != nil {
+			m.errMsg = err.Error()
+			return m, nil
+		}
+		m.conv = conv
+		m.messages = nil
+		m.streaming = false
+		m.streamBuf.Reset()
+		m.autoTitled = false
+		m.state = stateChat
+		m.errMsg = ""
+		m.refreshContent()
+		m.viewport.GotoBottom()
+		m.atBottom = true
+		return m, nil
+	}
 
 	switch verb {
 	case ":q", ":quit":
@@ -407,6 +432,10 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.injectSystemLine(helpText)
 		return m, nil
 
+	case ":wipe":
+		m.injectSystemLine("this will delete ALL conversations and messages.\ntype  :wipe confirm  to proceed, or anything else to cancel.")
+		return m, nil
+
 	default:
 		m.errMsg = "unknown command: " + verb + "  (tab to complete, :help for list)"
 		return m, nil
@@ -443,6 +472,7 @@ commands  (type : to see completions)
   :models               list available providers
   :clear                clear injected notes (history kept)
   :debug                show current system prompt
+  :wipe                 delete ALL conversations and messages (asks confirm)
 
 memory
   edit ~/.config/cx/memory.md — injected into every conversation`
