@@ -1,3 +1,5 @@
 spec.md
 data/
 cx
+.env
+config.toml
