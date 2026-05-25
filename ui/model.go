@@ -18,6 +18,7 @@ import (
 
 	"cx/config"
 	"cx/llm"
+	"cx/memory"
 	"cx/store"
 )
 
@@ -42,6 +43,9 @@ type editorDoneMsg string
 type streamTickMsg struct{}
 type modelsLoadedMsg []llm.ModelInfo
 type modelsErrorMsg string
+type memoryExtractedMsg struct{ facts []string }
+type memoryErrorMsg string
+type compactionDoneMsg struct{ summary string }
 
 // ── search result ─────────────────────────────────────────────────────────────
 
@@ -54,9 +58,10 @@ type searchResult struct {
 
 var commands = []string{
 	":clear", ":copy", ":debug", ":delete",
-	":grep", ":help", ":list", ":model ",
-	":models", ":new", ":q", ":quit",
-	":r", ":rename ", ":retry", ":wipe",
+	":forget ", ":grep", ":help", ":list",
+	":model ", ":models", ":new", ":q",
+	":quit", ":r", ":remember ", ":rename ",
+	":retry", ":wipe",
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -203,9 +208,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		m.atBottom = true
 
+		var cmds []tea.Cmd
 		if !m.autoTitled && m.conv.Title == "Untitled" && len(m.messages) >= 2 {
 			m.autoTitled = true
-			return m, m.autoTitleCmd()
+			cmds = append(cmds, m.autoTitleCmd())
+		}
+		if cmd := m.extractMemoryCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		if len(cmds) > 0 {
+			return m, tea.Batch(cmds...)
 		}
 		return m, nil
 
@@ -228,6 +240,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state = stateChat
 		m.modelLoading = false
 		return m, nil
+
+	case memoryExtractedMsg:
+		for _, fact := range msg.facts {
+			memory.Add(config.MemoryPath(), fact)
+		}
+		m.reloadSystemPrompt()
+		return m, nil
+
+	case memoryErrorMsg:
+		// Silent — don't disrupt the user
+		return m, nil
+
+	case compactionDoneMsg:
+		// Replace old messages with summary + recent
+		recentCount := 6
+		if recentCount > len(m.messages) {
+			recentCount = len(m.messages)
+		}
+		recent := make([]*store.Message, recentCount)
+		copy(recent, m.messages[len(m.messages)-recentCount:])
+		summaryMsg := &store.Message{Role: "summary", Content: msg.summary}
+		m.messages = append([]*store.Message{summaryMsg}, recent...)
+		m.refreshContent()
+		m.viewport.GotoBottom()
+		m.atBottom = true
+		return m.startStream()
 
 	case tea.KeyMsg:
 		switch m.state {
@@ -368,6 +406,13 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	m.refreshContent()
 	m.viewport.GotoBottom()
 	m.atBottom = true
+
+	// Check if compaction needed before sending
+	msgs := m.buildLLMMessages()
+	tokenCount := llm.EstimateMessagesTokens(msgs)
+	if tokenCount > m.cfg.MaxContextTokens*3/4 {
+		return m.startCompaction()
+	}
 	return m.startStream()
 }
 
@@ -530,6 +575,44 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.atBottom = true
 		return m.startStream()
 
+	case ":remember":
+		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+			m.errMsg = "usage: :remember <fact>"
+			return m, nil
+		}
+		fact := strings.TrimSpace(parts[1])
+		added, err := memory.Add(config.MemoryPath(), fact)
+		if err != nil {
+			m.errMsg = "memory error: " + err.Error()
+			return m, nil
+		}
+		if added {
+			m.reloadSystemPrompt()
+			m.injectSystemLine("remembered: " + fact)
+		} else {
+			m.injectSystemLine("already in memory (or similar fact exists)")
+		}
+		return m, nil
+
+	case ":forget":
+		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+			m.errMsg = "usage: :forget <query>"
+			return m, nil
+		}
+		query := strings.TrimSpace(parts[1])
+		n, err := memory.Remove(config.MemoryPath(), query)
+		if err != nil {
+			m.errMsg = "memory error: " + err.Error()
+			return m, nil
+		}
+		if n > 0 {
+			m.reloadSystemPrompt()
+			m.injectSystemLine(fmt.Sprintf("forgot %d fact(s) matching %q", n, query))
+		} else {
+			m.injectSystemLine("no matching facts found")
+		}
+		return m, nil
+
 	case ":wipe":
 		m.injectSystemLine("this will delete ALL conversations and messages.\ntype  :wipe confirm  to proceed, or anything else to cancel.")
 		return m, nil
@@ -572,12 +655,17 @@ commands  (type : to see completions)
   :rename <title>       rename this conversation
   :model <name>         switch model mid-conversation
   :models               model switcher (fetches from OpenRouter)
+  :remember <fact>       save a fact to memory
+  :forget <query>        remove matching facts from memory
   :clear                clear injected notes (history kept)
   :debug                show full API payload
   :wipe                 delete ALL conversations and messages (asks confirm)
 
 memory
-  edit ~/.config/cx/memory.md — injected into every conversation`
+  auto-extracted after each response (via cheap model)
+  :remember / :forget for manual control
+  stored in ~/.config/cx/memory.md
+  context auto-compacted when conversation gets long`
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
 
@@ -633,12 +721,28 @@ func listenToken(ch <-chan string) tea.Cmd {
 func (m Model) buildLLMMessages() []llm.Message {
 	out := []llm.Message{{Role: "system", Content: m.systemPrompt}}
 	for _, msg := range m.messages {
+		if msg.Role == "summary" {
+			// Compaction summary — include as system context
+			out = append(out, llm.Message{Role: "system", Content: msg.Content})
+			continue
+		}
 		if msg.Role == "system" {
 			continue // skip display-only injections
 		}
 		out = append(out, llm.Message{Role: msg.Role, Content: msg.Content})
 	}
 	return out
+}
+
+// reloadSystemPrompt rebuilds the system prompt from memory.md on disk.
+func (m *Model) reloadSystemPrompt() {
+	mem := config.LoadMemory()
+	base := "You are a helpful, direct, and thoughtful assistant. Be concise unless detail is needed."
+	if strings.TrimSpace(mem) == "" {
+		m.systemPrompt = base
+	} else {
+		m.systemPrompt = base + "\n\n## Things you know about the user\n" + mem
+	}
 }
 
 // ── Auto-title ────────────────────────────────────────────────────────────────
@@ -682,6 +786,140 @@ func (m Model) autoTitleCmd() tea.Cmd {
 		}
 		st.UpdateTitle(convID, title)
 		return titleUpdatedMsg(title)
+	}
+}
+
+// ── Auto-memory extraction ───────────────────────────────────────────────────
+
+const extractionPrompt = `You are a memory extraction system. Given a conversation exchange, extract key facts about the user that would be useful to remember across conversations.
+
+Current memory:
+%s
+
+Latest exchange:
+User: %s
+Assistant: %s
+
+Rules:
+- Only extract NEW facts not already in memory
+- Extract concrete preferences, facts, names, tools, languages, workflows
+- Do NOT extract conversation-specific context (what they asked about today)
+- Do NOT extract obvious/generic things
+- One fact per line, no bullets, no numbering
+- If nothing worth remembering, return exactly: NONE`
+
+func (m Model) extractMemoryCmd() tea.Cmd {
+	var userMsg, assistantMsg string
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		if m.messages[i].Role == "assistant" && assistantMsg == "" {
+			assistantMsg = m.messages[i].Content
+		}
+		if m.messages[i].Role == "user" && userMsg == "" {
+			userMsg = m.messages[i].Content
+		}
+		if userMsg != "" && assistantMsg != "" {
+			break
+		}
+	}
+	if userMsg == "" || assistantMsg == "" {
+		return nil
+	}
+
+	memPath := config.MemoryPath()
+	cfg := m.cfg
+
+	return func() tea.Msg {
+		memModel := cfg.MemoryModel
+		if memModel == "" {
+			memModel = "google/gemini-2.0-flash-001"
+		}
+		prov, err := llm.ForModel(memModel, cfg)
+		if err != nil {
+			return memoryErrorMsg(err.Error())
+		}
+
+		existingFacts, _ := memory.Load(memPath)
+		existing := memory.FormatForPrompt(existingFacts)
+		if existing == "" {
+			existing = "(empty)"
+		}
+
+		prompt := []llm.Message{
+			{Role: "user", Content: fmt.Sprintf(extractionPrompt, existing, userMsg, assistantMsg)},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		result, err := prov.Complete(ctx, memModel, prompt)
+		if err != nil {
+			return memoryErrorMsg(err.Error())
+		}
+
+		result = strings.TrimSpace(result)
+		if result == "NONE" || result == "" {
+			return memoryExtractedMsg{facts: nil}
+		}
+
+		var facts []string
+		for _, line := range strings.Split(result, "\n") {
+			line = strings.TrimSpace(line)
+			// Strip common prefixes the model might add
+			line = strings.TrimPrefix(line, "- ")
+			line = strings.TrimPrefix(line, "* ")
+			if line != "" && line != "NONE" {
+				facts = append(facts, line)
+			}
+		}
+		return memoryExtractedMsg{facts: facts}
+	}
+}
+
+// ── Context compaction ───────────────────────────────────────────────────────
+
+const compactionPrompt = `Summarize the following conversation concisely. Preserve key facts, decisions, code snippets, and context needed to continue the conversation. Be thorough but brief.
+
+%s`
+
+func (m Model) startCompaction() (Model, tea.Cmd) {
+	m.streaming = true // show streaming indicator
+	m.injectSystemLine("compacting context...")
+
+	recentCount := 6
+	if recentCount > len(m.messages) {
+		recentCount = len(m.messages)
+	}
+	cutoff := len(m.messages) - recentCount
+
+	// Build the old messages text for summarization
+	var sb strings.Builder
+	for _, msg := range m.messages[:cutoff] {
+		if msg.Role == "system" || msg.Role == "summary" {
+			continue
+		}
+		sb.WriteString(msg.Role)
+		sb.WriteString(": ")
+		sb.WriteString(msg.Content)
+		sb.WriteString("\n\n")
+	}
+	oldText := sb.String()
+
+	// Use the MAIN model for compaction (quality matters)
+	prov := m.provider
+	model := m.model
+
+	return m, func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		prompt := []llm.Message{
+			{Role: "user", Content: fmt.Sprintf(compactionPrompt, oldText)},
+		}
+		result, err := prov.Complete(ctx, model, prompt)
+		if err != nil {
+			return streamErrMsg("compaction failed: " + err.Error())
+		}
+		return compactionDoneMsg{summary: "Previous conversation summary:\n" + strings.TrimSpace(result)}
 	}
 }
 
@@ -1352,6 +1590,14 @@ func (m Model) renderMsg(msg *store.Message) string {
 			} else {
 				lines[i] = "  " + line
 			}
+		}
+		return strings.Join(lines, "\n")
+
+	case "summary":
+		// Compaction summary — render as dim block
+		lines := strings.Split(wordWrap(msg.Content, w), "\n")
+		for i, l := range lines {
+			lines[i] = dimStyle.Render(l)
 		}
 		return strings.Join(lines, "\n")
 

@@ -76,5 +76,5 @@ func buildSystemPrompt(memory string) string {
 	if strings.TrimSpace(memory) == "" {
 		return base
 	}
-	return base + "\n\n" + memory
+	return base + "\n\n## Things you know about the user\n" + memory
 }

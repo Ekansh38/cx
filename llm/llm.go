@@ -67,6 +67,8 @@ type Message struct {
 type Provider interface {
 	// Stream calls onToken for each token and returns the full content when done.
 	Stream(ctx context.Context, model string, msgs []Message, onToken func(string)) (string, error)
+	// Complete is a non-streaming one-shot call. Used for background tasks (memory, compaction).
+	Complete(ctx context.Context, model string, msgs []Message) (string, error)
 }
 
 // ForModel returns the right provider for the given model name using cfg.
