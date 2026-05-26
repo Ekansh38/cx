@@ -42,6 +42,7 @@ type Message struct {
 	ConvID    int64
 	Role      string
 	Content   string
+	ImagePath string
 	CreatedAt int64
 }
 
@@ -57,6 +58,8 @@ func New(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
+	// Migrations — safe to re-run (errors ignored if column already exists)
+	db.Exec(`ALTER TABLE messages ADD COLUMN image_path TEXT NOT NULL DEFAULT ''`)
 	return &Store{db: db}, nil
 }
 
@@ -140,7 +143,7 @@ func (s *Store) TouchConversation(id int64) error {
 // GetMessages returns all messages for a conversation in order.
 func (s *Store) GetMessages(convID int64) ([]*Message, error) {
 	rows, err := s.db.Query(
-		`SELECT id, conversation_id, role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC`,
+		`SELECT id, conversation_id, role, content, image_path, created_at FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC`,
 		convID,
 	)
 	if err != nil {
@@ -151,7 +154,7 @@ func (s *Store) GetMessages(convID int64) ([]*Message, error) {
 	var msgs []*Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.ConvID, &m.Role, &m.Content, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ConvID, &m.Role, &m.Content, &m.ImagePath, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, &m)
@@ -161,23 +164,28 @@ func (s *Store) GetMessages(convID int64) ([]*Message, error) {
 
 // AddMessage inserts a message and updates the conversation timestamp.
 func (s *Store) AddMessage(convID int64, role, content string) (*Message, error) {
+	return s.AddMessageWithImage(convID, role, content, "")
+}
+
+// AddMessageWithImage inserts a message with an optional image path.
+func (s *Store) AddMessageWithImage(convID int64, role, content, imagePath string) (*Message, error) {
 	now := time.Now().Unix()
 	res, err := s.db.Exec(
-		`INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)`,
-		convID, role, content, now,
+		`INSERT INTO messages (conversation_id, role, content, image_path, created_at) VALUES (?, ?, ?, ?, ?)`,
+		convID, role, content, imagePath, now,
 	)
 	if err != nil {
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
 	s.db.Exec(`UPDATE conversations SET updated_at = ? WHERE id = ?`, now, convID)
-	return &Message{ID: id, ConvID: convID, Role: role, Content: content, CreatedAt: now}, nil
+	return &Message{ID: id, ConvID: convID, Role: role, Content: content, ImagePath: imagePath, CreatedAt: now}, nil
 }
 
 // SearchMessages returns messages containing query across all conversations.
 func (s *Store) SearchMessages(query string) ([]*Message, error) {
 	rows, err := s.db.Query(
-		`SELECT id, conversation_id, role, content, created_at FROM messages WHERE content LIKE ? ORDER BY created_at DESC LIMIT 200`,
+		`SELECT id, conversation_id, role, content, image_path, created_at FROM messages WHERE content LIKE ? ORDER BY created_at DESC LIMIT 200`,
 		"%"+query+"%",
 	)
 	if err != nil {
@@ -188,7 +196,7 @@ func (s *Store) SearchMessages(query string) ([]*Message, error) {
 	var msgs []*Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.ConvID, &m.Role, &m.Content, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ConvID, &m.Role, &m.Content, &m.ImagePath, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, &m)

@@ -2,9 +2,11 @@ package ui
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -58,10 +60,10 @@ type searchResult struct {
 
 var commands = []string{
 	":clear", ":copy", ":debug", ":delete",
-	":forget ", ":grep", ":help", ":list",
-	":model ", ":models", ":new", ":q",
-	":quit", ":r", ":remember ", ":rename ",
-	":retry", ":wipe",
+	":forget ", ":grep", ":help", ":img ",
+	":list", ":model ", ":models", ":new",
+	":q", ":quit", ":r", ":remember ",
+	":rename ", ":retry", ":wipe",
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -83,7 +85,9 @@ type Model struct {
 	// chat view
 	viewport    viewport.Model
 	input       textinput.Model
-	atBottom    bool
+	inputBuf     string // multiline buffer (alt+enter adds lines)
+	pendingImage string // base64 data URL for next message
+	atBottom     bool
 	autoTitled  bool   // prevent re-triggering auto-title
 	errMsg      string // shown on separator row, cleared on next input
 
@@ -316,16 +320,32 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case tea.KeyEnter:
+		if msg.Alt {
+			// Alt+Enter: add newline to buffer, keep typing
+			m.inputBuf += m.input.Value() + "\n"
+			m.input.SetValue("")
+			return m, nil
+		}
 		if m.streaming {
 			return m, nil
 		}
-		input := strings.TrimSpace(m.input.Value())
+		// Combine buffer + current input
+		full := m.inputBuf + m.input.Value()
+		input := strings.TrimSpace(full)
 		if input == "" {
 			return m, nil
 		}
 		m.input.SetValue("")
+		m.inputBuf = ""
 		m.errMsg = ""
 		return m.handleInput(input)
+
+	case tea.KeyEsc:
+		if m.inputBuf != "" {
+			// Escape clears the multiline buffer
+			m.inputBuf = ""
+			return m, nil
+		}
 
 	case tea.KeyTab:
 		matches := completionsFor(m.input.Value())
@@ -575,6 +595,56 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.atBottom = true
 		return m.startStream()
 
+	case ":img":
+		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+			m.errMsg = "usage: :img /path/to/image.png [optional message]"
+			return m, nil
+		}
+		rest := strings.TrimSpace(parts[1])
+		// Split into path and optional message
+		imgPath, text := rest, ""
+		if idx := strings.IndexByte(rest, ' '); idx >= 0 {
+			imgPath = rest[:idx]
+			text = strings.TrimSpace(rest[idx+1:])
+		}
+		if text == "" {
+			text = "What's in this image?"
+		}
+		// Resolve and validate path
+		if strings.HasPrefix(imgPath, "~") {
+			home, _ := os.UserHomeDir()
+			imgPath = home + imgPath[1:]
+		}
+		absPath, err := filepath.Abs(imgPath)
+		if err != nil {
+			m.errMsg = "invalid path: " + err.Error()
+			return m, nil
+		}
+		dataURL, err := encodeImageToDataURL(absPath)
+		if err != nil {
+			m.errMsg = "image: " + err.Error()
+			return m, nil
+		}
+		// Save with image path, display placeholder
+		display := text + "\n[image: " + filepath.Base(absPath) + "]"
+		if saved, err := m.store.AddMessageWithImage(m.conv.ID, "user", display, absPath); err == nil {
+			saved.ImagePath = absPath
+			m.messages = append(m.messages, saved)
+		} else {
+			m.messages = append(m.messages, &store.Message{Role: "user", Content: display, ImagePath: absPath})
+		}
+		// Stash the data URL for the next buildLLMMessages call
+		m.pendingImage = dataURL
+		m.refreshContent()
+		m.viewport.GotoBottom()
+		m.atBottom = true
+		msgs := m.buildLLMMessages()
+		tokenCount := llm.EstimateMessagesTokens(msgs)
+		if tokenCount > m.cfg.MaxContextTokens*3/4 {
+			return m.startCompaction()
+		}
+		return m.startStream()
+
 	case ":remember":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
 			m.errMsg = "usage: :remember <fact>"
@@ -640,6 +710,7 @@ const helpText = `keybindings
   ctrl+t       model switcher
   ctrl+e       open $EDITOR for long input
   ctrl+u / d   scroll half page
+  alt+enter    newline (multiline input)
   ↑ ↓          scroll one line
   tab          autocomplete :command
 
@@ -651,6 +722,7 @@ commands  (type : to see completions)
   :grep                 search messages
   :copy                 copy last assistant message to clipboard
   :retry / :r           re-send last message (gets a new response)
+  :img <path> [text]    send an image (png/jpg/gif/webp)
   :delete               delete current conversation
   :rename <title>       rename this conversation
   :model <name>         switch model mid-conversation
@@ -679,6 +751,7 @@ func (m Model) startStream() (Model, tea.Cmd) {
 	m.streamBuf.Reset()
 
 	msgs := m.buildLLMMessages()
+	m.pendingImage = "" // consumed
 	return m, tea.Batch(
 		runStream(ctx, m.provider, m.model, msgs, ch),
 		listenToken(ch),
@@ -720,16 +793,27 @@ func listenToken(ch <-chan string) tea.Cmd {
 
 func (m Model) buildLLMMessages() []llm.Message {
 	out := []llm.Message{{Role: "system", Content: m.systemPrompt}}
-	for _, msg := range m.messages {
+	for i, msg := range m.messages {
 		if msg.Role == "summary" {
-			// Compaction summary — include as system context
 			out = append(out, llm.Message{Role: "system", Content: msg.Content})
 			continue
 		}
 		if msg.Role == "system" {
-			continue // skip display-only injections
+			continue
 		}
-		out = append(out, llm.Message{Role: msg.Role, Content: msg.Content})
+		lm := llm.Message{Role: msg.Role, Content: msg.Content}
+		// Attach image if this message has one
+		if msg.ImagePath != "" {
+			dataURL, err := encodeImageToDataURL(msg.ImagePath)
+			if err == nil {
+				lm.Images = append(lm.Images, dataURL)
+			}
+		}
+		// Attach pending image to the last user message
+		if m.pendingImage != "" && i == len(m.messages)-1 && msg.Role == "user" {
+			lm.Images = append(lm.Images, m.pendingImage)
+		}
+		out = append(out, lm)
 	}
 	return out
 }
@@ -1380,7 +1464,10 @@ func (m Model) sepView() string {
 func (m Model) inputView() string {
 	prefix := promptStyle.Render("> ")
 	if m.streaming {
-		prefix = dimStyle.Render("  ") // indent, no prompt while streaming
+		prefix = dimStyle.Render("  ")
+	} else if m.inputBuf != "" {
+		lines := strings.Count(m.inputBuf, "\n") + 1
+		prefix = promptStyle.Render(fmt.Sprintf("%d> ", lines))
 	}
 	return prefix + m.input.View()
 }
@@ -1702,6 +1789,29 @@ func completionsFor(input string) []string {
 		}
 	}
 	return out
+}
+
+var imageExts = map[string]string{
+	".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+	".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+}
+
+func encodeImageToDataURL(path string) (string, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	mime, ok := imageExts[ext]
+	if !ok {
+		return "", fmt.Errorf("unsupported image type: %s", ext)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	// Cap at 20MB
+	if len(data) > 20*1024*1024 {
+		return "", fmt.Errorf("image too large (%d MB, max 20MB)", len(data)/1024/1024)
+	}
+	encoded := base64.StdEncoding.EncodeToString(data)
+	return "data:" + mime + ";base64," + encoded, nil
 }
 
 func copyToClipboard(text string) error {

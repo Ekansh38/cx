@@ -61,6 +61,7 @@ func FetchOpenRouterModels(apiKey string) ([]ModelInfo, error) {
 type Message struct {
 	Role    string
 	Content string
+	Images  []string // base64 data URLs (e.g. "data:image/png;base64,...")
 }
 
 // Provider streams responses from an LLM.

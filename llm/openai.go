@@ -16,21 +16,62 @@ type openAIProvider struct {
 	baseURL string
 }
 
-func (p *openAIProvider) Complete(ctx context.Context, model string, msgs []Message) (string, error) {
-	type oMsg struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
+// oMsg supports both plain text and multimodal content.
+type oMsg struct {
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"` // string or []contentPart
+}
+
+type contentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *imageURL `json:"image_url,omitempty"`
+}
+
+type imageURL struct {
+	URL string `json:"url"`
+}
+
+// buildMessages converts llm.Messages to OpenAI API format,
+// using content arrays when images are present.
+func buildMessages(msgs []Message) []oMsg {
+	out := make([]oMsg, 0, len(msgs))
+	for _, m := range msgs {
+		if len(m.Images) == 0 {
+			out = append(out, oMsg{Role: m.Role, Content: m.Content})
+			continue
+		}
+		// Multimodal: text + images
+		parts := []contentPart{{Type: "text", Text: m.Content}}
+		for _, img := range m.Images {
+			parts = append(parts, contentPart{
+				Type:     "image_url",
+				ImageURL: &imageURL{URL: img},
+			})
+		}
+		out = append(out, oMsg{Role: m.Role, Content: parts})
 	}
+	return out
+}
+
+func (p *openAIProvider) setHeaders(req *http.Request) {
+	req.Header.Set("Content-Type", "application/json")
+	if p.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
+	if strings.Contains(p.baseURL, "openrouter.ai") {
+		req.Header.Set("HTTP-Referer", "https://github.com/Ekansh38/cx")
+		req.Header.Set("X-OpenRouter-Title", "cx")
+	}
+}
+
+func (p *openAIProvider) Complete(ctx context.Context, model string, msgs []Message) (string, error) {
 	type reqBody struct {
 		Model    string `json:"model"`
 		Messages []oMsg `json:"messages"`
 	}
 
-	body := reqBody{Model: model}
-	for _, m := range msgs {
-		body.Messages = append(body.Messages, oMsg{Role: m.Role, Content: m.Content})
-	}
-
+	body := reqBody{Model: model, Messages: buildMessages(msgs)}
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return "", err
@@ -40,14 +81,7 @@ func (p *openAIProvider) Complete(ctx context.Context, model string, msgs []Mess
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
-	if strings.Contains(p.baseURL, "openrouter.ai") {
-		req.Header.Set("HTTP-Referer", "https://github.com/Ekansh38/cx")
-		req.Header.Set("X-OpenRouter-Title", "cx")
-	}
+	p.setHeaders(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -77,10 +111,6 @@ func (p *openAIProvider) Complete(ctx context.Context, model string, msgs []Mess
 }
 
 func (p *openAIProvider) Stream(ctx context.Context, model string, msgs []Message, onToken func(string)) (string, error) {
-	type oMsg struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
 	type reqBody struct {
 		Model         string `json:"model"`
 		Stream        bool   `json:"stream"`
@@ -90,11 +120,8 @@ func (p *openAIProvider) Stream(ctx context.Context, model string, msgs []Messag
 		Messages []oMsg `json:"messages"`
 	}
 
-	body := reqBody{Model: model, Stream: true}
+	body := reqBody{Model: model, Stream: true, Messages: buildMessages(msgs)}
 	body.StreamOptions.IncludeUsage = true
-	for _, m := range msgs {
-		body.Messages = append(body.Messages, oMsg{Role: m.Role, Content: m.Content})
-	}
 
 	buf, err := json.Marshal(body)
 	if err != nil {
@@ -105,15 +132,7 @@ func (p *openAIProvider) Stream(ctx context.Context, model string, msgs []Messag
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if p.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	}
-	// OpenRouter requires these for some accounts
-	if strings.Contains(p.baseURL, "openrouter.ai") {
-		req.Header.Set("HTTP-Referer", "https://github.com/Ekansh38/cx")
-		req.Header.Set("X-OpenRouter-Title", "cx")
-	}
+	p.setHeaders(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
