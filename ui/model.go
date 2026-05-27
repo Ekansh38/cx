@@ -230,9 +230,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case editorDoneMsg:
-		m.input.SetValue(string(msg))
-		m.input.CursorEnd()
-		return m, nil
+		content := strings.TrimSpace(string(msg))
+		if content == "" {
+			return m, nil
+		}
+		// Send editor content directly — preserves all formatting
+		return m.handleInput(content)
 
 	case modelsLoadedMsg:
 		m.modelList = []llm.ModelInfo(msg)
