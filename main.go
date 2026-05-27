@@ -30,22 +30,30 @@ func main() {
 	}
 	defer st.Close()
 
-	// Resolve model and provider
+	// Load or create conversation
+	conv, err := st.MostRecent()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Resolve model: env var > most recent conversation > config > fallback
 	model := cfg.Model
+	if conv != nil && conv.Model != "" {
+		model = conv.Model
+	}
 	if m := os.Getenv("CX_MODEL"); m != "" {
 		model = m
 	}
+	if model == "" {
+		model = "llama3.2" // last resort fallback
+	}
+
 	prov, err := llm.ForModel(model, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "provider: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Load or create conversation
-	conv, err := st.MostRecent()
-	if err != nil {
-		log.Fatal(err)
-	}
 	if conv == nil {
 		conv, err = st.CreateConversation(model)
 		if err != nil {
