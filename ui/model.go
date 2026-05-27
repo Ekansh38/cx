@@ -329,13 +329,14 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.input.SetValue("")
 			return m, nil
 		}
-		if m.streaming {
-			return m, nil
-		}
 		// Combine buffer + current input
 		full := m.inputBuf + m.input.Value()
 		input := strings.TrimSpace(full)
 		if input == "" {
+			return m, nil
+		}
+		// Allow commands during streaming, block regular messages
+		if m.streaming && !strings.HasPrefix(input, ":") {
 			return m, nil
 		}
 		m.input.SetValue("")
