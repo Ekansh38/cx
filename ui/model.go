@@ -1447,6 +1447,7 @@ func (m Model) chatView() string {
 		m.viewport.View(),
 		m.sepView(),
 		m.inputView(),
+		"",
 		m.statusView(),
 	)
 }
@@ -1725,7 +1726,7 @@ func (m Model) renderMarkdown(content string, width int) string {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func (m Model) viewportHeight() int {
-	h := m.height - 3 // history + sep + input + status = 4 rows; viewport gets the rest
+	h := m.height - 4 // sep + input + blank + status = 4 rows below viewport
 	if h < 1 {
 		h = 1
 	}
