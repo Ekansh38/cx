@@ -1490,11 +1490,7 @@ func (m Model) statusView() string {
 	left := "  " + modelDisplay + "  ·  " + m.conv.Title
 
 	var right string
-	if m.streaming {
-		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-		frame := frames[int(time.Now().UnixMilli()/100)%len(frames)]
-		right = "  " + frame + " generating  "
-	} else if !m.atBottom {
+	if !m.atBottom {
 		right = "  ↑ scroll  "
 	} else {
 		right = "  "
@@ -1671,6 +1667,10 @@ func (m *Model) refreshContent() {
 		if m.streamBuf.Len() > 0 {
 			sb.WriteString(m.renderMarkdown(m.streamBuf.String(), m.viewport.Width-2))
 			sb.WriteString(cursorStyle.Render(" █"))
+		} else {
+			frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+			frame := frames[int(time.Now().UnixMilli()/100)%len(frames)]
+			sb.WriteString(dimStyle.Render("  " + frame + " thinking..."))
 		}
 	}
 	m.viewport.SetContent(sb.String())
