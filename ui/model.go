@@ -234,7 +234,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if content == "" {
 			return m, nil
 		}
-		// Send editor content directly — preserves all formatting
+		m.input.SetValue("")
+		m.inputBuf = ""
 		return m.handleInput(content)
 
 	case modelsLoadedMsg:
@@ -1067,6 +1068,11 @@ func (m Model) updatePicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case tea.KeySpace:
+		m.pickerFilter += " "
+		m.pickerCursor = 0
+		return m, nil
+
 	case tea.KeyRunes:
 		m.pickerFilter += string(msg.Runes)
 		m.pickerCursor = 0
@@ -1209,6 +1215,11 @@ func (m Model) updateSearch(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case tea.KeySpace:
+		m.searchInput += " "
+		m.searchCursor = 0
+		return m, nil
+
 	case tea.KeyRunes:
 		m.searchInput += string(msg.Runes)
 		m.searchCursor = 0
@@ -1302,6 +1313,11 @@ func (m Model) updateModelPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case tea.KeySpace:
+		m.modelFilter += " "
+		m.modelCursor = 0
+		return m, nil
+
 	case tea.KeyRunes:
 		m.modelFilter += string(msg.Runes)
 		m.modelCursor = 0
@@ -1327,24 +1343,23 @@ func (m Model) filteredModels() []llm.ModelInfo {
 
 func (m Model) modelPickerView() string {
 	var sb strings.Builder
-	sb.WriteString("\n")
-	sb.WriteString(pickerTitleStyle.Render("  models") + "\n\n")
+	sb.WriteString("\n\n")
+	sb.WriteString(pickerTitleStyle.Render("   Models") + "\n\n")
 
 	filterText := m.modelFilter
 	if filterText == "" {
 		filterText = dimStyle.Render("type to filter...")
 	}
-	sb.WriteString(promptStyle.Render("  > ") + filterText + "\n")
-	sb.WriteString(sepStyle.Render(strings.Repeat("─", m.width)) + "\n")
+	sb.WriteString(promptStyle.Render("   > ") + filterText + "\n\n")
 
 	if m.modelLoading {
-		sb.WriteString(dimStyle.Render("  fetching models from OpenRouter...") + "\n")
+		sb.WriteString(dimStyle.Render("   fetching models...") + "\n")
 	} else {
 		filtered := m.filteredModels()
 		if len(filtered) == 0 {
-			sb.WriteString(dimStyle.Render("  no matches") + "\n")
+			sb.WriteString(dimStyle.Render("   no matches") + "\n")
 		} else {
-			maxVisible := m.height - 9
+			maxVisible := m.height - 10
 			if maxVisible < 1 {
 				maxVisible = 1
 			}
@@ -1361,13 +1376,16 @@ func (m Model) modelPickerView() string {
 				mi := filtered[i]
 				isCurrent := mi.ID == m.model
 
-				dot := "  "
+				marker := "   "
 				if isCurrent {
-					dot = "● "
+					marker = " ● "
+				}
+				if i == m.modelCursor {
+					marker = " › "
 				}
 
 				name := mi.ID
-				maxName := m.width - 6
+				maxName := m.width - 8
 				if maxName < 20 {
 					maxName = 20
 				}
@@ -1375,21 +1393,21 @@ func (m Model) modelPickerView() string {
 					name = string([]rune(name)[:maxName-1]) + "…"
 				}
 
-				line := dot + name
 				if i == m.modelCursor {
-					sb.WriteString(pickerSelectedStyle.Render(line) + "\n")
+					sb.WriteString(pickerSelectedStyle.Render(marker+name) + "\n")
 				} else {
-					sb.WriteString(pickerRowStyle.Render(line) + "\n")
+					sb.WriteString(pickerRowStyle.Render(marker+name) + "\n")
 				}
 			}
 			if len(filtered) > maxVisible {
-				sb.WriteString(dimStyle.Render(fmt.Sprintf("  … %d more", len(filtered)-maxVisible)) + "\n")
+				sb.WriteString("\n")
+				sb.WriteString(dimStyle.Render(fmt.Sprintf("   … %d more", len(filtered)-maxVisible)) + "\n")
 			}
 		}
 	}
 
-	sb.WriteString("\n")
-	sb.WriteString(dimStyle.Render("  ↑↓ navigate   enter select   esc cancel"))
+	sb.WriteString("\n\n")
+	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter select  esc back"))
 	return sb.String()
 }
 
@@ -1507,12 +1525,11 @@ func (m Model) statusView() string {
 
 func (m Model) pickerView() string {
 	filtered := m.filteredConvs()
-	maxVisible := m.height - 8
+	maxVisible := m.height - 10
 	if maxVisible < 1 {
 		maxVisible = 1
 	}
 
-	// Scroll window around cursor
 	start := 0
 	if m.pickerCursor >= maxVisible {
 		start = m.pickerCursor - maxVisible + 1
@@ -1523,25 +1540,23 @@ func (m Model) pickerView() string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("\n")
-	sb.WriteString(pickerTitleStyle.Render("  conversations") + "\n\n")
+	sb.WriteString("\n\n")
+	sb.WriteString(pickerTitleStyle.Render("   Conversations") + "\n\n")
 
-	// Filter input line
 	filterText := m.pickerFilter
 	if filterText == "" {
 		filterText = dimStyle.Render("type to filter...")
 	}
-	sb.WriteString(promptStyle.Render("  > ") + filterText + "\n")
-	sb.WriteString(sepStyle.Render(strings.Repeat("─", m.width)) + "\n")
+	sb.WriteString(promptStyle.Render("   > ") + filterText + "\n\n")
 
 	if len(filtered) == 0 {
-		sb.WriteString(dimStyle.Render("  no matches") + "\n")
+		sb.WriteString(dimStyle.Render("   no matches") + "\n")
 	} else {
 		for i := start; i < end; i++ {
 			c := filtered[i]
-			age := timeAgo(c.UpdatedAt)
+			age := dimStyle.Render(timeAgo(c.UpdatedAt))
 			title := c.Title
-			maxTitle := m.width - 14
+			maxTitle := m.width - 18
 			if maxTitle < 10 {
 				maxTitle = 10
 			}
@@ -1552,25 +1567,30 @@ func (m Model) pickerView() string {
 			isCurrent := c.ID == m.conv.ID
 			isSelected := i == m.pickerCursor
 
-			dot := "  "
+			marker := "   "
 			if isCurrent {
-				dot = "● "
+				marker = " ● "
 			}
-			line := fmt.Sprintf("%s%-*s  %s", dot, maxTitle, title, age)
+			if isSelected {
+				marker = " › "
+			}
+
+			line := fmt.Sprintf("%-*s  %s", maxTitle, title, age)
 
 			if isSelected {
-				sb.WriteString(pickerSelectedStyle.Render(line) + "\n")
+				sb.WriteString(pickerSelectedStyle.Render(marker+line) + "\n")
 			} else {
-				sb.WriteString(pickerRowStyle.Render(line) + "\n")
+				sb.WriteString(pickerRowStyle.Render(marker+line) + "\n")
 			}
 		}
 		if len(filtered) > maxVisible {
-			sb.WriteString(dimStyle.Render(fmt.Sprintf("  … %d more", len(filtered)-maxVisible)) + "\n")
+			sb.WriteString("\n")
+			sb.WriteString(dimStyle.Render(fmt.Sprintf("   … %d more", len(filtered)-maxVisible)) + "\n")
 		}
 	}
 
-	sb.WriteString("\n")
-	sb.WriteString(dimStyle.Render("  ↑↓ navigate   enter select   ctrl+n new   esc cancel"))
+	sb.WriteString("\n\n")
+	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter select  ctrl+n new  esc back"))
 	return sb.String()
 }
 
@@ -1578,7 +1598,7 @@ func (m Model) pickerView() string {
 
 func (m Model) searchView() string {
 	filtered := m.filteredSearch()
-	maxVisible := m.height - 9
+	maxVisible := m.height - 10
 	if maxVisible < 1 {
 		maxVisible = 1
 	}
@@ -1593,26 +1613,24 @@ func (m Model) searchView() string {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("\n")
-	sb.WriteString(pickerTitleStyle.Render("  search messages") + "\n\n")
+	sb.WriteString("\n\n")
+	sb.WriteString(pickerTitleStyle.Render("   Search") + "\n\n")
 
 	filterText := m.searchInput
 	if filterText == "" {
-		filterText = dimStyle.Render("type to search...")
+		filterText = dimStyle.Render("search conversations and messages...")
 	}
-	sb.WriteString(promptStyle.Render("  > ") + filterText + "\n")
-	sb.WriteString(sepStyle.Render(strings.Repeat("─", m.width)) + "\n")
+	sb.WriteString(promptStyle.Render("   > ") + filterText + "\n\n")
 
 	if len(m.searchAll) == 0 {
-		sb.WriteString(dimStyle.Render("  no messages yet") + "\n")
+		sb.WriteString(dimStyle.Render("   no messages yet") + "\n")
 	} else if len(filtered) == 0 {
-		sb.WriteString(dimStyle.Render("  no matches") + "\n")
+		sb.WriteString(dimStyle.Render("   no matches") + "\n")
 	} else {
 		for i := start; i < end; i++ {
 			r := filtered[i]
-			role := r.msg.Role
 			convTitle := r.conv.Title
-			maxTitle := 20
+			maxTitle := 22
 			if utf8.RuneCountInString(convTitle) > maxTitle {
 				convTitle = string([]rune(convTitle)[:maxTitle-1]) + "…"
 			}
@@ -1622,7 +1640,7 @@ func (m Model) searchView() string {
 			if nl := strings.Index(preview, "\n"); nl >= 0 {
 				preview = preview[:nl]
 			}
-			maxPreview := m.width - maxTitle - 22
+			maxPreview := m.width - maxTitle - 16
 			if maxPreview < 20 {
 				maxPreview = 20
 			}
@@ -1630,23 +1648,28 @@ func (m Model) searchView() string {
 				preview = string([]rune(preview)[:maxPreview-1]) + "…"
 			}
 
-			age := dimStyle.Render(timeAgo(r.msg.CreatedAt))
-			roleTag := fmt.Sprintf("[%-4s]", role)
-			line := fmt.Sprintf("  %s  %-*s  %s  %s", roleTag, maxTitle, convTitle, preview, age)
+			marker := "   "
+			if i == m.searchCursor {
+				marker = " › "
+			}
+
+			titlePart := dimStyle.Render(convTitle)
+			line := fmt.Sprintf("%s%s  %s", marker, preview, titlePart)
 
 			if i == m.searchCursor {
-				sb.WriteString(pickerSelectedStyle.Render(line) + "\n")
+				sb.WriteString(pickerSelectedStyle.Render(marker+preview) + "  " + titlePart + "\n")
 			} else {
 				sb.WriteString(pickerRowStyle.Render(line) + "\n")
 			}
 		}
 		if len(filtered) > maxVisible {
-			sb.WriteString(dimStyle.Render(fmt.Sprintf("  … %d more", len(filtered)-maxVisible)) + "\n")
+			sb.WriteString("\n")
+			sb.WriteString(dimStyle.Render(fmt.Sprintf("   … %d more", len(filtered)-maxVisible)) + "\n")
 		}
 	}
 
-	sb.WriteString("\n")
-	sb.WriteString(dimStyle.Render("  ↑↓ navigate   enter jump to conv   esc cancel"))
+	sb.WriteString("\n\n")
+	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter open  esc back"))
 	return sb.String()
 }
 
