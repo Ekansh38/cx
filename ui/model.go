@@ -12,7 +12,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
@@ -83,9 +84,8 @@ type Model struct {
 	ready  bool
 
 	// chat view
-	viewport    viewport.Model
-	input       textinput.Model
-	inputBuf     string // multiline buffer (alt+enter adds lines)
+	viewport     viewport.Model
+	input        textarea.Model
 	pendingImage string // base64 data URL for next message
 	atBottom     bool
 	autoTitled  bool   // prevent re-triggering auto-title
@@ -121,11 +121,19 @@ type Model struct {
 // ── constructor ───────────────────────────────────────────────────────────────
 
 func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*store.Message, prov llm.Provider, modelName, sysPrompt string) Model {
-	ti := textinput.New()
-	ti.Prompt = "" // we render our own "> " prefix
-	ti.Placeholder = "message..."
-	ti.Focus()
-	ti.CharLimit = 0
+	ta := textarea.New()
+	ta.Prompt = ""
+	ta.Placeholder = "message..."
+	ta.ShowLineNumbers = false
+	ta.CharLimit = 0
+	ta.MaxHeight = 10
+	ta.SetHeight(1)
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	ta.FocusedStyle.Base = lipgloss.NewStyle()
+	ta.BlurredStyle.Base = lipgloss.NewStyle()
+	// Enter = submit (we handle it), Alt+Enter / Shift+Enter = newline
+	ta.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("alt+enter", "shift+enter"))
+	ta.Focus()
 
 	return Model{
 		cfg:          cfg,
@@ -134,7 +142,7 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 		messages:     msgs,
 		provider:     prov,
 		model:        modelName,
-		input:        ti,
+		input:        ta,
 		systemPrompt: sysPrompt,
 		atBottom:     true,
 		state:        stateChat,
@@ -143,7 +151,7 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 }
 
 func (m Model) Init() tea.Cmd {
-	return textinput.Blink
+	return textarea.Blink
 }
 
 // ── Update ────────────────────────────────────────────────────────────────────
@@ -161,7 +169,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.Width = msg.Width
 			m.viewport.Height = m.viewportHeight()
 		}
-		m.input.Width = msg.Width - 3
+		m.input.SetWidth(msg.Width - 4)
 		m.refreshContent() // re-wrap on every resize
 		if m.atBottom {
 			m.viewport.GotoBottom()
@@ -235,7 +243,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.input.SetValue("")
-		m.inputBuf = ""
 		return m.handleInput(content)
 
 	case modelsLoadedMsg:
@@ -324,33 +331,18 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case tea.KeyEnter:
-		if msg.Alt {
-			// Alt+Enter: add newline to buffer, keep typing
-			m.inputBuf += m.input.Value() + "\n"
-			m.input.SetValue("")
-			return m, nil
-		}
-		// Combine buffer + current input
-		full := m.inputBuf + m.input.Value()
-		input := strings.TrimSpace(full)
+		// Alt+Enter / Shift+Enter handled by textarea (inserts newline)
+		input := strings.TrimSpace(m.input.Value())
 		if input == "" {
 			return m, nil
 		}
-		// Allow commands during streaming, block regular messages
 		if m.streaming && !strings.HasPrefix(input, ":") {
 			return m, nil
 		}
-		m.input.SetValue("")
-		m.inputBuf = ""
+		m.input.Reset()
+		m.input.SetHeight(1)
 		m.errMsg = ""
 		return m.handleInput(input)
-
-	case tea.KeyEsc:
-		if m.inputBuf != "" {
-			// Escape clears the multiline buffer
-			m.inputBuf = ""
-			return m, nil
-		}
 
 	case tea.KeyTab:
 		matches := completionsFor(m.input.Value())
@@ -408,6 +400,12 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
+	// Dynamically resize textarea + viewport based on line count
+	newH := m.inputHeight()
+	if newH != m.input.Height() {
+		m.input.SetHeight(newH)
+		m.viewport.Height = m.viewportHeight()
+	}
 	return m, cmd
 }
 
@@ -1471,12 +1469,9 @@ func (m Model) chatView() string {
 }
 
 func (m Model) sepView() string {
-	val := m.input.Value()
-	if m.inputBuf != "" {
-		val = m.inputBuf + val
-	}
-	if strings.HasPrefix(strings.TrimSpace(val), ":") {
-		matches := completionsFor(strings.TrimSpace(val))
+	val := strings.TrimSpace(m.input.Value())
+	if strings.HasPrefix(val, ":") {
+		matches := completionsFor(val)
 		if len(matches) > 0 {
 			return completionStyle.Render("  " + strings.Join(matches, "  "))
 		}
@@ -1491,11 +1486,19 @@ func (m Model) inputView() string {
 	prefix := promptStyle.Render(" > ")
 	if m.streaming {
 		prefix = dimStyle.Render(" > ")
-	} else if m.inputBuf != "" {
-		lines := strings.Count(m.inputBuf, "\n") + 1
-		prefix = promptStyle.Render(fmt.Sprintf(" %d> ", lines))
 	}
 	return prefix + m.input.View()
+}
+
+func (m Model) inputHeight() int {
+	lines := m.input.LineCount()
+	if lines < 1 {
+		lines = 1
+	}
+	if lines > 10 {
+		lines = 10
+	}
+	return lines
 }
 
 func (m Model) statusView() string {
@@ -1756,7 +1759,8 @@ func (m Model) renderMarkdown(content string, width int) string {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func (m Model) viewportHeight() int {
-	h := m.height - 4 // sep + input + blank + status = 4 rows below viewport
+	// sep(1) + input(dynamic) + blank(1) + status(1) = 3 + inputHeight
+	h := m.height - 3 - m.inputHeight()
 	if h < 1 {
 		h = 1
 	}
