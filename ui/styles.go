@@ -9,6 +9,11 @@ var (
 			Bold(true).
 			Foreground(lipgloss.Color("6"))
 
+	// Assistant role label
+	assistantLabelStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("5")) // magenta
+
 	// User prompt prefix "> "
 	promptStyle = lipgloss.NewStyle().
 			Bold(true).
@@ -16,11 +21,12 @@ var (
 
 	// Separator line
 	sepStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("240"))
+			Foreground(lipgloss.Color("238"))
 
-	// Status bar: plain dim gray, no background
+	// Status bar: subtle background
 	statusStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("243"))
+			Foreground(lipgloss.Color("245")).
+			Background(lipgloss.Color("236"))
 
 	// Command completions shown on separator row
 	completionStyle = lipgloss.NewStyle().
@@ -39,7 +45,7 @@ var (
 	pickerRowStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("252"))
 
-	// Dim text for picker meta info (age) and :help output
+	// Dim text for picker meta info, :help, system annotations
 	dimStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("246"))
 
@@ -47,4 +53,9 @@ var (
 	pickerTitleStyle = lipgloss.NewStyle().
 				Bold(true).
 				Foreground(lipgloss.Color("252"))
+
+	// Streaming cursor
+	cursorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("6")).
+			Bold(true)
 )

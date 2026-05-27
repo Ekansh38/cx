@@ -1454,10 +1454,13 @@ func (m Model) chatView() string {
 
 func (m Model) sepView() string {
 	val := m.input.Value()
-	if strings.HasPrefix(val, ":") {
-		matches := completionsFor(val)
+	if m.inputBuf != "" {
+		val = m.inputBuf + val
+	}
+	if strings.HasPrefix(strings.TrimSpace(val), ":") {
+		matches := completionsFor(strings.TrimSpace(val))
 		if len(matches) > 0 {
-			return completionStyle.Render("  " + strings.Join(matches, "   "))
+			return completionStyle.Render("  " + strings.Join(matches, "  "))
 		}
 	}
 	if m.errMsg != "" {
@@ -1467,26 +1470,30 @@ func (m Model) sepView() string {
 }
 
 func (m Model) inputView() string {
-	prefix := promptStyle.Render("> ")
+	prefix := promptStyle.Render(" > ")
 	if m.streaming {
-		prefix = dimStyle.Render("  ")
+		prefix = dimStyle.Render(" > ")
 	} else if m.inputBuf != "" {
 		lines := strings.Count(m.inputBuf, "\n") + 1
-		prefix = promptStyle.Render(fmt.Sprintf("%d> ", lines))
+		prefix = promptStyle.Render(fmt.Sprintf(" %d> ", lines))
 	}
 	return prefix + m.input.View()
 }
 
 func (m Model) statusView() string {
-	modelPart := m.model
-	titlePart := m.conv.Title
+	// Shorten model name for display (e.g. "anthropic/claude-sonnet-4-5" → "claude-sonnet-4-5")
+	modelDisplay := m.model
+	if idx := strings.LastIndex(modelDisplay, "/"); idx >= 0 {
+		modelDisplay = modelDisplay[idx+1:]
+	}
 
-	left := fmt.Sprintf("  %s  ·  %s", modelPart, titlePart)
+	left := "  " + modelDisplay + "  ·  " + m.conv.Title
 
 	var right string
 	if m.streaming {
-		dots := strings.Repeat(".", int(time.Now().UnixMilli()/400)%4)
-		right = fmt.Sprintf("  thinking%-4s", dots)
+		frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+		frame := frames[int(time.Now().UnixMilli()/100)%len(frames)]
+		right = "  " + frame + " generating  "
 	} else if !m.atBottom {
 		right = "  ↑ scroll  "
 	} else {
@@ -1654,14 +1661,17 @@ func (m *Model) refreshContent() {
 		return
 	}
 	var sb strings.Builder
-	sb.WriteString("\n") // top padding
+	sb.WriteString("\n")
 	for _, msg := range m.messages {
 		sb.WriteString(m.renderMsg(msg))
-		sb.WriteString("\n\n")
+		sb.WriteString("\n")
 	}
-	if m.streaming && m.streamBuf.Len() > 0 {
-		sb.WriteString(wordWrap(m.streamBuf.String(), m.viewport.Width))
-		sb.WriteString(" ▊")
+	if m.streaming {
+		sb.WriteString(assistantLabelStyle.Render("cx") + "\n")
+		if m.streamBuf.Len() > 0 {
+			sb.WriteString(m.renderMarkdown(m.streamBuf.String(), m.viewport.Width-2))
+			sb.WriteString(cursorStyle.Render(" █"))
+		}
 	}
 	m.viewport.SetContent(sb.String())
 }
@@ -1674,35 +1684,32 @@ func (m Model) renderMsg(msg *store.Message) string {
 
 	switch msg.Role {
 	case "user":
+		label := userStyle.Render("you")
 		wrapped := wordWrap(msg.Content, w-2)
 		lines := strings.Split(wrapped, "\n")
 		for i, line := range lines {
-			if i == 0 {
-				lines[i] = userStyle.Render("> ") + line
-			} else {
-				lines[i] = "  " + line
-			}
+			lines[i] = "  " + line
 		}
-		return strings.Join(lines, "\n")
+		return label + "\n" + strings.Join(lines, "\n") + "\n"
 
 	case "summary":
-		// Compaction summary — render as dim block
 		lines := strings.Split(wordWrap(msg.Content, w), "\n")
 		for i, l := range lines {
-			lines[i] = dimStyle.Render(l)
+			lines[i] = dimStyle.Render("  " + l)
 		}
-		return strings.Join(lines, "\n")
+		return dimStyle.Render("── context ──") + "\n" + strings.Join(lines, "\n") + "\n"
 
 	case "system":
-		// Display-only annotations (:help, :debug output, etc.)
-		lines := strings.Split(wordWrap(msg.Content, w), "\n")
+		lines := strings.Split(wordWrap(msg.Content, w-2), "\n")
 		for i, l := range lines {
-			lines[i] = dimStyle.Render(l)
+			lines[i] = dimStyle.Render("  " + l)
 		}
-		return strings.Join(lines, "\n")
+		return strings.Join(lines, "\n") + "\n"
 
 	default: // assistant
-		return m.renderMarkdown(msg.Content, w)
+		label := assistantLabelStyle.Render("cx")
+		body := m.renderMarkdown(msg.Content, w-2)
+		return label + "\n" + body + "\n"
 	}
 }
 
