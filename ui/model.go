@@ -1479,19 +1479,19 @@ func (m Model) inputView() string {
 func (m Model) statusView() string {
 	modelPart := m.model
 	titlePart := m.conv.Title
+
+	left := fmt.Sprintf("  %s  ·  %s", modelPart, titlePart)
+
+	var right string
 	if m.streaming {
-		titlePart = "···"
+		dots := strings.Repeat(".", int(time.Now().UnixMilli()/400)%4)
+		right = fmt.Sprintf("  thinking%-4s", dots)
+	} else if !m.atBottom {
+		right = "  ↑ scroll  "
+	} else {
+		right = "  "
 	}
 
-	left := fmt.Sprintf("  %s  ·  #%d  ·  %s", modelPart, m.conv.ID, titlePart)
-
-	// Scroll position indicator
-	var scrollPart string
-	if !m.atBottom {
-		scrollPart = "↑  "
-	}
-
-	right := scrollPart + time.Now().Format("15:04") + "  "
 	pad := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if pad < 1 {
 		pad = 1

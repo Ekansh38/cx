@@ -121,7 +121,7 @@ func (p *openAIProvider) Stream(ctx context.Context, model string, msgs []Messag
 		Messages []oMsg `json:"messages"`
 	}
 
-	body := reqBody{Model: model, Stream: true, Messages: buildMessages(msgs), MaxTokens: 4096}
+	body := reqBody{Model: model, Stream: true, Messages: buildMessages(msgs), MaxTokens: 16384}
 	body.StreamOptions.IncludeUsage = true
 
 	buf, err := json.Marshal(body)
