@@ -210,6 +210,29 @@ func (s *Store) DeleteConversation(id int64) error {
 	return err
 }
 
+// AddMessageAt inserts a message with an explicit timestamp. Used to position
+// compaction summaries chronologically before the messages they precede.
+func (s *Store) AddMessageAt(convID int64, role, content string, createdAt int64) (*Message, error) {
+	res, err := s.db.Exec(
+		`INSERT INTO messages (conversation_id, role, content, image_path, created_at) VALUES (?, ?, ?, '', ?)`,
+		convID, role, content, createdAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &Message{ID: id, ConvID: convID, Role: role, Content: content, CreatedAt: createdAt}, nil
+}
+
+// DeleteMessagesFrom removes a message and all messages after it in the conversation.
+func (s *Store) DeleteMessagesFrom(convID, msgID int64) error {
+	_, err := s.db.Exec(
+		`DELETE FROM messages WHERE conversation_id = ? AND id >= ?`,
+		convID, msgID,
+	)
+	return err
+}
+
 // WipeAll deletes every conversation and message from the database.
 func (s *Store) WipeAll() error {
 	_, err := s.db.Exec(`DELETE FROM conversations`)
