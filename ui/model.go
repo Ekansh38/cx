@@ -61,10 +61,10 @@ type searchResult struct {
 
 var commands = []string{
 	":clear", ":copy", ":debug", ":delete",
-	":forget ", ":grep", ":help", ":img ",
+	":edit", ":forget ", ":grep", ":help", ":img ",
 	":list", ":model ", ":models", ":new",
 	":q", ":quit", ":r", ":remember ",
-	":rename ", ":retry", ":wipe",
+	":rename ", ":retry", ":stop", ":wipe",
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -116,6 +116,11 @@ type Model struct {
 
 	// system
 	systemPrompt string
+
+	// markdown rendering (cached — glamour is expensive)
+	mdRenderer *glamour.TermRenderer
+	mdWidth    int
+	mdCache    map[*store.Message]string
 }
 
 // ── constructor ───────────────────────────────────────────────────────────────
@@ -147,6 +152,7 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 		atBottom:     true,
 		state:        stateChat,
 		streamBuf:    &strings.Builder{},
+		mdCache:      make(map[*store.Message]string),
 	}
 }
 
@@ -187,11 +193,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tokenMsg:
+		// Just accumulate — the 150ms streamTick refreshes the view.
 		m.streamBuf.WriteString(string(msg))
-		m.refreshContent()
-		if m.atBottom {
-			m.viewport.GotoBottom()
-		}
 		return m, listenToken(m.streamCh)
 
 	case streamErrMsg:
@@ -203,6 +206,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case streamEndMsg:
+		// If the stream was cancelled (ctrl+c / :stop), the partial response
+		// was already saved — drop this late completion to avoid duplicates.
+		if !m.streaming {
+			return m, nil
+		}
 		content := msg.content
 		m.streaming = false
 		m.cancelStream = nil
@@ -242,8 +250,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if content == "" {
 			return m, nil
 		}
-		m.input.SetValue("")
-		return m.handleInput(content)
+		// Load into input field — user presses Enter to send
+		m.input.SetValue(content)
+		m.input.CursorEnd()
+		return m, nil
 
 	case modelsLoadedMsg:
 		m.modelList = []llm.ModelInfo(msg)
@@ -268,14 +278,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case compactionDoneMsg:
-		// Replace old messages with summary + recent
-		recentCount := 6
-		if recentCount > len(m.messages) {
-			recentCount = len(m.messages)
+		// Drop transient display-only notes (e.g. "compacting context...")
+		var persisted []*store.Message
+		for _, pm := range m.messages {
+			if pm.ID != 0 || pm.Role != "system" {
+				persisted = append(persisted, pm)
+			}
 		}
-		recent := make([]*store.Message, recentCount)
-		copy(recent, m.messages[len(m.messages)-recentCount:])
-		summaryMsg := &store.Message{Role: "summary", Content: msg.summary}
+		recentCount := 6
+		if recentCount > len(persisted) {
+			recentCount = len(persisted)
+		}
+		recent := persisted[len(persisted)-recentCount:]
+
+		// Persist the summary just before the recent messages so it survives
+		// restarts and lands in the right chronological position.
+		createdAt := time.Now().Unix()
+		if len(recent) > 0 {
+			createdAt = recent[0].CreatedAt - 1
+		}
+		summaryMsg, err := m.store.AddMessageAt(m.conv.ID, "summary", msg.summary, createdAt)
+		if err != nil {
+			summaryMsg = &store.Message{Role: "summary", Content: msg.summary}
+		}
 		m.messages = append([]*store.Message{summaryMsg}, recent...)
 		m.refreshContent()
 		m.viewport.GotoBottom()
@@ -416,6 +441,13 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 		return m.handleCommand(input)
 	}
 
+	// Auto-detect image paths: if the input (or first word) is a file path
+	// ending in an image extension, treat it like :img <path> [rest as text].
+	// This makes drag-and-drop work — terminals paste the file path.
+	if imgPath, text, ok := m.detectImagePath(input); ok {
+		return m.handleCommand(`:img "` + imgPath + `" ` + text)
+	}
+
 	if m.provider == nil {
 		m.errMsg = "no provider — set GEMINI_API_KEY, OPENAI_API_KEY, or configure ollama"
 		return m, nil
@@ -469,6 +501,28 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 	}
 
 	switch verb {
+	case ":stop":
+		if !m.streaming {
+			m.errMsg = "not currently streaming"
+			return m, nil
+		}
+		m.cancelStream()
+		m.streaming = false
+		m.streamCh = nil
+		m.cancelStream = nil
+		partial := m.streamBuf.String()
+		m.streamBuf.Reset()
+		if partial != "" {
+			if saved, err := m.store.AddMessage(m.conv.ID, "assistant", partial+" [stopped]"); err == nil {
+				m.messages = append(m.messages, saved)
+			} else {
+				m.messages = append(m.messages, &store.Message{Role: "assistant", Content: partial + " [stopped]"})
+			}
+		}
+		m.refreshContent()
+		m.viewport.GotoBottom()
+		return m, nil
+
 	case ":q", ":quit":
 		if m.streaming {
 			m.cancelStream()
@@ -575,6 +629,44 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		}
 		return m.switchConversation(convs[0].ID)
 
+	case ":edit":
+		if m.streaming {
+			return m, nil
+		}
+		// Find last user message
+		var lastUserIdx int = -1
+		for i := len(m.messages) - 1; i >= 0; i-- {
+			if m.messages[i].Role == "user" {
+				lastUserIdx = i
+				break
+			}
+		}
+		if lastUserIdx < 0 {
+			m.errMsg = "no message to edit"
+			return m, nil
+		}
+		lastMsg := m.messages[lastUserIdx]
+		// Remove last user message + everything after from DB
+		if lastMsg.ID > 0 {
+			m.store.DeleteMessagesFrom(m.conv.ID, lastMsg.ID)
+		}
+		// Remove from in-memory list
+		m.messages = m.messages[:lastUserIdx]
+		// Put the old text into the input field for editing
+		content := lastMsg.Content
+		// Strip image placeholder lines
+		var lines []string
+		for _, line := range strings.Split(content, "\n") {
+			if !strings.HasPrefix(line, "[image: ") {
+				lines = append(lines, line)
+			}
+		}
+		m.input.SetValue(strings.TrimSpace(strings.Join(lines, "\n")))
+		m.refreshContent()
+		m.viewport.GotoBottom()
+		m.atBottom = true
+		return m, nil
+
 	case ":retry", ":r":
 		if m.streaming {
 			return m, nil
@@ -599,17 +691,16 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m.startStream()
 
 	case ":img":
+		if m.streaming {
+			m.errMsg = "wait for the response to finish (or :stop)"
+			return m, nil
+		}
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
 			m.errMsg = "usage: :img /path/to/image.png [optional message]"
 			return m, nil
 		}
-		rest := strings.TrimSpace(parts[1])
-		// Split into path and optional message
-		imgPath, text := rest, ""
-		if idx := strings.IndexByte(rest, ' '); idx >= 0 {
-			imgPath = rest[:idx]
-			text = strings.TrimSpace(rest[idx+1:])
-		}
+		// Split into path and optional message (handles quoted / escaped spaces)
+		imgPath, text := splitPathToken(parts[1])
 		if text == "" {
 			text = "What's in this image?"
 		}
@@ -706,7 +797,7 @@ func (m *Model) injectSystemLine(text string) {
 }
 
 const helpText = `keybindings
-  ctrl+c       cancel stream / quit
+  ctrl+c       cancel stream / quit (or :stop)
   ctrl+l       conversation picker
   ctrl+n       new conversation
   ctrl+g       search all messages
@@ -724,8 +815,10 @@ commands  (type : to see completions)
   :list                 conversation picker
   :grep                 search messages
   :copy                 copy last assistant message to clipboard
+  :edit                 edit your last message (loads into input, re-send)
   :retry / :r           re-send last message (gets a new response)
   :img <path> [text]    send an image (png/jpg/gif/webp)
+                        (or just paste/drop an image path — auto-detected)
   :delete               delete current conversation
   :rename <title>       rename this conversation
   :model <name>         switch model mid-conversation
@@ -796,7 +889,18 @@ func listenToken(ch <-chan string) tea.Cmd {
 
 func (m Model) buildLLMMessages() []llm.Message {
 	out := []llm.Message{{Role: "system", Content: m.systemPrompt}}
+	// Everything before the last compaction summary is already covered by it —
+	// start there so reloaded conversations stay compacted.
+	start := 0
 	for i, msg := range m.messages {
+		if msg.Role == "summary" {
+			start = i
+		}
+	}
+	for i, msg := range m.messages {
+		if i < start {
+			continue
+		}
 		if msg.Role == "summary" {
 			out = append(out, llm.Message{Role: "system", Content: msg.Content})
 			continue
@@ -978,14 +1082,26 @@ func (m Model) startCompaction() (Model, tea.Cmd) {
 	}
 	cutoff := len(m.messages) - recentCount
 
+	// Start after the last prior summary — that history is already compacted.
+	start := 0
+	for i, msg := range m.messages[:cutoff] {
+		if msg.Role == "summary" {
+			start = i
+		}
+	}
+
 	// Build the old messages text for summarization
 	var sb strings.Builder
-	for _, msg := range m.messages[:cutoff] {
-		if msg.Role == "system" || msg.Role == "summary" {
+	for _, msg := range m.messages[start:cutoff] {
+		if msg.Role == "system" {
 			continue
 		}
-		sb.WriteString(msg.Role)
-		sb.WriteString(": ")
+		if msg.Role == "summary" {
+			sb.WriteString("(earlier context) ")
+		} else {
+			sb.WriteString(msg.Role)
+			sb.WriteString(": ")
+		}
 		sb.WriteString(msg.Content)
 		sb.WriteString("\n\n")
 	}
@@ -995,19 +1111,22 @@ func (m Model) startCompaction() (Model, tea.Cmd) {
 	prov := m.provider
 	model := m.model
 
-	return m, func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+	return m, tea.Batch(
+		func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
 
-		prompt := []llm.Message{
-			{Role: "user", Content: fmt.Sprintf(compactionPrompt, oldText)},
-		}
-		result, err := prov.Complete(ctx, model, prompt)
-		if err != nil {
-			return streamErrMsg("compaction failed: " + err.Error())
-		}
-		return compactionDoneMsg{summary: "Previous conversation summary:\n" + strings.TrimSpace(result)}
-	}
+			prompt := []llm.Message{
+				{Role: "user", Content: fmt.Sprintf(compactionPrompt, oldText)},
+			}
+			result, err := prov.Complete(ctx, model, prompt)
+			if err != nil {
+				return streamErrMsg("compaction failed: " + err.Error())
+			}
+			return compactionDoneMsg{summary: "Previous conversation summary:\n" + strings.TrimSpace(result)}
+		},
+		streamTick(), // animate the spinner while compacting
+	)
 }
 
 // ── Picker ────────────────────────────────────────────────────────────────────
@@ -1678,20 +1797,50 @@ func (m Model) searchView() string {
 
 // ── Content rendering ─────────────────────────────────────────────────────────
 
+// ensureRenderer (re)builds the shared glamour renderer when the width changes
+// and invalidates the per-message render cache.
+func (m *Model) ensureRenderer() {
+	w := m.viewport.Width - 2
+	if w < 10 {
+		w = 78
+	}
+	if m.mdRenderer != nil && m.mdWidth == w {
+		return
+	}
+	// Wrap 2 cols narrower than the target: glamour adds its own left margin,
+	// and lines that land exactly at terminal width spill one word onto the
+	// next row (the "orphan word" glitch).
+	r, err := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(w-2),
+	)
+	if err == nil {
+		m.mdRenderer = r
+	}
+	m.mdWidth = w
+	m.mdCache = make(map[*store.Message]string)
+}
+
 func (m *Model) refreshContent() {
 	if !m.ready {
 		return
 	}
+	m.ensureRenderer()
 	var sb strings.Builder
 	sb.WriteString("\n")
 	for _, msg := range m.messages {
-		sb.WriteString(m.renderMsg(msg))
+		rendered, ok := m.mdCache[msg]
+		if !ok {
+			rendered = m.renderMsg(msg)
+			m.mdCache[msg] = rendered
+		}
+		sb.WriteString(rendered)
 		sb.WriteString("\n")
 	}
 	if m.streaming {
 		sb.WriteString(assistantLabelStyle.Render("cx") + "\n")
 		if m.streamBuf.Len() > 0 {
-			sb.WriteString(m.renderMarkdown(m.streamBuf.String(), m.viewport.Width-2))
+			sb.WriteString(m.renderMarkdown(m.streamBuf.String()))
 			sb.WriteString(cursorStyle.Render(" █"))
 		} else {
 			frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -1711,7 +1860,7 @@ func (m Model) renderMsg(msg *store.Message) string {
 	switch msg.Role {
 	case "user":
 		label := userStyle.Render("you")
-		wrapped := wordWrap(msg.Content, w-2)
+		wrapped := wordWrap(msg.Content, w-4) // 2 indent + 2 safety
 		lines := strings.Split(wrapped, "\n")
 		for i, line := range lines {
 			lines[i] = "  " + line
@@ -1719,14 +1868,14 @@ func (m Model) renderMsg(msg *store.Message) string {
 		return label + "\n" + strings.Join(lines, "\n") + "\n"
 
 	case "summary":
-		lines := strings.Split(wordWrap(msg.Content, w), "\n")
+		lines := strings.Split(wordWrap(msg.Content, w-4), "\n")
 		for i, l := range lines {
 			lines[i] = dimStyle.Render("  " + l)
 		}
 		return dimStyle.Render("── context ──") + "\n" + strings.Join(lines, "\n") + "\n"
 
 	case "system":
-		lines := strings.Split(wordWrap(msg.Content, w-2), "\n")
+		lines := strings.Split(wordWrap(msg.Content, w-4), "\n")
 		for i, l := range lines {
 			lines[i] = dimStyle.Render("  " + l)
 		}
@@ -1734,23 +1883,20 @@ func (m Model) renderMsg(msg *store.Message) string {
 
 	default: // assistant
 		label := assistantLabelStyle.Render("cx")
-		body := m.renderMarkdown(msg.Content, w-2)
+		body := m.renderMarkdown(msg.Content)
 		return label + "\n" + body + "\n"
 	}
 }
 
-// renderMarkdown renders content with glamour; falls back to plain wrap on error.
-func (m Model) renderMarkdown(content string, width int) string {
-	r, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(width),
-	)
-	if err != nil {
-		return wordWrap(content, width)
+// renderMarkdown renders content with the shared glamour renderer;
+// falls back to plain wrap on error.
+func (m *Model) renderMarkdown(content string) string {
+	if m.mdRenderer == nil {
+		return wordWrap(content, m.mdWidth)
 	}
-	out, err := r.Render(content)
+	out, err := m.mdRenderer.Render(content)
 	if err != nil {
-		return wordWrap(content, width)
+		return wordWrap(content, m.mdWidth)
 	}
 	// Glamour adds a trailing newline; trim it since we add our own separator
 	return strings.TrimRight(out, "\n")
@@ -1828,6 +1974,69 @@ func completionsFor(input string) []string {
 		}
 	}
 	return out
+}
+
+// splitPathToken extracts a leading file path from input, handling quoted
+// paths ('...' or "...") and backslash-escaped spaces (foo\ bar.png) the way
+// terminals produce them on drag-and-drop. Returns the path and the rest.
+func splitPathToken(s string) (string, string) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", ""
+	}
+	// Quoted path
+	if s[0] == '\'' || s[0] == '"' {
+		q := s[0]
+		if i := strings.IndexByte(s[1:], q); i >= 0 {
+			return s[1 : 1+i], strings.TrimSpace(s[i+2:])
+		}
+	}
+	// Unquoted: respect backslash-escaped spaces
+	var b strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] == '\\' && i+1 < len(s) && s[i+1] == ' ' {
+			b.WriteByte(' ')
+			i += 2
+			continue
+		}
+		if s[i] == ' ' {
+			break
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String(), strings.TrimSpace(s[i:])
+}
+
+// detectImagePath checks if the input starts with a file path ending in an image extension.
+// Returns the resolved path, remaining text, and true if detected.
+func (m Model) detectImagePath(input string) (string, string, bool) {
+	candidate, rest := splitPathToken(input)
+	if candidate == "" {
+		return "", "", false
+	}
+
+	ext := strings.ToLower(filepath.Ext(candidate))
+	if _, ok := imageExts[ext]; !ok {
+		return "", "", false
+	}
+
+	// Expand ~ and resolve
+	p := candidate
+	if strings.HasPrefix(p, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = home + p[1:]
+		}
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", "", false
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return "", "", false
+	}
+	return abs, rest, true
 }
 
 var imageExts = map[string]string{
