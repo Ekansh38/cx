@@ -41,12 +41,15 @@ const (
 type tokenMsg string
 type streamEndMsg struct{ content string }
 type streamErrMsg string
-type titleUpdatedMsg string
+type titleUpdatedMsg struct {
+	convID int64
+	title  string
+}
 type editorDoneMsg string
 type streamTickMsg struct{}
 type modelsLoadedMsg []llm.ModelInfo
 type modelsErrorMsg string
-type memoryExtractedMsg struct{ facts []string }
+type memoryUpdatedMsg struct{ content string }
 type memoryErrorMsg string
 type compactionDoneMsg struct{ summary string }
 
@@ -62,8 +65,8 @@ type searchResult struct {
 var commands = []string{
 	":clear", ":copy", ":debug", ":delete",
 	":edit", ":forget ", ":grep", ":help", ":img ",
-	":list", ":model ", ":models", ":new",
-	":q", ":quit", ":r", ":remember ",
+	":list", ":memory", ":model ", ":models", ":new",
+	":paste", ":q", ":quit", ":r", ":remember ",
 	":rename ", ":retry", ":stop", ":wipe",
 }
 
@@ -233,7 +236,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.autoTitled = true
 			cmds = append(cmds, m.autoTitleCmd())
 		}
-		if cmd := m.extractMemoryCmd(); cmd != nil {
+		if cmd := m.curateMemoryCmd(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 		if len(cmds) > 0 {
@@ -242,7 +245,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case titleUpdatedMsg:
-		m.conv.Title = string(msg)
+		// Only apply if we're still on the conversation that was titled
+		if msg.convID == m.conv.ID {
+			m.conv.Title = msg.title
+		}
 		return m, nil
 
 	case editorDoneMsg:
@@ -253,6 +259,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Load into input field — user presses Enter to send
 		m.input.SetValue(content)
 		m.input.CursorEnd()
+		m.syncInputHeight()
 		return m, nil
 
 	case modelsLoadedMsg:
@@ -266,11 +273,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modelLoading = false
 		return m, nil
 
-	case memoryExtractedMsg:
-		for _, fact := range msg.facts {
-			memory.Add(config.MemoryPath(), fact)
+	case memoryUpdatedMsg:
+		if msg.content != "" {
+			memory.SaveRaw(config.MemoryPath(), msg.content)
+			m.reloadSystemPrompt()
 		}
-		m.reloadSystemPrompt()
 		return m, nil
 
 	case memoryErrorMsg:
@@ -365,9 +372,15 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.input.Reset()
-		m.input.SetHeight(1)
+		m.syncInputHeight()
 		m.errMsg = ""
 		return m.handleInput(input)
+
+	case tea.KeyEsc:
+		m.input.Reset()
+		m.syncInputHeight()
+		m.errMsg = ""
+		return m, nil
 
 	case tea.KeyTab:
 		matches := completionsFor(m.input.Value())
@@ -426,11 +439,7 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	// Dynamically resize textarea + viewport based on line count
-	newH := m.inputHeight()
-	if newH != m.input.Height() {
-		m.input.SetHeight(newH)
-		m.viewport.Height = m.viewportHeight()
-	}
+	m.syncInputHeight()
 	return m, cmd
 }
 
@@ -463,9 +472,7 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	m.atBottom = true
 
 	// Check if compaction needed before sending
-	msgs := m.buildLLMMessages()
-	tokenCount := llm.EstimateMessagesTokens(msgs)
-	if tokenCount > m.cfg.MaxContextTokens*3/4 {
+	if m.contextTokens() > m.cfg.MaxContextTokens*3/4 {
 		return m.startCompaction()
 	}
 	return m.startStream()
@@ -477,6 +484,18 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 	verb := parts[0]
 
 	switch input {
+	case ":delete confirm":
+		if err := m.store.DeleteConversation(m.conv.ID); err != nil {
+			m.errMsg = "delete failed: " + err.Error()
+			return m, nil
+		}
+		// Switch to most recent remaining, or create new
+		convs, _ := m.store.ListConversations()
+		if len(convs) == 0 {
+			return m.newConversation()
+		}
+		return m.switchConversation(convs[0].ID)
+
 	case ":wipe confirm":
 		if err := m.store.WipeAll(); err != nil {
 			m.errMsg = "wipe failed: " + err.Error()
@@ -556,7 +575,11 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		sb.WriteString(fmt.Sprintf("── debug: %s ──\n", m.model))
 		sb.WriteString(fmt.Sprintf("── %d messages in payload ──\n\n", len(msgs)))
 		for i, msg := range msgs {
-			sb.WriteString(fmt.Sprintf("[%d] %s:\n%s\n\n", i, msg.Role, msg.Content))
+			imgNote := ""
+			if len(msg.Images) > 0 {
+				imgNote = fmt.Sprintf("  [+%d image(s) attached]", len(msg.Images))
+			}
+			fmt.Fprintf(&sb, "[%d] %s:%s\n%s\n\n", i, msg.Role, imgNote, msg.Content)
 		}
 		m.injectSystemLine(sb.String())
 		return m, nil
@@ -618,16 +641,8 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m, nil
 
 	case ":delete":
-		if err := m.store.DeleteConversation(m.conv.ID); err != nil {
-			m.errMsg = "delete failed: " + err.Error()
-			return m, nil
-		}
-		// Switch to most recent remaining, or create new
-		convs, _ := m.store.ListConversations()
-		if len(convs) == 0 {
-			return m.newConversation()
-		}
-		return m.switchConversation(convs[0].ID)
+		m.injectSystemLine("delete this conversation? type  :delete confirm  to proceed.")
+		return m, nil
 
 	case ":edit":
 		if m.streaming {
@@ -662,6 +677,8 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			}
 		}
 		m.input.SetValue(strings.TrimSpace(strings.Join(lines, "\n")))
+		m.input.CursorEnd()
+		m.syncInputHeight()
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		m.atBottom = true
@@ -732,12 +749,39 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		m.atBottom = true
-		msgs := m.buildLLMMessages()
-		tokenCount := llm.EstimateMessagesTokens(msgs)
-		if tokenCount > m.cfg.MaxContextTokens*3/4 {
+		if m.contextTokens() > m.cfg.MaxContextTokens*3/4 {
 			return m.startCompaction()
 		}
 		return m.startStream()
+
+	case ":paste":
+		if m.streaming {
+			m.errMsg = "wait for the response to finish (or :stop)"
+			return m, nil
+		}
+		path, err := pasteClipboardImage()
+		if err != nil {
+			m.errMsg = err.Error()
+			return m, nil
+		}
+		text := ""
+		if len(parts) > 1 {
+			text = strings.TrimSpace(parts[1])
+		}
+		return m.handleCommand(`:img "` + path + `" ` + text)
+
+	case ":memory":
+		content, err := memory.Raw(config.MemoryPath())
+		if err != nil {
+			m.errMsg = "memory error: " + err.Error()
+			return m, nil
+		}
+		if content == "" {
+			m.injectSystemLine("memory is empty — chat or use :remember <fact>")
+			return m, nil
+		}
+		m.injectSystemLine("── memory file ──\n" + content)
+		return m, nil
 
 	case ":remember":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
@@ -805,6 +849,7 @@ const helpText = `keybindings
   ctrl+e       open $EDITOR for long input
   ctrl+u / d   scroll half page
   alt+enter    newline (multiline input)
+  esc          clear the input field
   ↑ ↓          scroll one line
   tab          autocomplete :command
 
@@ -819,20 +864,24 @@ commands  (type : to see completions)
   :retry / :r           re-send last message (gets a new response)
   :img <path> [text]    send an image (png/jpg/gif/webp)
                         (or just paste/drop an image path — auto-detected)
-  :delete               delete current conversation
+  :paste [text]         send the image on your clipboard
+  :stop                 stop the current response (same as ctrl+c)
+  :delete               delete current conversation (asks confirm)
   :rename <title>       rename this conversation
   :model <name>         switch model mid-conversation
   :models               model switcher (fetches from OpenRouter)
+  :memory               show the memory file
   :remember <fact>       save a fact to memory
-  :forget <query>        remove matching facts from memory
+  :forget <query>        remove matching lines from memory
   :clear                clear injected notes (history kept)
   :debug                show full API payload
   :wipe                 delete ALL conversations and messages (asks confirm)
 
 memory
-  auto-extracted after each response (via cheap model)
-  :remember / :forget for manual control
-  stored in ~/.config/cx/memory.md
+  after each response a model rewrites ~/.config/cx/memory.md —
+  merging, organizing, and pruning what it knows about you
+  :memory to view, :remember / :forget for manual control
+  set memory_model in config.toml to control which model curates
   context auto-compacted when conversation gets long`
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
@@ -925,6 +974,26 @@ func (m Model) buildLLMMessages() []llm.Message {
 	return out
 }
 
+// contextTokens estimates the text token count of the next API payload.
+// Images are deliberately excluded — base64 data URLs would wildly inflate
+// the estimate and trigger spurious compaction.
+func (m Model) contextTokens() int {
+	start := 0
+	for i, msg := range m.messages {
+		if msg.Role == "summary" {
+			start = i
+		}
+	}
+	n := llm.EstimateTokens(m.systemPrompt)
+	for i, msg := range m.messages {
+		if i < start || msg.Role == "system" {
+			continue
+		}
+		n += llm.EstimateTokens(msg.Content) + 4
+	}
+	return n
+}
+
 // reloadSystemPrompt rebuilds the system prompt from memory.md on disk.
 func (m *Model) reloadSystemPrompt() {
 	mem := config.LoadMemory()
@@ -939,33 +1008,45 @@ func (m *Model) reloadSystemPrompt() {
 // ── Auto-title ────────────────────────────────────────────────────────────────
 
 func (m Model) autoTitleCmd() tea.Cmd {
-	msgs := m.buildLLMMessages()
-	prov, model, st, convID := m.provider, m.model, m.store, m.conv.ID
+	// Cheap text-only transcript — no images, no system prompt, capped length.
+	var sb strings.Builder
+	for _, msg := range m.messages {
+		if msg.Role != "user" && msg.Role != "assistant" {
+			continue
+		}
+		content := msg.Content
+		if len(content) > 500 {
+			content = content[:500]
+		}
+		sb.WriteString(msg.Role + ": " + content + "\n\n")
+		if sb.Len() > 3000 {
+			break
+		}
+	}
+	transcript := sb.String()
+
+	cfg, st, convID := m.cfg, m.store, m.conv.ID
+	mainProv, mainModel := m.provider, m.model
 
 	return func() tea.Msg {
-		prompt := append(msgs, llm.Message{
-			Role:    "user",
-			Content: "Give this conversation a short title (4 words max, no quotes, no punctuation). Reply with only the title.",
-		})
+		// Prefer the cheap memory model; fall back to the main model
+		model := cfg.MemoryModel
+		prov, err := llm.ForModel(model, cfg)
+		if err != nil || model == "" {
+			prov, model = mainProv, mainModel
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 
-		ch := make(chan string, 64)
-		go func() {
-			prov.Stream(ctx, model, prompt, func(t string) {
-				select {
-				case ch <- t:
-				case <-ctx.Done():
-				}
-			})
-			close(ch)
-		}()
-
-		var sb strings.Builder
-		for t := range ch {
-			sb.WriteString(t)
+		title, err := prov.Complete(ctx, model, []llm.Message{{
+			Role:    "user",
+			Content: "Give this conversation a short title (4 words max, no quotes, no punctuation). Reply with only the title.\n\n" + transcript,
+		}})
+		if err != nil {
+			return nil
 		}
-		title := strings.TrimSpace(sb.String())
+		title = strings.TrimSpace(title)
 		if title == "" {
 			return nil
 		}
@@ -976,30 +1057,35 @@ func (m Model) autoTitleCmd() tea.Cmd {
 			title = title[:60]
 		}
 		st.UpdateTitle(convID, title)
-		return titleUpdatedMsg(title)
+		return titleUpdatedMsg{convID: convID, title: title}
 	}
 }
 
-// ── Auto-memory extraction ───────────────────────────────────────────────────
+// ── Auto-memory curation ─────────────────────────────────────────────────────
 
-const extractionPrompt = `You are a memory extraction system. Given a conversation exchange, extract key facts about the user that would be useful to remember across conversations.
+const curationPrompt = `You are the long-term memory manager for a personal AI assistant. Your job is to maintain a single markdown file that captures durable knowledge about the user: who they are, their preferences, ongoing projects, tools, workflows, and goals.
 
-Current memory:
+Below is the current memory file and the latest conversation exchange. Rewrite the memory file to incorporate anything genuinely worth remembering long-term:
+- Merge new information into existing sections; consolidate duplicates and related facts
+- Generalize where patterns emerge (three similar facts become one insight)
+- Drop stale, trivial, or conversation-specific details
+- Organize with markdown headers (e.g. ## Identity, ## Preferences, ## Projects, ## Tools & Workflow — adapt sections to the content)
+- Keep it under 60 lines, concise bullet points
+
+If nothing should change, reply with exactly: NO_CHANGES
+Otherwise reply with ONLY the complete new memory file content — no code fences, no commentary.
+
+Current memory file:
+<memory>
 %s
+</memory>
 
 Latest exchange:
 User: %s
-Assistant: %s
 
-Rules:
-- Only extract NEW facts not already in memory
-- Extract concrete preferences, facts, names, tools, languages, workflows
-- Do NOT extract conversation-specific context (what they asked about today)
-- Do NOT extract obvious/generic things
-- One fact per line, no bullets, no numbering
-- If nothing worth remembering, return exactly: NONE`
+Assistant: %s`
 
-func (m Model) extractMemoryCmd() tea.Cmd {
+func (m Model) curateMemoryCmd() tea.Cmd {
 	var userMsg, assistantMsg string
 	for i := len(m.messages) - 1; i >= 0; i-- {
 		if m.messages[i].Role == "assistant" && assistantMsg == "" {
@@ -1029,17 +1115,16 @@ func (m Model) extractMemoryCmd() tea.Cmd {
 			return memoryErrorMsg(err.Error())
 		}
 
-		existingFacts, _ := memory.Load(memPath)
-		existing := memory.FormatForPrompt(existingFacts)
+		existing, _ := memory.Raw(memPath)
 		if existing == "" {
-			existing = "(empty)"
+			existing = "(empty — this is a new memory file)"
 		}
 
 		prompt := []llm.Message{
-			{Role: "user", Content: fmt.Sprintf(extractionPrompt, existing, userMsg, assistantMsg)},
+			{Role: "user", Content: fmt.Sprintf(curationPrompt, existing, userMsg, assistantMsg)},
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
 		result, err := prov.Complete(ctx, memModel, prompt)
@@ -1048,21 +1133,16 @@ func (m Model) extractMemoryCmd() tea.Cmd {
 		}
 
 		result = strings.TrimSpace(result)
-		if result == "NONE" || result == "" {
-			return memoryExtractedMsg{facts: nil}
-		}
+		// Strip code fences if the model wrapped its output anyway
+		result = strings.TrimPrefix(result, "```markdown")
+		result = strings.TrimPrefix(result, "```")
+		result = strings.TrimSuffix(result, "```")
+		result = strings.TrimSpace(result)
 
-		var facts []string
-		for _, line := range strings.Split(result, "\n") {
-			line = strings.TrimSpace(line)
-			// Strip common prefixes the model might add
-			line = strings.TrimPrefix(line, "- ")
-			line = strings.TrimPrefix(line, "* ")
-			if line != "" && line != "NONE" {
-				facts = append(facts, line)
-			}
+		if result == "" || result == "NO_CHANGES" || strings.HasPrefix(result, "NO_CHANGES") {
+			return memoryUpdatedMsg{content: ""}
 		}
-		return memoryExtractedMsg{facts: facts}
+		return memoryUpdatedMsg{content: result}
 	}
 }
 
@@ -1609,6 +1689,16 @@ func (m Model) inputView() string {
 	return prefix + m.input.View()
 }
 
+// syncInputHeight resizes the textarea and viewport after input content changes.
+func (m *Model) syncInputHeight() {
+	if h := m.inputHeight(); h != m.input.Height() {
+		m.input.SetHeight(h)
+	}
+	if m.ready {
+		m.viewport.Height = m.viewportHeight()
+	}
+}
+
 func (m Model) inputHeight() int {
 	lines := m.input.LineCount()
 	if lines < 1 {
@@ -1629,11 +1719,19 @@ func (m Model) statusView() string {
 
 	left := "  " + modelDisplay + "  ·  " + m.conv.Title
 
+	tok := m.contextTokens()
+	var tokDisplay string
+	if tok >= 1000 {
+		tokDisplay = fmt.Sprintf("~%.1fk tok", float64(tok)/1000)
+	} else {
+		tokDisplay = fmt.Sprintf("~%d tok", tok)
+	}
+
 	var right string
 	if !m.atBottom {
-		right = "  ↑ scroll  "
+		right = tokDisplay + "  ·  ↑ scroll  "
 	} else {
-		right = "  "
+		right = tokDisplay + "  "
 	}
 
 	pad := m.width - lipgloss.Width(left) - lipgloss.Width(right)
@@ -2039,9 +2137,10 @@ func (m Model) detectImagePath(input string) (string, string, bool) {
 	return abs, rest, true
 }
 
+// Note: no .svg — vision APIs reject image/svg+xml data URLs.
 var imageExts = map[string]string{
 	".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-	".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+	".gif": "image/gif", ".webp": "image/webp",
 }
 
 func encodeImageToDataURL(path string) (string, error) {
@@ -2060,6 +2159,40 @@ func encodeImageToDataURL(path string) (string, error) {
 	}
 	encoded := base64.StdEncoding.EncodeToString(data)
 	return "data:" + mime + ";base64," + encoded, nil
+}
+
+// pasteClipboardImage writes the clipboard image to the data dir and returns its path.
+// macOS: pngpaste (brew install pngpaste). Linux: xclip.
+func pasteClipboardImage() (string, error) {
+	dir := filepath.Join(config.DataDir(), "images")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, fmt.Sprintf("paste-%d.png", time.Now().UnixNano()))
+
+	switch runtime.GOOS {
+	case "darwin":
+		if _, err := exec.LookPath("pngpaste"); err != nil {
+			return "", fmt.Errorf("pngpaste not installed — brew install pngpaste")
+		}
+		if out, err := exec.Command("pngpaste", path).CombinedOutput(); err != nil {
+			return "", fmt.Errorf("no image on clipboard (%s)", strings.TrimSpace(string(out)))
+		}
+	case "linux":
+		if _, err := exec.LookPath("xclip"); err != nil {
+			return "", fmt.Errorf("xclip not installed")
+		}
+		data, err := exec.Command("xclip", "-selection", "clipboard", "-t", "image/png", "-o").Output()
+		if err != nil || len(data) == 0 {
+			return "", fmt.Errorf("no image on clipboard")
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			return "", err
+		}
+	default:
+		return "", fmt.Errorf("clipboard paste not supported on %s", runtime.GOOS)
+	}
+	return path, nil
 }
 
 func copyToClipboard(text string) error {

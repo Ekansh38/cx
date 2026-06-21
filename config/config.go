@@ -12,6 +12,7 @@ type Config struct {
 	Model            string     `toml:"model"`
 	MemoryModel      string     `toml:"memory_model"`
 	MaxContextTokens int        `toml:"max_context_tokens"`
+	MaxTokens        int        `toml:"max_tokens"` // max response tokens per request
 	Gemini           ProviderCf `toml:"gemini"`
 	OpenAI           ProviderCf `toml:"openai"`
 	Ollama           ProviderCf `toml:"ollama"`
@@ -28,6 +29,7 @@ func Load() (*Config, error) {
 		Model:            "", // no default — uses most recent conversation's model
 		MemoryModel:      "google/gemini-2.0-flash-001",
 		MaxContextTokens: 128000,
+		MaxTokens:        16384,
 		Ollama:           ProviderCf{BaseURL: "http://localhost:11434/v1"},
 	}
 

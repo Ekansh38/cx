@@ -1,3 +1,9 @@
+// Package memory manages the long-term memory file (~/.config/cx/memory.md).
+//
+// The file is freeform markdown curated by an LLM after each exchange: the
+// model receives the current file plus the latest exchange and rewrites the
+// whole file — merging, generalizing, and pruning. :remember and :forget
+// provide instant line-level manual control between curation passes.
 package memory
 
 import (
@@ -6,113 +12,99 @@ import (
 	"sync"
 )
 
-const maxFacts = 50
+// maxLines is a hard safety cap so a runaway model can't bloat the file.
+const maxLines = 100
 
 var mu sync.Mutex
 
-// Load reads memory.md and returns the list of facts.
-func Load(path string) ([]string, error) {
+// Raw returns the full memory file content ("" if it doesn't exist).
+func Raw(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return "", nil
 		}
-		return nil, err
+		return "", err
 	}
-	var facts []string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "- ") {
-			facts = append(facts, strings.TrimPrefix(line, "- "))
-		}
-	}
-	return facts, nil
+	return strings.TrimSpace(string(data)), nil
 }
 
-// Save writes facts to memory.md with a header.
-func Save(path string, facts []string) error {
-	var sb strings.Builder
-	sb.WriteString("# Memory\n\n")
-	for _, f := range facts {
-		sb.WriteString("- ")
-		sb.WriteString(f)
-		sb.WriteByte('\n')
-	}
-	return os.WriteFile(path, []byte(sb.String()), 0o644)
-}
-
-// Add appends a fact if it's not a near-duplicate. Returns true if added.
-func Add(path string, fact string) (bool, error) {
+// SaveRaw writes the memory file, enforcing the line cap.
+func SaveRaw(path, content string) error {
 	mu.Lock()
 	defer mu.Unlock()
+	return saveLocked(path, content)
+}
 
-	facts, err := Load(path)
-	if err != nil {
-		return false, err
+func saveLocked(path, content string) error {
+	content = strings.TrimSpace(content)
+	lines := strings.Split(content, "\n")
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+		content = strings.Join(lines, "\n")
 	}
+	return os.WriteFile(path, []byte(content+"\n"), 0o644)
+}
+
+// Add appends a fact as a bullet line unless a line already contains it.
+// Returns true if added.
+func Add(path, fact string) (bool, error) {
+	mu.Lock()
+	defer mu.Unlock()
 
 	fact = strings.TrimSpace(fact)
 	if fact == "" {
 		return false, nil
 	}
 
-	// Dedup: skip if new fact is substring of existing or vice versa
+	content, err := Raw(path)
+	if err != nil {
+		return false, err
+	}
+
 	lower := strings.ToLower(fact)
-	for _, existing := range facts {
-		el := strings.ToLower(existing)
-		if strings.Contains(el, lower) || strings.Contains(lower, el) {
+	for _, line := range strings.Split(content, "\n") {
+		if strings.Contains(strings.ToLower(line), lower) {
 			return false, nil
 		}
 	}
 
-	facts = append(facts, fact)
-
-	// Evict oldest if over cap
-	if len(facts) > maxFacts {
-		facts = facts[len(facts)-maxFacts:]
+	if content == "" {
+		content = "# Memory"
 	}
-
-	return true, Save(path, facts)
+	return true, saveLocked(path, content+"\n- "+fact)
 }
 
-// Remove removes facts matching query (case-insensitive substring).
-// Returns the number of facts removed.
-func Remove(path string, query string) (int, error) {
+// Remove deletes non-header lines matching query (case-insensitive substring).
+// Returns the number of lines removed.
+func Remove(path, query string) (int, error) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	facts, err := Load(path)
-	if err != nil {
+	content, err := Raw(path)
+	if err != nil || content == "" {
 		return 0, err
 	}
 
-	q := strings.ToLower(query)
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return 0, nil
+	}
+
 	var kept []string
 	removed := 0
-	for _, f := range facts {
-		if strings.Contains(strings.ToLower(f), q) {
+	for _, line := range strings.Split(content, "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "#") &&
+			strings.TrimSpace(line) != "" &&
+			strings.Contains(strings.ToLower(line), q) {
 			removed++
-		} else {
-			kept = append(kept, f)
+			continue
 		}
+		kept = append(kept, line)
 	}
 
 	if removed > 0 {
-		return removed, Save(path, kept)
+		return removed, saveLocked(path, strings.Join(kept, "\n"))
 	}
 	return 0, nil
-}
-
-// FormatForPrompt returns memory facts formatted for system prompt injection.
-func FormatForPrompt(facts []string) string {
-	if len(facts) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	for _, f := range facts {
-		sb.WriteString("- ")
-		sb.WriteString(f)
-		sb.WriteByte('\n')
-	}
-	return sb.String()
 }

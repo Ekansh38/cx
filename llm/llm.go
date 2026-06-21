@@ -86,7 +86,7 @@ func ForModel(model string, cfg *config.Config) (Provider, error) {
 		if baseURL == "" {
 			baseURL = "https://openrouter.ai/api/v1"
 		}
-		return &openAIProvider{apiKey: cfg.OpenRouter.APIKey, baseURL: baseURL}, nil
+		return &openAIProvider{apiKey: cfg.OpenRouter.APIKey, baseURL: baseURL, maxTokens: cfg.MaxTokens}, nil
 
 	case strings.HasPrefix(m, "gemini"):
 		if cfg.Gemini.APIKey == "" {
@@ -96,7 +96,7 @@ func ForModel(model string, cfg *config.Config) (Provider, error) {
 		if baseURL == "" {
 			baseURL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 		}
-		return &openAIProvider{apiKey: cfg.Gemini.APIKey, baseURL: baseURL}, nil
+		return &openAIProvider{apiKey: cfg.Gemini.APIKey, baseURL: baseURL, maxTokens: cfg.MaxTokens}, nil
 
 	case strings.HasPrefix(m, "gpt") ||
 		strings.HasPrefix(m, "o1") ||
@@ -110,7 +110,7 @@ func ForModel(model string, cfg *config.Config) (Provider, error) {
 		if baseURL == "" {
 			baseURL = "https://api.openai.com/v1"
 		}
-		return &openAIProvider{apiKey: cfg.OpenAI.APIKey, baseURL: baseURL}, nil
+		return &openAIProvider{apiKey: cfg.OpenAI.APIKey, baseURL: baseURL, maxTokens: cfg.MaxTokens}, nil
 
 	default:
 		// Ollama or any OpenAI-compatible local server
@@ -118,6 +118,6 @@ func ForModel(model string, cfg *config.Config) (Provider, error) {
 		if baseURL == "" {
 			baseURL = "http://localhost:11434/v1"
 		}
-		return &openAIProvider{apiKey: "", baseURL: baseURL}, nil
+		return &openAIProvider{apiKey: "", baseURL: baseURL, maxTokens: cfg.MaxTokens}, nil
 	}
 }
