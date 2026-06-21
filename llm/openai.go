@@ -12,8 +12,9 @@ import (
 )
 
 type openAIProvider struct {
-	apiKey  string
-	baseURL string
+	apiKey    string
+	baseURL   string
+	maxTokens int
 }
 
 // oMsg supports both plain text and multimodal content.
@@ -121,7 +122,11 @@ func (p *openAIProvider) Stream(ctx context.Context, model string, msgs []Messag
 		Messages []oMsg `json:"messages"`
 	}
 
-	body := reqBody{Model: model, Stream: true, Messages: buildMessages(msgs), MaxTokens: 16384}
+	maxTok := p.maxTokens
+	if maxTok <= 0 {
+		maxTok = 16384
+	}
+	body := reqBody{Model: model, Stream: true, Messages: buildMessages(msgs), MaxTokens: maxTok}
 	body.StreamOptions.IncludeUsage = true
 
 	buf, err := json.Marshal(body)

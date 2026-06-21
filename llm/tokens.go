@@ -5,12 +5,3 @@ package llm
 func EstimateTokens(s string) int {
 	return len(s)/4 + 1
 }
-
-// EstimateMessagesTokens sums token estimates for a slice of Messages.
-func EstimateMessagesTokens(msgs []Message) int {
-	total := 0
-	for _, m := range msgs {
-		total += EstimateTokens(m.Content) + 4 // +4 for role/formatting overhead
-	}
-	return total
-}

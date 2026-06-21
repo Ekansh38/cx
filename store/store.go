@@ -185,7 +185,7 @@ func (s *Store) AddMessageWithImage(convID int64, role, content, imagePath strin
 // SearchMessages returns messages containing query across all conversations.
 func (s *Store) SearchMessages(query string) ([]*Message, error) {
 	rows, err := s.db.Query(
-		`SELECT id, conversation_id, role, content, image_path, created_at FROM messages WHERE content LIKE ? ORDER BY created_at DESC LIMIT 200`,
+		`SELECT id, conversation_id, role, content, image_path, created_at FROM messages WHERE content LIKE ? ORDER BY created_at DESC LIMIT 2000`,
 		"%"+query+"%",
 	)
 	if err != nil {

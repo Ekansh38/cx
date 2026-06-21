@@ -47,6 +47,7 @@ cx
 |-----|--------|
 | `enter` | Send message |
 | `alt+enter` | Newline (multiline input) |
+| `esc` | Clear input line |
 | `ctrl+c` | Cancel stream / quit |
 | `ctrl+l` | Conversation picker |
 | `ctrl+n` | New conversation |
@@ -64,7 +65,9 @@ cx
 | `:q` | Quit |
 | `:new` | New conversation |
 | `:list` | Conversation picker |
-| `:delete` | Delete current conversation |
+| `:edit` | Edit your last message |
+| `:stop` | Stop streaming response |
+| `:delete` | Delete current conversation (confirms) |
 | `:grep` | Search all messages |
 | `:copy` | Copy last response to clipboard |
 | `:retry` / `:r` | Re-send last message |
@@ -74,14 +77,16 @@ cx
 | `:models` | Model picker (fetches from OpenRouter) |
 | `:remember <fact>` | Save to memory |
 | `:forget <query>` | Remove from memory |
+| `:paste [text]` | Paste image from clipboard |
+| `:memory` | Show current memory file |
 | `:debug` | Show full API payload |
 | `:wipe` | Delete all data (asks confirm) |
 
 ### Memory
 
-cx auto-learns about you. After each response, a cheap background model extracts key facts and saves them to `~/.config/cx/memory.md`. These are injected into every conversation's system prompt.
+cx auto-learns about you. After each response, a background model curates `~/.config/cx/memory.md` — merging, generalizing, and pruning facts into organized markdown sections. Memory is injected into every conversation's system prompt.
 
-Manual control with `:remember` and `:forget`. Edit `memory.md` directly if you want.
+Manual control with `:remember` and `:forget`. View with `:memory`. Edit `memory.md` directly if you want.
 
 ### Context Compaction
 
@@ -90,8 +95,9 @@ When conversations get long, cx automatically summarizes older messages to stay 
 Configure in `config.toml`:
 
 ```toml
-memory_model = "google/gemini-2.0-flash-001"  # cheap model for memory extraction
+memory_model = "google/gemini-2.0-flash-001"  # model for memory curation + compaction
 max_context_tokens = 128000
+max_tokens = 16384  # max output tokens per response
 ```
 
 ### Models
