@@ -78,13 +78,23 @@ cx
 | `:remember <fact>` | Save to memory |
 | `:forget <query>` | Remove from memory |
 | `:paste [text]` | Paste image from clipboard |
+| `:doc [path]` | Attach a document to discuss/edit (no path = picker) |
+| `:doc off` | Close the attached document |
 | `:memory` | Show current memory file |
 | `:debug` | Show full API payload |
 | `:wipe` | Delete all data (asks confirm) |
 
+### Doc chat
+
+Attach a markdown/text file with `:doc` (fuzzy picker over the current directory) or `:doc <path>`. The document renders in a left pane with line numbers; chat lives on the right. The full file is sent to the model every turn, so you can just talk about it — reference passages as `@L12`, `@L12-30`, or `@## Heading`.
+
+- `ctrl+o` focuses the doc pane: `j/k` `u/d` `g/G` scroll, `e` opens the file in `$EDITOR` (reloads on exit), `r` reloads, `esc` back to chat
+- When the model proposes changes, each edit shows as a diff: `y` apply, `n` skip, `a` apply all, `esc` cancel — accepted edits are written straight to the file
+- The attachment persists with the conversation; `:doc off` closes it
+
 ### Memory
 
-cx keeps a structured markdown profile at `~/.config/cx/memory.md`, organized into sections like **Identity**, **Preferences**, **Projects**, **Tools & Workflow**, **Feedback**, and **References** — not a flat list of bullet points.
+cx keeps a structured markdown profile at `~/.config/cx/memory.md`, organized into sections like **Identity**, **Preferences**, **Projects**, **Tools & Workflow**, **Feedback**, **References**, and **Recent conversations** — not a flat list of bullet points. The Recent conversations section is an episodic log (date · title · what was decided) so new sessions know what you've already discussed.
 
 After every response, the configured `memory_model` re-reads the file plus the latest exchange and **rewrites the whole file** — merging new facts into the right sections, generalizing patterns, and pruning stale details. The result is injected into every conversation's system prompt.
 
