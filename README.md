@@ -84,9 +84,11 @@ cx
 
 ### Memory
 
-cx auto-learns about you. After each response, a background model curates `~/.config/cx/memory.md` — merging, generalizing, and pruning facts into organized markdown sections. Memory is injected into every conversation's system prompt.
+cx keeps a structured markdown profile at `~/.config/cx/memory.md`, organized into sections like **Identity**, **Preferences**, **Projects**, **Tools & Workflow**, **Feedback**, and **References** — not a flat list of bullet points.
 
-Manual control with `:remember` and `:forget`. View with `:memory`. Edit `memory.md` directly if you want.
+After every response, the configured `memory_model` re-reads the file plus the latest exchange and **rewrites the whole file** — merging new facts into the right sections, generalizing patterns, and pruning stale details. The result is injected into every conversation's system prompt.
+
+`:remember <fact>` and `:forget <query>` also route through the model, so manual edits stay organized in the same structure. `:memory` shows the current file. You can also edit `memory.md` directly if you want.
 
 ### Context Compaction
 
