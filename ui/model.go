@@ -34,6 +34,7 @@ const (
 	statePicker               // conversation picker overlay
 	stateSearch               // inline message search
 	stateModelPicker          // model switcher
+	stateDocPicker            // document picker for :doc
 )
 
 // ── tea.Msg types ─────────────────────────────────────────────────────────────
@@ -66,7 +67,7 @@ type searchResult struct {
 // ── available :commands ───────────────────────────────────────────────────────
 
 var commands = []string{
-	":clear", ":copy", ":debug", ":delete",
+	":clear", ":copy", ":debug", ":delete", ":doc",
 	":edit", ":forget ", ":grep", ":help", ":img ",
 	":list", ":memory", ":model ", ":models", ":new",
 	":paste", ":q", ":quit", ":r", ":remember ",
@@ -120,6 +121,20 @@ type Model struct {
 	modelCursor   int
 	modelLoading  bool
 
+	// doc chat state
+	docPath    string
+	docContent string
+	docVP      viewport.Model
+	docFocus   bool
+	docReview  bool
+	docEdits   []docEdit
+	docEditIdx int
+
+	// doc picker state
+	docFiles  []string
+	docFilter string
+	docCursor int
+
 	// system
 	systemPrompt string
 
@@ -146,7 +161,7 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 	ta.KeyMap.InsertNewline = key.NewBinding(key.WithKeys("alt+enter", "shift+enter"))
 	ta.Focus()
 
-	return Model{
+	m := Model{
 		cfg:          cfg,
 		store:        st,
 		conv:         conv,
@@ -160,6 +175,14 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 		streamBuf:    &strings.Builder{},
 		mdCache:      make(map[*store.Message]string),
 	}
+	// Restore an attached doc from a previous session
+	if conv.DocPath != "" {
+		if data, err := os.ReadFile(conv.DocPath); err == nil {
+			m.docPath = conv.DocPath
+			m.docContent = string(data)
+		}
+	}
+	return m
 }
 
 func (m Model) Init() tea.Cmd {
@@ -175,17 +198,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		if !m.ready {
-			m.viewport = viewport.New(msg.Width, m.viewportHeight())
+			m.viewport = viewport.New(m.chatWidth(), m.viewportHeight())
 			m.ready = true
-		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = m.viewportHeight()
 		}
-		m.input.SetWidth(msg.Width - 4)
+		m.applyLayout()
 		m.refreshContent() // re-wrap on every resize
 		if m.atBottom {
 			m.viewport.GotoBottom()
 		}
+		return m, nil
+
+	case docReloadMsg:
+		m.reloadDoc()
 		return m, nil
 
 	case streamTickMsg:
@@ -233,6 +257,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		m.atBottom = true
+
+		// Doc mode: collect proposed edits and start the y/n review
+		if m.docPath != "" && content != "" {
+			if edits := parseDocEdits(content); len(edits) > 0 {
+				m.docEdits = edits
+				m.docEditIdx = 0
+				m.docReview = true
+				m.showDocEdit()
+			}
+		}
 
 		var cmds []tea.Cmd
 		if !m.autoTitled && m.conv.Title == "Untitled" && len(m.messages) >= 2 {
@@ -293,10 +327,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case compactionDoneMsg:
-		// Drop transient display-only notes (e.g. "compacting context...")
+		// Drop transient display-only notes (system lines, diff previews)
 		var persisted []*store.Message
 		for _, pm := range m.messages {
-			if pm.ID != 0 || pm.Role != "system" {
+			if pm.ID != 0 {
 				persisted = append(persisted, pm)
 			}
 		}
@@ -330,6 +364,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateSearch(msg)
 		case stateModelPicker:
 			return m.updateModelPicker(msg)
+		case stateDocPicker:
+			return m.updateDocPicker(msg)
 		default:
 			return m.updateChat(msg)
 		}
@@ -341,6 +377,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ── Chat key handling ─────────────────────────────────────────────────────────
 
 func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
+	// Pending doc edits: y/n/a/esc review takes over the keyboard
+	if m.docReview {
+		return m.updateDocReview(msg)
+	}
+	// Doc pane focused: j/k/e/r etc. scroll and act on the document
+	if m.docPath != "" && m.docFocus {
+		return m.updateDocFocus(msg)
+	}
+	// ctrl+o jumps into the doc pane
+	if m.docPath != "" && msg.String() == "ctrl+o" {
+		m.docFocus = true
+		return m, nil
+	}
+
 	// Clear error on any meaningful key
 	if msg.Type == tea.KeyRunes || msg.Type == tea.KeyBackspace || msg.Type == tea.KeyDelete {
 		m.errMsg = ""
@@ -521,6 +571,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.autoTitled = false
 		m.state = stateChat
 		m.errMsg = ""
+		m.loadConvDoc()
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		m.atBottom = true
@@ -778,6 +829,21 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		}
 		return m.handleCommand(`:img "` + path + `" ` + text)
 
+	case ":doc":
+		if m.streaming {
+			m.errMsg = "wait for the response to finish (or :stop)"
+			return m, nil
+		}
+		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+			return m.enterDocPicker()
+		}
+		arg := strings.TrimSpace(parts[1])
+		if arg == "off" || arg == "close" {
+			return m.detachDoc()
+		}
+		path, _ := splitPathToken(arg)
+		return m.attachDoc(path)
+
 	case ":memory":
 		content, err := memory.Raw(config.MemoryPath())
 		if err != nil {
@@ -853,6 +919,8 @@ commands  (type : to see completions)
   :img <path> [text]    send an image (png/jpg/gif/webp)
                         (or just paste/drop an image path — auto-detected)
   :paste [text]         send the image on your clipboard
+  :doc [path]           attach a document to discuss/edit (no path = picker)
+  :doc off              close the attached document
   :stop                 stop the current response (same as ctrl+c)
   :delete               delete current conversation (asks confirm)
   :rename <title>       rename this conversation
@@ -864,6 +932,15 @@ commands  (type : to see completions)
   :clear                clear injected notes (history kept)
   :debug                show full API payload
   :wipe                 delete ALL conversations and messages (asks confirm)
+
+doc mode  (:doc)
+  the document shows in a left pane; the whole file is sent to the
+  model every turn, so you can just discuss it. reference passages
+  as @L12, @L12-30, or @## Heading.
+  ctrl+o focuses the doc pane: j/k u/d g/G scroll, e opens $EDITOR
+  on the file (reloads on exit), r reloads, esc back to chat.
+  when the model proposes edits you review each one:
+  [y] apply  [n] skip  [a] apply all  [esc] cancel
 
 memory
   cx keeps a structured markdown profile at ~/.config/cx/memory.md,
@@ -930,6 +1007,12 @@ func listenToken(ch <-chan string) tea.Cmd {
 
 func (m Model) buildLLMMessages() []llm.Message {
 	out := []llm.Message{{Role: "system", Content: m.systemPrompt}}
+	// Attach the live document (read fresh so external edits are picked up)
+	if m.docPath != "" {
+		if data, err := os.ReadFile(m.docPath); err == nil {
+			out = append(out, llm.Message{Role: "system", Content: docContextMsg(m.docPath, string(data))})
+		}
+	}
 	// Everything before the last compaction summary is already covered by it —
 	// start there so reloaded conversations stay compacted.
 	start := 0
@@ -946,8 +1029,8 @@ func (m Model) buildLLMMessages() []llm.Message {
 			out = append(out, llm.Message{Role: "system", Content: msg.Content})
 			continue
 		}
-		if msg.Role == "system" {
-			continue
+		if msg.Role != "user" && msg.Role != "assistant" {
+			continue // system notes, diff previews — display only
 		}
 		lm := llm.Message{Role: msg.Role, Content: msg.Content}
 		// Attach image if this message has one
@@ -977,8 +1060,11 @@ func (m Model) contextTokens() int {
 		}
 	}
 	n := llm.EstimateTokens(m.systemPrompt)
+	if m.docPath != "" {
+		n += llm.EstimateTokens(m.docContent)
+	}
 	for i, msg := range m.messages {
-		if i < start || msg.Role == "system" {
+		if i < start || (msg.Role != "user" && msg.Role != "assistant" && msg.Role != "summary") {
 			continue
 		}
 		n += llm.EstimateTokens(msg.Content) + 4
@@ -1059,22 +1145,29 @@ const curationPrompt = `You are the long-term memory manager for a personal AI a
 
 Organize the memory into meaningful ## markdown sections. Adapt sections to the content, but the common shape is:
 
-  ## Identity          who they are, background, role, expertise
-  ## Preferences       taste, style, communication, how they like to work
-  ## Projects          ongoing initiatives, current focus, goals
-  ## Tools & Workflow  languages, editors, libraries, environment
-  ## Feedback          how they want you to behave (do X, avoid Y) and WHY
-  ## References        pointers to external systems (dashboards, repos, docs)
+  ## Identity              who they are, background, role, expertise
+  ## Preferences           taste, style, communication, how they like to work
+  ## Projects              ongoing initiatives, current focus, goals
+  ## Tools & Workflow      languages, editors, libraries, environment
+  ## Feedback              how they want you to behave (do X, avoid Y) and WHY
+  ## References            pointers to external systems (dashboards, repos, docs)
+  ## Recent conversations  episodic log — what was discussed and decided, per conversation
 
 Rules:
 - Rich, substantive bullets — not one-word tags. Merge related facts into single bullets.
 - Consolidate duplicates; generalize when patterns emerge (three similar facts become one insight)
-- Drop stale, trivial, or conversation-specific details.
+- Drop stale, trivial, or conversation-specific details (except in Recent conversations).
 - Every ## section that survives must have at least one bullet.
-- Keep the total file under 80 lines. Quality over quantity.
+- Keep the total file under 100 lines. Quality over quantity.
 - Never invent facts or extrapolate beyond what was actually said.
 
-Below is the current memory file and the latest exchange. Rewrite the memory to incorporate anything genuinely worth remembering long-term.
+The "## Recent conversations" section is an episodic log so future sessions know what was already discussed:
+- Exactly one bullet per conversation: "- {date} · {title} — {one sentence: what was discussed, decided, or concluded}"
+- The current conversation is "%s" (today: %s). If it already has a bullet, UPDATE that bullet to reflect the conversation so far; otherwise add one at the top of the section. If the title is "Untitled", write a short descriptive title yourself — and if the newest bullet from today clearly describes this same discussion, update it rather than adding a duplicate.
+- Newest first. Keep at most 15 bullets; drop the oldest beyond that.
+- Before dropping an old bullet, promote anything still durable into the appropriate section above.
+
+Below is the current memory file and the latest exchange. Rewrite the memory to incorporate anything genuinely worth remembering.
 
 If nothing should change, reply with exactly: NO_CHANGES
 Otherwise reply with ONLY the complete new memory file content — no code fences, no commentary.
@@ -1108,6 +1201,8 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 
 	memPath := config.MemoryPath()
 	cfg := m.cfg
+	convTitle := m.conv.Title
+	today := time.Now().Format("2006-01-02")
 
 	return func() tea.Msg {
 		memModel := cfg.MemoryModel
@@ -1125,7 +1220,7 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 		}
 
 		prompt := []llm.Message{
-			{Role: "user", Content: fmt.Sprintf(curationPrompt, existing, userMsg, assistantMsg)},
+			{Role: "user", Content: fmt.Sprintf(curationPrompt, convTitle, today, existing, userMsg, assistantMsg)},
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1253,7 +1348,7 @@ func (m Model) startCompaction() (Model, tea.Cmd) {
 	// Build the old messages text for summarization
 	var sb strings.Builder
 	for _, msg := range m.messages[start:cutoff] {
-		if msg.Role == "system" {
+		if msg.Role != "user" && msg.Role != "assistant" && msg.Role != "summary" {
 			continue
 		}
 		if msg.Role == "summary" {
@@ -1399,11 +1494,39 @@ func (m Model) switchConversation(id int64) (Model, tea.Cmd) {
 	m.autoTitled = conv.Title != "Untitled"
 	m.state = stateChat
 	m.errMsg = ""
+	m.loadConvDoc()
 
 	m.refreshContent()
 	m.viewport.GotoBottom()
 	m.atBottom = true
 	return m, nil
+}
+
+// loadConvDoc restores (or clears) the doc pane for the current conversation.
+func (m *Model) loadConvDoc() {
+	m.docFocus = false
+	m.docReview = false
+	m.docEdits = nil
+	if m.conv.DocPath == "" {
+		m.docPath = ""
+		m.docContent = ""
+		m.applyLayout()
+		return
+	}
+	data, err := os.ReadFile(m.conv.DocPath)
+	if err != nil {
+		// File moved/deleted — detach quietly
+		m.docPath = ""
+		m.docContent = ""
+		m.store.UpdateDocPath(m.conv.ID, "")
+		m.conv.DocPath = ""
+		m.applyLayout()
+		return
+	}
+	m.docPath = m.conv.DocPath
+	m.docContent = string(data)
+	m.applyLayout()
+	m.refreshDocPane()
 }
 
 func (m Model) newConversation() (Model, tea.Cmd) {
@@ -1420,6 +1543,7 @@ func (m Model) newConversation() (Model, tea.Cmd) {
 	m.autoTitled = false
 	m.state = stateChat
 	m.errMsg = ""
+	m.loadConvDoc()
 
 	m.refreshContent()
 	m.viewport.GotoBottom()
@@ -1731,15 +1855,26 @@ func (m Model) View() string {
 		return m.searchView()
 	case stateModelPicker:
 		return m.modelPickerView()
+	case stateDocPicker:
+		return m.docPickerView()
 	default:
 		return m.chatView()
 	}
 }
 
 func (m Model) chatView() string {
+	top := m.viewport.View()
+	if m.docPath != "" {
+		top = lipgloss.JoinHorizontal(
+			lipgloss.Top,
+			m.docPaneView(),
+			m.docDivider(),
+			m.viewport.View(),
+		)
+	}
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
-		m.viewport.View(),
+		top,
 		m.sepView(),
 		m.inputView(),
 		"",
@@ -1776,6 +1911,9 @@ func (m *Model) syncInputHeight() {
 	}
 	if m.ready {
 		m.viewport.Height = m.viewportHeight()
+		if m.docPath != "" {
+			m.docVP.Height = m.viewportHeight() - 1
+		}
 	}
 }
 
@@ -1798,6 +1936,9 @@ func (m Model) statusView() string {
 	}
 
 	left := "  " + modelDisplay + "  ·  " + m.conv.Title
+	if m.docPath != "" {
+		left += "  ·  doc: " + filepath.Base(m.docPath)
+	}
 
 	tok := m.contextTokens()
 	var tokDisplay string
@@ -2059,9 +2200,17 @@ func (m Model) renderMsg(msg *store.Message) string {
 		}
 		return strings.Join(lines, "\n") + "\n"
 
+	case "diff":
+		// Pre-styled doc-edit preview — render as-is
+		return msg.Content + "\n"
+
 	default: // assistant
 		label := assistantLabelStyle.Render("cx")
-		body := m.renderMarkdown(msg.Content)
+		content := msg.Content
+		if strings.Contains(content, "<edit>") {
+			content = stripEditBlocks(content)
+		}
+		body := m.renderMarkdown(content)
 		return label + "\n" + body + "\n"
 	}
 }
