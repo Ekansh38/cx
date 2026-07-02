@@ -1,9 +1,12 @@
 // Package memory manages the long-term memory file (~/.config/cx/memory.md).
 //
-// The file is freeform markdown curated by an LLM after each exchange: the
-// model receives the current file plus the latest exchange and rewrites the
-// whole file — merging, generalizing, and pruning. :remember and :forget
-// provide instant line-level manual control between curation passes.
+// The file is structured markdown curated by an LLM: after every exchange the
+// model reads the current file plus the latest turn and rewrites the whole
+// thing — organizing into sections (Identity / Preferences / Projects / Tools
+// & Workflow / Feedback / References), merging, generalizing, and pruning.
+//
+// :remember and :forget also route through the model so edits stay organized.
+// This package only provides the raw read/write; the LLM prompting lives in ui.
 package memory
 
 import (
@@ -33,10 +36,6 @@ func Raw(path string) (string, error) {
 func SaveRaw(path, content string) error {
 	mu.Lock()
 	defer mu.Unlock()
-	return saveLocked(path, content)
-}
-
-func saveLocked(path, content string) error {
 	content = strings.TrimSpace(content)
 	lines := strings.Split(content, "\n")
 	if len(lines) > maxLines {
@@ -44,67 +43,4 @@ func saveLocked(path, content string) error {
 		content = strings.Join(lines, "\n")
 	}
 	return os.WriteFile(path, []byte(content+"\n"), 0o644)
-}
-
-// Add appends a fact as a bullet line unless a line already contains it.
-// Returns true if added.
-func Add(path, fact string) (bool, error) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	fact = strings.TrimSpace(fact)
-	if fact == "" {
-		return false, nil
-	}
-
-	content, err := Raw(path)
-	if err != nil {
-		return false, err
-	}
-
-	lower := strings.ToLower(fact)
-	for _, line := range strings.Split(content, "\n") {
-		if strings.Contains(strings.ToLower(line), lower) {
-			return false, nil
-		}
-	}
-
-	if content == "" {
-		content = "# Memory"
-	}
-	return true, saveLocked(path, content+"\n- "+fact)
-}
-
-// Remove deletes non-header lines matching query (case-insensitive substring).
-// Returns the number of lines removed.
-func Remove(path, query string) (int, error) {
-	mu.Lock()
-	defer mu.Unlock()
-
-	content, err := Raw(path)
-	if err != nil || content == "" {
-		return 0, err
-	}
-
-	q := strings.ToLower(strings.TrimSpace(query))
-	if q == "" {
-		return 0, nil
-	}
-
-	var kept []string
-	removed := 0
-	for _, line := range strings.Split(content, "\n") {
-		if !strings.HasPrefix(strings.TrimSpace(line), "#") &&
-			strings.TrimSpace(line) != "" &&
-			strings.Contains(strings.ToLower(line), q) {
-			removed++
-			continue
-		}
-		kept = append(kept, line)
-	}
-
-	if removed > 0 {
-		return removed, saveLocked(path, strings.Join(kept, "\n"))
-	}
-	return 0, nil
 }

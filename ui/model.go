@@ -49,7 +49,10 @@ type editorDoneMsg string
 type streamTickMsg struct{}
 type modelsLoadedMsg []llm.ModelInfo
 type modelsErrorMsg string
-type memoryUpdatedMsg struct{ content string }
+type memoryUpdatedMsg struct {
+	content string // new memory file (blank = NO_CHANGES / no update)
+	note    string // display-only confirmation; blank for silent auto-curation
+}
 type memoryErrorMsg string
 type compactionDoneMsg struct{ summary string }
 
@@ -278,10 +281,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			memory.SaveRaw(config.MemoryPath(), msg.content)
 			m.reloadSystemPrompt()
 		}
+		if msg.note != "" {
+			m.injectSystemLine(msg.note)
+		}
 		return m, nil
 
 	case memoryErrorMsg:
-		// Silent — don't disrupt the user
+		if string(msg) != "" {
+			m.injectSystemLine("memory error: " + string(msg))
+		}
 		return m, nil
 
 	case compactionDoneMsg:
@@ -789,18 +797,8 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			return m, nil
 		}
 		fact := strings.TrimSpace(parts[1])
-		added, err := memory.Add(config.MemoryPath(), fact)
-		if err != nil {
-			m.errMsg = "memory error: " + err.Error()
-			return m, nil
-		}
-		if added {
-			m.reloadSystemPrompt()
-			m.injectSystemLine("remembered: " + fact)
-		} else {
-			m.injectSystemLine("already in memory (or similar fact exists)")
-		}
-		return m, nil
+		m.injectSystemLine("updating memory...")
+		return m, m.editMemoryCmd("Remember this: "+fact, "memory updated — remembered: "+fact)
 
 	case ":forget":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
@@ -808,18 +806,8 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			return m, nil
 		}
 		query := strings.TrimSpace(parts[1])
-		n, err := memory.Remove(config.MemoryPath(), query)
-		if err != nil {
-			m.errMsg = "memory error: " + err.Error()
-			return m, nil
-		}
-		if n > 0 {
-			m.reloadSystemPrompt()
-			m.injectSystemLine(fmt.Sprintf("forgot %d fact(s) matching %q", n, query))
-		} else {
-			m.injectSystemLine("no matching facts found")
-		}
-		return m, nil
+		m.injectSystemLine("updating memory...")
+		return m, m.editMemoryCmd("Forget/remove anything related to: "+query, "memory updated — forgot: "+query)
 
 	case ":wipe":
 		m.injectSystemLine("this will delete ALL conversations and messages.\ntype  :wipe confirm  to proceed, or anything else to cancel.")
@@ -871,18 +859,22 @@ commands  (type : to see completions)
   :model <name>         switch model mid-conversation
   :models               model switcher (fetches from OpenRouter)
   :memory               show the memory file
-  :remember <fact>       save a fact to memory
-  :forget <query>        remove matching lines from memory
+  :remember <fact>      ask the memory model to add a fact
+  :forget <query>       ask the memory model to drop matching content
   :clear                clear injected notes (history kept)
   :debug                show full API payload
   :wipe                 delete ALL conversations and messages (asks confirm)
 
 memory
-  after each response a model rewrites ~/.config/cx/memory.md —
-  merging, organizing, and pruning what it knows about you
-  :memory to view, :remember / :forget for manual control
-  set memory_model in config.toml to control which model curates
-  context auto-compacted when conversation gets long`
+  cx keeps a structured markdown profile at ~/.config/cx/memory.md,
+  organized into sections like Identity / Preferences / Projects /
+  Tools & Workflow / Feedback / References.
+  after each response, the memory model rewrites the file —
+  merging, generalizing, and pruning what it knows about you.
+  :remember and :forget also route through the model so edits stay
+  organized and don't leave dangling bullets.
+  set memory_model in config.toml to pick a stronger curation model.
+  context auto-compacted when the conversation gets long.`
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
 
@@ -1061,16 +1053,28 @@ func (m Model) autoTitleCmd() tea.Cmd {
 	}
 }
 
-// ── Auto-memory curation ─────────────────────────────────────────────────────
+// ── Memory curation & explicit edits ─────────────────────────────────────────
 
 const curationPrompt = `You are the long-term memory manager for a personal AI assistant. Your job is to maintain a single markdown file that captures durable knowledge about the user: who they are, their preferences, ongoing projects, tools, workflows, and goals.
 
-Below is the current memory file and the latest conversation exchange. Rewrite the memory file to incorporate anything genuinely worth remembering long-term:
-- Merge new information into existing sections; consolidate duplicates and related facts
-- Generalize where patterns emerge (three similar facts become one insight)
-- Drop stale, trivial, or conversation-specific details
-- Organize with markdown headers (e.g. ## Identity, ## Preferences, ## Projects, ## Tools & Workflow — adapt sections to the content)
-- Keep it under 60 lines, concise bullet points
+Organize the memory into meaningful ## markdown sections. Adapt sections to the content, but the common shape is:
+
+  ## Identity          who they are, background, role, expertise
+  ## Preferences       taste, style, communication, how they like to work
+  ## Projects          ongoing initiatives, current focus, goals
+  ## Tools & Workflow  languages, editors, libraries, environment
+  ## Feedback          how they want you to behave (do X, avoid Y) and WHY
+  ## References        pointers to external systems (dashboards, repos, docs)
+
+Rules:
+- Rich, substantive bullets — not one-word tags. Merge related facts into single bullets.
+- Consolidate duplicates; generalize when patterns emerge (three similar facts become one insight)
+- Drop stale, trivial, or conversation-specific details.
+- Every ## section that survives must have at least one bullet.
+- Keep the total file under 80 lines. Quality over quantity.
+- Never invent facts or extrapolate beyond what was actually said.
+
+Below is the current memory file and the latest exchange. Rewrite the memory to incorporate anything genuinely worth remembering long-term.
 
 If nothing should change, reply with exactly: NO_CHANGES
 Otherwise reply with ONLY the complete new memory file content — no code fences, no commentary.
@@ -1143,6 +1147,82 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 			return memoryUpdatedMsg{content: ""}
 		}
 		return memoryUpdatedMsg{content: result}
+	}
+}
+
+// editMemoryPrompt is used by :remember and :forget — an explicit instruction
+// from the user that the memory model applies to the file.
+const editMemoryPrompt = `You are the long-term memory manager for a personal AI assistant. The user has issued an EXPLICIT instruction to update their memory file.
+
+Organize the memory into meaningful ## markdown sections. Adapt sections to the content, but the common shape is:
+
+  ## Identity          who they are, background, role, expertise
+  ## Preferences       taste, style, communication, how they like to work
+  ## Projects          ongoing initiatives, current focus, goals
+  ## Tools & Workflow  languages, editors, libraries, environment
+  ## Feedback          how they want you to behave (do X, avoid Y) and WHY
+  ## References        pointers to external systems (dashboards, repos, docs)
+
+Rules:
+- Follow the user's instruction precisely — this is their explicit ask.
+- When adding, place the new fact in the most appropriate section (create one if needed).
+- When forgetting/removing, drop the matching content but keep surrounding context intact.
+- Rich, substantive bullets — not one-word tags. Merge related facts.
+- Every ## section that survives must have at least one bullet.
+- Keep the total file under 80 lines.
+
+Reply with ONLY the complete new memory file content — no code fences, no commentary.
+If the instruction has literally no effect (e.g. forget something that isn't there), reply with exactly: NO_CHANGES
+
+## Current memory file
+<memory>
+%s
+</memory>
+
+## User instruction
+%s`
+
+func (m Model) editMemoryCmd(instruction, successNote string) tea.Cmd {
+	memPath := config.MemoryPath()
+	cfg := m.cfg
+
+	return func() tea.Msg {
+		memModel := cfg.MemoryModel
+		if memModel == "" {
+			memModel = "google/gemini-2.0-flash-001"
+		}
+		prov, err := llm.ForModel(memModel, cfg)
+		if err != nil {
+			return memoryErrorMsg(err.Error())
+		}
+
+		existing, _ := memory.Raw(memPath)
+		if existing == "" {
+			existing = "(empty — this is a new memory file)"
+		}
+
+		prompt := []llm.Message{
+			{Role: "user", Content: fmt.Sprintf(editMemoryPrompt, existing, instruction)},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		result, err := prov.Complete(ctx, memModel, prompt)
+		if err != nil {
+			return memoryErrorMsg(err.Error())
+		}
+
+		result = strings.TrimSpace(result)
+		result = strings.TrimPrefix(result, "```markdown")
+		result = strings.TrimPrefix(result, "```")
+		result = strings.TrimSuffix(result, "```")
+		result = strings.TrimSpace(result)
+
+		if result == "" || strings.HasPrefix(result, "NO_CHANGES") {
+			return memoryUpdatedMsg{content: "", note: "memory unchanged (no matching content or already reflected)"}
+		}
+		return memoryUpdatedMsg{content: result, note: successNote}
 	}
 }
 
