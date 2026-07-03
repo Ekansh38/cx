@@ -511,15 +511,18 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Pick up an editor highlight, if one was sent over (see README: neovim bridge)
+	// Pick up an editor highlight, if one was sent over (see README: neovim bridge).
+	// Selections from a file other than the attached doc are ignored.
 	display := input
 	if sel := readSelection(); sel != nil {
 		if m.docPath == "" {
 			m, _ = m.attachDoc(sel.file) // auto-attach the highlighted file
 		}
-		m.pendingSel = sel
-		consumeSelection()
-		display += fmt.Sprintf("\n[highlighted L%d-%d in %s]", sel.start, sel.end, filepath.Base(sel.file))
+		if sel.file == m.docPath {
+			m.pendingSel = sel
+			consumeSelection()
+			display += fmt.Sprintf("\n[highlighted L%d-%d in %s]", sel.start, sel.end, filepath.Base(sel.file))
+		}
 	}
 	// Re-read the doc so the pane and payload reflect external editor saves
 	if m.docPath != "" {
@@ -888,8 +891,12 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		if len(preview) > 500 {
 			preview = preview[:500] + "…"
 		}
-		m.injectSystemLine(fmt.Sprintf("── selection: L%d-%d of %s ──\n%s\n(attached to your next message · :sel clear to drop)",
-			sel.start, sel.end, filepath.Base(sel.file), preview))
+		note := "(attached to your next message · :sel clear to drop)"
+		if m.docPath != "" && sel.file != m.docPath {
+			note = "(from a DIFFERENT file than the attached doc — will NOT be sent)"
+		}
+		m.injectSystemLine(fmt.Sprintf("── selection: L%d-%d of %s ──\n%s\n%s",
+			sel.start, sel.end, filepath.Base(sel.file), preview, note))
 		return m, nil
 
 	case ":memory":
@@ -1987,7 +1994,7 @@ func (m Model) statusView() string {
 	if m.docPath != "" {
 		left += "  ·  doc: " + filepath.Base(m.docPath)
 	}
-	if sel := readSelection(); sel != nil {
+	if sel := readSelection(); sel != nil && (m.docPath == "" || sel.file == m.docPath) {
 		left += fmt.Sprintf("  ·  sel L%d-%d", sel.start, sel.end)
 	}
 
