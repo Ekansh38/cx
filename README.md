@@ -81,20 +81,25 @@ cx doc notes.md   # same, with the file given directly
 | `:remember <fact>` | Save to memory |
 | `:forget <query>` | Remove from memory |
 | `:paste [text]` | Paste image from clipboard |
-| `:doc [path]` | Attach a document to discuss/edit (no path = picker) |
-| `:doc off` | Close the attached document |
+| `:doc [path]` | Connect a doc and open it in your editor (no path = fuzzy picker) |
+| `:doc edit` | Reopen a connected doc in your editor |
+| `:doc off` | Disconnect (same as `:disconnect doc`) |
+| `:connect doc [path]` | Connect a doc without opening the editor (no path = last doc) |
+| `:disconnect doc` | Disconnect a doc (picker with ALL when several) |
 | `:memory` | Show current memory file |
 | `:debug` | Show full API payload |
 | `:wipe` | Delete all data (asks confirm) |
 
 ### Doc chat
 
-Attach a markdown/text file with `:doc` (fuzzy picker over the current directory) or `:doc <path>`. The document lives in *your editor* — inside tmux, cx opens it beside itself automatically. The full file is sent to the model every turn (re-read from disk, so every save is picked up), and you just talk about it — reference passages as `@L12`, `@L12-30`, or `@## Heading`.
+Connect markdown/text files with `:doc` (fuzzy picker over the current directory), `:doc <path>`, or `:connect doc [path]` — with no path, `:connect doc` reuses the last doc you connected (cx remembers it across sessions). A chat can have **multiple docs connected**; all of them are sent to the model every turn (re-read from disk, so every save is picked up). Documents live in *your editor* — inside tmux, `:doc` opens them beside cx automatically; for extra docs just open them in neovim yourself, or use `:doc edit` to open a connected one with the cx bridge wired up.
 
-- When the model proposes changes, the review happens **in neovim**: each hunk shows as an inline diff right in your buffer (old lines red, proposed lines green). `y` apply, `n` skip, `N` reject with a note, `a` apply all, `q` quit. Approved hunks are applied by neovim itself — no reload races — and rejection notes flow back into the conversation so the model's next attempt learns from them.
+Reference passages as `@L12`, `@L12-30`, or `@## Heading`. Disconnect with `:disconnect doc` — instant with one doc, a fuzzy picker (including an ALL option) with several.
+
+- When the model proposes changes, the review happens **in neovim**, one file at a time: each hunk shows as an inline diff right in your buffer (old lines red, proposed lines green). `y` apply, `n` skip, `N` reject with a note, `a` apply all, `q` quit. Approved hunks are applied by neovim itself — no reload races — and rejection notes flow back into the conversation, triggering an automatic retry.
 - cx spawns neovim with an RPC socket (`--listen`), which also powers hot reload: when cx writes the file, your buffer refreshes instantly.
 - Without the neovim bridge (different `$EDITOR`, no socket), the y/n review falls back to cx's chat pane.
-- `:doc edit` reopens the file in your editor; `:doc off` closes the attachment (it persists with the conversation otherwise)
+- Connections persist with the conversation; reopening a chat reconnects its docs
 
 #### Neovim side-by-side
 
@@ -105,7 +110,7 @@ cx doc            # fuzzy-pick from md/txt files under the current directory
 cx doc notes.md   # or name the file directly
 ```
 
-That opens a tmux session with neovim on the left, cx on the right, and the doc attached (reusing tmux/the doc's previous conversation if they exist). The picker matches fuzzily — `nts` finds `notes.md`. Inside cx, `:doc`, the doc picker, and `e` also auto-open the editor in a split when you're in tmux.
+That opens a tmux session with neovim on the left, cx on the right, and the doc connected (reusing tmux/the doc's previous conversation if they exist). The picker matches fuzzily — `nts` finds `notes.md`. Inside cx, `:doc` and `:doc edit` also auto-open the editor in a split when you're in tmux.
 
 cx re-reads the doc from disk on every message, so every `:w` in neovim is instantly visible to the model. To also send it *what you've highlighted*, add this to your neovim config:
 

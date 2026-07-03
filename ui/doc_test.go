@@ -133,10 +133,10 @@ func TestFuzzyMatch(t *testing.T) {
 		want bool
 	}{
 		{"", "anything", true},
-		{"nts", "notes.md", true},          // subsequence
-		{"docmd", "docs/readme.md", true},  // spans path segments
+		{"nts", "notes.md", true},         // subsequence
+		{"docmd", "docs/readme.md", true}, // spans path segments
 		{"xyz", "notes.md", false},
-		{"nst", "notes.md", false},         // wrong order
+		{"nst", "notes.md", false}, // wrong order
 		{"notes", "notes.md", true},
 	}
 	for _, c := range cases {
@@ -145,4 +145,3 @@ func TestFuzzyMatch(t *testing.T) {
 		}
 	}
 }
-
