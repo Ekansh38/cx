@@ -94,6 +94,21 @@ func TestStripEditBlocks(t *testing.T) {
 	}
 }
 
+func TestSelectionParse(t *testing.T) {
+	good := "/tmp/notes.md\n12-30\nselected line one\nselected line two\n"
+	if sel := parseSelectionText(good); sel == nil ||
+		sel.file != "/tmp/notes.md" || sel.start != 12 || sel.end != 30 ||
+		!strings.Contains(sel.text, "selected line two") {
+		t.Errorf("good selection parsed as %+v", sel)
+	}
+
+	for _, bad := range []string{"", "/tmp/x.md\n", "/tmp/x.md\nnot-a-range\ntext", "/tmp/x.md\n30-12\ntext"} {
+		if sel := parseSelectionText(bad); sel != nil {
+			t.Errorf("bad selection %q parsed as %+v", bad, sel)
+		}
+	}
+}
+
 func TestHardWrap(t *testing.T) {
 	long := strings.Repeat("x", 25)
 	for _, ln := range strings.Split(hardWrap(long, 10), "\n") {
