@@ -39,7 +39,8 @@ Env vars override config: `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KE
 
 ```bash
 cx                # chat
-cx doc notes.md   # doc mode: neovim + cx side by side (needs tmux)
+cx doc            # fuzzy-pick a doc, then neovim + cx side by side
+cx doc notes.md   # same, with the file given directly
 ```
 
 ### Keybindings
@@ -98,10 +99,11 @@ Attach a markdown/text file with `:doc` (fuzzy picker over the current directory
 One command sets the whole thing up:
 
 ```bash
-cx doc notes.md
+cx doc            # fuzzy-pick from md/txt files under the current directory
+cx doc notes.md   # or name the file directly
 ```
 
-That opens a tmux session with neovim on the left, cx on the right, and the doc attached (reusing tmux/the doc's previous conversation if they exist). Inside cx, `:doc`, the doc picker, and `e` also auto-open the editor in a split when you're in tmux.
+That opens a tmux session with neovim on the left, cx on the right, and the doc attached (reusing tmux/the doc's previous conversation if they exist). The picker matches fuzzily — `nts` finds `notes.md`. Inside cx, `:doc`, the doc picker, and `e` also auto-open the editor in a split when you're in tmux.
 
 cx re-reads the doc from disk on every message, so every `:w` in neovim is instantly visible to the model. To also send it *what you've highlighted*, add this to your neovim config:
 
