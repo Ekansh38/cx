@@ -91,7 +91,9 @@ cx doc notes.md   # same, with the file given directly
 
 Attach a markdown/text file with `:doc` (fuzzy picker over the current directory) or `:doc <path>`. The document lives in *your editor* — inside tmux, cx opens it beside itself automatically. The full file is sent to the model every turn (re-read from disk, so every save is picked up), and you just talk about it — reference passages as `@L12`, `@L12-30`, or `@## Heading`.
 
-- When the model proposes changes, each edit shows as a diff: `y` apply, `n` skip, `a` apply all, `esc` cancel — accepted edits are written straight to the file
+- When the model proposes changes, the review happens **in neovim**: each hunk shows as an inline diff right in your buffer (old lines red, proposed lines green). `y` apply, `n` skip, `N` reject with a note, `a` apply all, `q` quit. Approved hunks are applied by neovim itself — no reload races — and rejection notes flow back into the conversation so the model's next attempt learns from them.
+- cx spawns neovim with an RPC socket (`--listen`), which also powers hot reload: when cx writes the file, your buffer refreshes instantly.
+- Without the neovim bridge (different `$EDITOR`, no socket), the y/n review falls back to cx's chat pane.
 - `:doc edit` reopens the file in your editor; `:doc off` closes the attachment (it persists with the conversation otherwise)
 
 #### Neovim side-by-side

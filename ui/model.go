@@ -214,6 +214,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.reloadDoc()
 		return m, nil
 
+	case extReviewTickMsg:
+		results, done := readExternalReviewResults()
+		if !done {
+			if msg.n > 3600 { // ~30 min — assume the review was abandoned
+				return m, nil
+			}
+			return m, extReviewTick(msg.n + 1)
+		}
+		m.reloadDoc() // neovim wrote the file
+		note := summarizeReview(results, filepath.Base(m.docPath))
+		if saved, err := m.store.AddMessage(m.conv.ID, "note", note); err == nil {
+			m.messages = append(m.messages, saved)
+		} else {
+			m.messages = append(m.messages, &store.Message{Role: "note", Content: note})
+		}
+		m.refreshContent()
+		if m.atBottom {
+			m.viewport.GotoBottom()
+		}
+		return m, nil
+
 	case streamTickMsg:
 		if m.streaming {
 			m.refreshContent()
@@ -260,18 +281,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		m.atBottom = true
 
-		// Doc mode: collect proposed edits and start the y/n review
+		// Doc mode: hand proposed edits to neovim for review, or fall back
+		// to the in-cx y/n flow when the editor bridge isn't up.
+		var reviewCmd tea.Cmd
 		if m.docPath != "" && content != "" {
 			m.reloadDoc() // match edits against the latest on-disk content
 			if edits := parseDocEdits(content); len(edits) > 0 {
-				m.docEdits = edits
-				m.docEditIdx = 0
-				m.docReview = true
-				m.showDocEdit()
+				if startExternalReview(m.docPath, edits) {
+					m.docEdits = edits
+					m.injectSystemLine(fmt.Sprintf("%d proposed edit(s) — review in neovim: y apply · n skip · N reject+note · a all · q quit", len(edits)))
+					reviewCmd = extReviewTick(0)
+				} else {
+					m.docEdits = edits
+					m.docEditIdx = 0
+					m.docReview = true
+					m.showDocEdit()
+				}
 			}
 		}
 
 		var cmds []tea.Cmd
+		if reviewCmd != nil {
+			cmds = append(cmds, reviewCmd)
+		}
 		if !m.autoTitled && m.conv.Title == "Untitled" && len(m.messages) >= 2 {
 			m.autoTitled = true
 			cmds = append(cmds, m.autoTitleCmd())
@@ -997,8 +1029,10 @@ doc mode  (:doc)
   turn, re-read from disk — every save is picked up automatically.
   reference passages as @L12, @L12-30, @## Heading.
   :doc edit reopens the file in your editor.
-  when the model proposes edits you review each one:
-  [y] apply  [n] skip  [a] apply all  [esc] cancel
+  proposed edits are reviewed IN NEOVIM as an inline diff:
+  [y] apply  [n] skip  [N] reject with a note  [a] all  [q] quit
+  rejection notes go back to the model so its next try improves.
+  (without the neovim bridge, the y/n review happens in cx instead)
 
 neovim side-by-side
   cx doc <file>   (from your shell) sets everything up: a tmux
@@ -1097,7 +1131,7 @@ func (m Model) buildLLMMessages() []llm.Message {
 		if i < start {
 			continue
 		}
-		if msg.Role == "summary" {
+		if msg.Role == "summary" || msg.Role == "note" {
 			out = append(out, llm.Message{Role: "system", Content: msg.Content})
 			continue
 		}
@@ -1136,7 +1170,7 @@ func (m Model) contextTokens() int {
 		n += llm.EstimateTokens(m.docContent)
 	}
 	for i, msg := range m.messages {
-		if i < start || (msg.Role != "user" && msg.Role != "assistant" && msg.Role != "summary") {
+		if i < start || (msg.Role != "user" && msg.Role != "assistant" && msg.Role != "summary" && msg.Role != "note") {
 			continue
 		}
 		n += llm.EstimateTokens(msg.Content) + 4
@@ -1420,10 +1454,10 @@ func (m Model) startCompaction() (Model, tea.Cmd) {
 	// Build the old messages text for summarization
 	var sb strings.Builder
 	for _, msg := range m.messages[start:cutoff] {
-		if msg.Role != "user" && msg.Role != "assistant" && msg.Role != "summary" {
+		if msg.Role != "user" && msg.Role != "assistant" && msg.Role != "summary" && msg.Role != "note" {
 			continue
 		}
-		if msg.Role == "summary" {
+		if msg.Role == "summary" || msg.Role == "note" {
 			sb.WriteString("(earlier context) ")
 		} else {
 			sb.WriteString(msg.Role)
@@ -2251,7 +2285,7 @@ func (m Model) renderMsg(msg *store.Message) string {
 		}
 		return dimStyle.Render("── context ──") + "\n" + strings.Join(lines, "\n") + "\n"
 
-	case "system":
+	case "system", "note":
 		lines := strings.Split(wordWrap(msg.Content, w-4), "\n")
 		for i, l := range lines {
 			lines[i] = dimStyle.Render("  " + l)
