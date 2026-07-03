@@ -1690,15 +1690,12 @@ func (m Model) switchConversation(id int64) (Model, tea.Cmd) {
 		m.state = stateChat
 		return m, nil
 	}
-	prov, err := llm.ForModel(conv.Model, m.cfg)
-	if err != nil {
-		prov = m.provider // keep old provider if model unknown
-	}
 
+	// The model is globally sticky: switching conversations must NOT flip
+	// back to whatever model that conversation used long ago. The user's
+	// last selection stays until they pick another.
 	m.conv = conv
 	m.messages = msgs
-	m.model = conv.Model
-	m.provider = prov
 	m.streaming = false
 	m.streamBuf.Reset()
 	m.autoTitled = conv.Title != "Untitled"
