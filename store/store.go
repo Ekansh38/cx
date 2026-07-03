@@ -124,6 +124,22 @@ func (s *Store) ListConversations() ([]*Conversation, error) {
 	return convs, rows.Err()
 }
 
+// FindConversationByDoc returns the most recent conversation attached to a
+// document path, or nil if none.
+func (s *Store) FindConversationByDoc(path string) (*Conversation, error) {
+	row := s.db.QueryRow(
+		`SELECT id, title, model, doc_path, created_at, updated_at FROM conversations WHERE doc_path = ? ORDER BY updated_at DESC LIMIT 1`,
+		path,
+	)
+	var c Conversation
+	if err := row.Scan(&c.ID, &c.Title, &c.Model, &c.DocPath, &c.CreatedAt, &c.UpdatedAt); err == sql.ErrNoRows {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
 // UpdateDocPath attaches (or detaches, with "") a document to a conversation.
 func (s *Store) UpdateDocPath(id int64, path string) error {
 	_, err := s.db.Exec(`UPDATE conversations SET doc_path = ?, updated_at = ? WHERE id = ?`, path, time.Now().Unix(), id)
