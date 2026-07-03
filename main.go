@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -16,6 +17,16 @@ import (
 )
 
 func main() {
+	// cx doc <file> — auto-launch a split: editor on the left, cx on the right
+	var docPath string
+	if len(os.Args) >= 2 && os.Args[1] == "doc" {
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: cx doc <file>")
+			os.Exit(1)
+		}
+		docPath = launchDocSplit(os.Args[2])
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
@@ -61,6 +72,25 @@ func main() {
 		}
 	}
 
+	// Doc mode: reuse the conversation already attached to this file, or start one
+	if docPath != "" {
+		dc, _ := st.FindConversationByDoc(docPath)
+		if dc == nil {
+			dc, err = st.CreateConversation(model)
+			if err != nil {
+				log.Fatal(err)
+			}
+			st.UpdateDocPath(dc.ID, docPath)
+			dc.DocPath = docPath
+		}
+		conv = dc
+		if conv.Model != "" && conv.Model != model {
+			if p2, err := llm.ForModel(conv.Model, cfg); err == nil {
+				model, prov = conv.Model, p2
+			}
+		}
+	}
+
 	// Load messages
 	msgs, err := st.GetMessages(conv.ID)
 	if err != nil {
@@ -77,6 +107,52 @@ func main() {
 		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// launchDocSplit resolves the doc path and sets up the tmux split view.
+// Outside tmux it re-execs itself inside a new tmux session and exits;
+// inside tmux it opens the editor in a left pane and returns the path.
+func launchDocSplit(path string) string {
+	if strings.HasPrefix(path, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			path = home + path[1:]
+		}
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "doc: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := os.Stat(abs); err != nil {
+		fmt.Fprintf(os.Stderr, "doc: %v\n", err)
+		os.Exit(1)
+	}
+
+	if os.Getenv("TMUX") == "" {
+		// Not in tmux — start one running this same command, then exit
+		if _, err := exec.LookPath("tmux"); err != nil {
+			fmt.Fprintln(os.Stderr, "cx doc needs tmux for the split view — install tmux, or run :doc inside cx")
+			os.Exit(1)
+		}
+		exe, err := os.Executable()
+		if err != nil {
+			exe = os.Args[0]
+		}
+		cmd := exec.Command("tmux", "new-session", exe, "doc", abs)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := cmd.Run(); err != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	// Inside tmux — open the editor in a pane to the left of cx
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "nvim"
+	}
+	exec.Command("tmux", "split-window", "-h", "-b", editor, abs).Run()
+	return abs
 }
 
 func buildSystemPrompt(memory string) string {

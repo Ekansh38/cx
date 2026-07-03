@@ -286,15 +286,35 @@ func (m Model) updateDocFocus(msg tea.KeyMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// openDocEditor opens the attached document in $EDITOR and reloads on exit.
+// openDocEditor opens the attached document in the editor. Inside tmux it
+// opens a split pane beside cx; otherwise it suspends cx into $EDITOR.
 func (m Model) openDocEditor() (Model, tea.Cmd) {
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
 		editor = "vim"
 	}
+	if os.Getenv("TMUX") != "" {
+		if err := exec.Command("tmux", "split-window", "-h", "-b", editor, m.docPath).Run(); err == nil {
+			m.docFocus = false
+			return m, nil
+		}
+	}
 	return m, tea.ExecProcess(exec.Command(editor, m.docPath), func(err error) tea.Msg {
 		return docReloadMsg{}
 	})
+}
+
+// autoEditorSplit opens the editor beside cx after an explicit :doc attach
+// (no-op outside tmux; keeps focus on cx).
+func (m *Model) autoEditorSplit() {
+	if m.docPath == "" || os.Getenv("TMUX") == "" {
+		return
+	}
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "nvim"
+	}
+	exec.Command("tmux", "split-window", "-h", "-b", "-d", editor, m.docPath).Run()
 }
 
 // ── Edit blocks: parse / apply / review ──────────────────────────────────────
@@ -614,7 +634,9 @@ func (m Model) updateDocPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.state = stateChat
-		return m.attachDoc(filtered[m.docCursor])
+		m2, cmd := m.attachDoc(filtered[m.docCursor])
+		m2.autoEditorSplit()
+		return m2, cmd
 
 	case tea.KeyUp:
 		if m.docCursor > 0 {

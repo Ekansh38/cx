@@ -859,7 +859,9 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			return m.detachDoc()
 		}
 		path, _ := splitPathToken(arg)
-		return m.attachDoc(path)
+		m2, cmd := m.attachDoc(path)
+		m2.autoEditorSplit()
+		return m2, cmd
 
 	case ":sel":
 		if len(parts) > 1 && strings.TrimSpace(parts[1]) == "clear" {
@@ -981,11 +983,13 @@ doc mode  (:doc)
   [y] apply  [n] skip  [a] apply all  [esc] cancel
 
 neovim side-by-side
-  run neovim and cx in tmux panes over the same file. add the
-  keybinding from the README; then highlight text in neovim and
-  press <leader>cs — cx picks the selection up on your next
-  message (auto-attaching the doc if needed). status bar shows
-  "sel L12-30" while one is waiting; :sel previews it.
+  cx doc <file>   (from your shell) sets everything up: a tmux
+  session with neovim on the left, cx on the right, doc attached.
+  inside tmux, :doc / the doc picker / e also auto-open the editor
+  in a split pane. add the keybinding from the README, highlight
+  text in neovim, press <leader>cs — cx attaches the selection to
+  your next message (auto-attaching the doc if needed). status bar
+  shows "sel L12-30" while one is waiting; :sel previews it.
 
 memory
   cx keeps a structured markdown profile at ~/.config/cx/memory.md,
