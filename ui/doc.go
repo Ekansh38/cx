@@ -19,6 +19,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"cx/config"
 	"cx/store"
 )
 
@@ -481,6 +482,63 @@ func stripEditBlocks(s string) string {
 		s = s[:start] + fmt.Sprintf("*[proposed edit %d — review below]*", n) + s[start+rel+len("</edit>"):]
 	}
 	return s
+}
+
+// ── Editor selection bridge ──────────────────────────────────────────────────
+//
+// A keybinding in the user's editor (see README) writes the visual selection
+// to a handoff file. cx picks it up on the next message: auto-attaches the
+// doc if needed, and passes the highlighted passage to the model.
+//
+// File format:  line 1 = absolute file path, line 2 = "start-end", rest = text.
+
+type docSelection struct {
+	file  string
+	start int
+	end   int
+	text  string
+}
+
+func selectionPath() string {
+	return filepath.Join(config.DataDir(), "selection.txt")
+}
+
+// readSelection parses the handoff file without consuming it (nil if absent/invalid).
+func readSelection() *docSelection {
+	data, err := os.ReadFile(selectionPath())
+	if err != nil {
+		return nil
+	}
+	return parseSelectionText(string(data))
+}
+
+func parseSelectionText(raw string) *docSelection {
+	lines := strings.Split(strings.TrimRight(raw, "\n"), "\n")
+	if len(lines) < 3 {
+		return nil
+	}
+	file := strings.TrimSpace(lines[0])
+	var start, end int
+	if _, err := fmt.Sscanf(strings.TrimSpace(lines[1]), "%d-%d", &start, &end); err != nil {
+		return nil
+	}
+	if file == "" || start < 1 || end < start {
+		return nil
+	}
+	return &docSelection{file: file, start: start, end: end, text: strings.Join(lines[2:], "\n")}
+}
+
+// consumeSelection removes the handoff file after the selection has been used.
+func consumeSelection() {
+	os.Remove(selectionPath())
+}
+
+// selectionContextMsg builds the one-turn system message carrying the highlight.
+func selectionContextMsg(sel *docSelection) string {
+	return fmt.Sprintf(
+		"The user is currently highlighting lines %d-%d of %s in their editor:\n<selection>\n%s\n</selection>\nTheir next message refers to this passage.",
+		sel.start, sel.end, sel.file, sel.text,
+	)
 }
 
 // ── Doc file picker (:doc with no args) ──────────────────────────────────────

@@ -71,7 +71,7 @@ var commands = []string{
 	":edit", ":forget ", ":grep", ":help", ":img ",
 	":list", ":memory", ":model ", ":models", ":new",
 	":paste", ":q", ":quit", ":r", ":remember ",
-	":rename ", ":retry", ":stop", ":wipe",
+	":rename ", ":retry", ":sel", ":stop", ":wipe",
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -129,6 +129,7 @@ type Model struct {
 	docReview  bool
 	docEdits   []docEdit
 	docEditIdx int
+	pendingSel *docSelection // editor highlight riding along the next message
 
 	// doc picker state
 	docFiles  []string
@@ -260,6 +261,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Doc mode: collect proposed edits and start the y/n review
 		if m.docPath != "" && content != "" {
+			m.reloadDoc() // match edits against the latest on-disk content
 			if edits := parseDocEdits(content); len(edits) > 0 {
 				m.docEdits = edits
 				m.docEditIdx = 0
@@ -520,10 +522,25 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if saved, err := m.store.AddMessage(m.conv.ID, "user", input); err == nil {
+	// Pick up an editor highlight, if one was sent over (see README: neovim bridge)
+	display := input
+	if sel := readSelection(); sel != nil {
+		if m.docPath == "" {
+			m, _ = m.attachDoc(sel.file) // auto-attach the highlighted file
+		}
+		m.pendingSel = sel
+		consumeSelection()
+		display += fmt.Sprintf("\n[highlighted L%d-%d in %s]", sel.start, sel.end, filepath.Base(sel.file))
+	}
+	// Re-read the doc so the pane and payload reflect external editor saves
+	if m.docPath != "" {
+		m.reloadDoc()
+	}
+
+	if saved, err := m.store.AddMessage(m.conv.ID, "user", display); err == nil {
 		m.messages = append(m.messages, saved)
 	} else {
-		m.messages = append(m.messages, &store.Message{Role: "user", Content: input})
+		m.messages = append(m.messages, &store.Message{Role: "user", Content: display})
 	}
 	m.refreshContent()
 	m.viewport.GotoBottom()
@@ -728,10 +745,10 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.messages = m.messages[:lastUserIdx]
 		// Put the old text into the input field for editing
 		content := lastMsg.Content
-		// Strip image placeholder lines
+		// Strip image / highlight placeholder lines
 		var lines []string
 		for _, line := range strings.Split(content, "\n") {
-			if !strings.HasPrefix(line, "[image: ") {
+			if !strings.HasPrefix(line, "[image: ") && !strings.HasPrefix(line, "[highlighted ") {
 				lines = append(lines, line)
 			}
 		}
@@ -844,6 +861,25 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		path, _ := splitPathToken(arg)
 		return m.attachDoc(path)
 
+	case ":sel":
+		if len(parts) > 1 && strings.TrimSpace(parts[1]) == "clear" {
+			consumeSelection()
+			m.injectSystemLine("selection cleared")
+			return m, nil
+		}
+		sel := readSelection()
+		if sel == nil {
+			m.injectSystemLine("no editor selection — highlight in neovim and press <leader>cs (see README)")
+			return m, nil
+		}
+		preview := sel.text
+		if len(preview) > 500 {
+			preview = preview[:500] + "…"
+		}
+		m.injectSystemLine(fmt.Sprintf("── selection: L%d-%d of %s ──\n%s\n(attached to your next message · :sel clear to drop)",
+			sel.start, sel.end, filepath.Base(sel.file), preview))
+		return m, nil
+
 	case ":memory":
 		content, err := memory.Raw(config.MemoryPath())
 		if err != nil {
@@ -921,6 +957,8 @@ commands  (type : to see completions)
   :paste [text]         send the image on your clipboard
   :doc [path]           attach a document to discuss/edit (no path = picker)
   :doc off              close the attached document
+  :sel                  preview the editor selection waiting for your next msg
+  :sel clear            drop it
   :stop                 stop the current response (same as ctrl+c)
   :delete               delete current conversation (asks confirm)
   :rename <title>       rename this conversation
@@ -935,12 +973,19 @@ commands  (type : to see completions)
 
 doc mode  (:doc)
   the document shows in a left pane; the whole file is sent to the
-  model every turn, so you can just discuss it. reference passages
-  as @L12, @L12-30, or @## Heading.
+  model every turn (re-read from disk, so editor saves are picked
+  up automatically). reference passages as @L12, @L12-30, @## Heading.
   ctrl+o focuses the doc pane: j/k u/d g/G scroll, e opens $EDITOR
   on the file (reloads on exit), r reloads, esc back to chat.
   when the model proposes edits you review each one:
   [y] apply  [n] skip  [a] apply all  [esc] cancel
+
+neovim side-by-side
+  run neovim and cx in tmux panes over the same file. add the
+  keybinding from the README; then highlight text in neovim and
+  press <leader>cs — cx picks the selection up on your next
+  message (auto-attaching the doc if needed). status bar shows
+  "sel L12-30" while one is waiting; :sel previews it.
 
 memory
   cx keeps a structured markdown profile at ~/.config/cx/memory.md,
@@ -966,6 +1011,7 @@ func (m Model) startStream() (Model, tea.Cmd) {
 
 	msgs := m.buildLLMMessages()
 	m.pendingImage = "" // consumed
+	m.pendingSel = nil  // consumed
 	return m, tea.Batch(
 		runStream(ctx, m.provider, m.model, msgs, ch),
 		listenToken(ch),
@@ -1012,6 +1058,10 @@ func (m Model) buildLLMMessages() []llm.Message {
 		if data, err := os.ReadFile(m.docPath); err == nil {
 			out = append(out, llm.Message{Role: "system", Content: docContextMsg(m.docPath, string(data))})
 		}
+	}
+	// Editor highlight riding along this turn
+	if m.pendingSel != nil {
+		out = append(out, llm.Message{Role: "system", Content: selectionContextMsg(m.pendingSel)})
 	}
 	// Everything before the last compaction summary is already covered by it —
 	// start there so reloaded conversations stay compacted.
@@ -1938,6 +1988,9 @@ func (m Model) statusView() string {
 	left := "  " + modelDisplay + "  ·  " + m.conv.Title
 	if m.docPath != "" {
 		left += "  ·  doc: " + filepath.Base(m.docPath)
+	}
+	if sel := readSelection(); sel != nil {
+		left += fmt.Sprintf("  ·  sel L%d-%d", sel.start, sel.end)
 	}
 
 	tok := m.contextTokens()

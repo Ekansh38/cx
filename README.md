@@ -92,6 +92,21 @@ Attach a markdown/text file with `:doc` (fuzzy picker over the current directory
 - When the model proposes changes, each edit shows as a diff: `y` apply, `n` skip, `a` apply all, `esc` cancel — accepted edits are written straight to the file
 - The attachment persists with the conversation; `:doc off` closes it
 
+#### Neovim side-by-side
+
+Run neovim and cx in two tmux/terminal panes over the same file — cx re-reads the doc from disk on every message, so every `:w` in neovim is instantly visible to the model. To also send it *what you've highlighted*, add this to your neovim config:
+
+```vim
+" visual mode: send the selection to cx
+xnoremap <silent> <leader>cs :<C-u>call writefile(
+      \ [expand('%:p'), line("'<").'-'.line("'>")] + getline(line("'<"), line("'>")),
+      \ expand('~/.local/share/cx/selection.txt'))<CR>
+```
+
+Workflow: highlight lines in neovim → `<leader>cs` → switch panes → just type your question. cx attaches the highlighted passage to that message (auto-attaching the file with `:doc` if you hadn't). The status bar shows `sel L12-30` while a selection is waiting; `:sel` previews it, `:sel clear` drops it.
+
+Tip: if cx applies edits while the file is open in neovim, set `:set autoread` so neovim picks them up.
+
 ### Memory
 
 cx keeps a structured markdown profile at `~/.config/cx/memory.md`, organized into sections like **Identity**, **Preferences**, **Projects**, **Tools & Workflow**, **Feedback**, **References**, and **Recent conversations** — not a flat list of bullet points. The Recent conversations section is an episodic log (date · title · what was decided) so new sessions know what you've already discussed.
