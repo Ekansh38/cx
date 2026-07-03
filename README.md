@@ -72,6 +72,7 @@ cx doc notes.md   # same, with the file given directly
 | `:delete` | Delete current conversation (confirms) |
 | `:grep` | Search all messages |
 | `:copy` | Copy last response to clipboard |
+| `:copy prompt` | Copy your last message to clipboard |
 | `:retry` / `:r` | Re-send last message |
 | `:img <path> [text]` | Send an image |
 | `:rename <title>` | Rename conversation |
