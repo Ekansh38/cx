@@ -121,11 +121,9 @@ type Model struct {
 	modelCursor   int
 	modelLoading  bool
 
-	// doc chat state
+	// doc chat state (the doc renders in the user's editor, not in cx)
 	docPath    string
 	docContent string
-	docVP      viewport.Model
-	docFocus   bool
 	docReview  bool
 	docEdits   []docEdit
 	docEditIdx int
@@ -199,10 +197,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		if !m.ready {
-			m.viewport = viewport.New(m.chatWidth(), m.viewportHeight())
+			m.viewport = viewport.New(msg.Width, m.viewportHeight())
 			m.ready = true
+		} else {
+			m.viewport.Width = msg.Width
+			m.viewport.Height = m.viewportHeight()
 		}
-		m.applyLayout()
+		m.input.SetWidth(msg.Width - 4)
 		m.refreshContent() // re-wrap on every resize
 		if m.atBottom {
 			m.viewport.GotoBottom()
@@ -291,12 +292,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case editorDoneMsg:
-		content := strings.TrimSpace(string(msg))
-		if content == "" {
-			return m, nil
-		}
-		// Load into input field — user presses Enter to send
-		m.input.SetValue(content)
+		// Mirror the editor exactly into the input — including cleared-to-blank.
+		// Never sends; the user presses Enter.
+		m.input.SetValue(strings.TrimSpace(string(msg)))
 		m.input.CursorEnd()
 		m.syncInputHeight()
 		return m, nil
@@ -382,15 +380,6 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 	// Pending doc edits: y/n/a/esc review takes over the keyboard
 	if m.docReview {
 		return m.updateDocReview(msg)
-	}
-	// Doc pane focused: j/k/e/r etc. scroll and act on the document
-	if m.docPath != "" && m.docFocus {
-		return m.updateDocFocus(msg)
-	}
-	// ctrl+o jumps into the doc pane
-	if m.docPath != "" && msg.String() == "ctrl+o" {
-		m.docFocus = true
-		return m, nil
 	}
 
 	// Clear error on any meaningful key
@@ -869,8 +858,15 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			return m.enterDocPicker()
 		}
 		arg := strings.TrimSpace(parts[1])
-		if arg == "off" || arg == "close" {
+		switch arg {
+		case "off", "close":
 			return m.detachDoc()
+		case "edit":
+			if m.docPath == "" {
+				m.errMsg = "no document attached"
+				return m, nil
+			}
+			return m.openDocEditor()
 		}
 		path, _ := splitPathToken(arg)
 		m2, cmd := m.attachDoc(path)
@@ -989,11 +985,11 @@ commands  (type : to see completions)
   :wipe                 delete ALL conversations and messages (asks confirm)
 
 doc mode  (:doc)
-  the document shows in a left pane; the whole file is sent to the
-  model every turn (re-read from disk, so editor saves are picked
-  up automatically). reference passages as @L12, @L12-30, @## Heading.
-  ctrl+o focuses the doc pane: j/k u/d g/G scroll, e opens $EDITOR
-  on the file (reloads on exit), r reloads, esc back to chat.
+  the document lives in YOUR editor (opened beside cx in tmux);
+  cx just knows the file. the whole doc is sent to the model every
+  turn, re-read from disk — every save is picked up automatically.
+  reference passages as @L12, @L12-30, @## Heading.
+  :doc edit reopens the file in your editor.
   when the model proposes edits you review each one:
   [y] apply  [n] skip  [a] apply all  [esc] cancel
 
@@ -1571,15 +1567,13 @@ func (m Model) switchConversation(id int64) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// loadConvDoc restores (or clears) the doc pane for the current conversation.
+// loadConvDoc restores (or clears) the attached doc for the current conversation.
 func (m *Model) loadConvDoc() {
-	m.docFocus = false
 	m.docReview = false
 	m.docEdits = nil
 	if m.conv.DocPath == "" {
 		m.docPath = ""
 		m.docContent = ""
-		m.applyLayout()
 		return
 	}
 	data, err := os.ReadFile(m.conv.DocPath)
@@ -1589,13 +1583,10 @@ func (m *Model) loadConvDoc() {
 		m.docContent = ""
 		m.store.UpdateDocPath(m.conv.ID, "")
 		m.conv.DocPath = ""
-		m.applyLayout()
 		return
 	}
 	m.docPath = m.conv.DocPath
 	m.docContent = string(data)
-	m.applyLayout()
-	m.refreshDocPane()
 }
 
 func (m Model) newConversation() (Model, tea.Cmd) {
@@ -1932,18 +1923,9 @@ func (m Model) View() string {
 }
 
 func (m Model) chatView() string {
-	top := m.viewport.View()
-	if m.docPath != "" {
-		top = lipgloss.JoinHorizontal(
-			lipgloss.Top,
-			m.docPaneView(),
-			m.docDivider(),
-			m.viewport.View(),
-		)
-	}
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
-		top,
+		m.viewport.View(),
 		m.sepView(),
 		m.inputView(),
 		"",
@@ -1980,9 +1962,6 @@ func (m *Model) syncInputHeight() {
 	}
 	if m.ready {
 		m.viewport.Height = m.viewportHeight()
-		if m.docPath != "" {
-			m.docVP.Height = m.viewportHeight() - 1
-		}
 	}
 }
 

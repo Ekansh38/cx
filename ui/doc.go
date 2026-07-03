@@ -17,7 +17,6 @@ import (
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"cx/config"
 	"cx/store"
@@ -97,16 +96,12 @@ func (m Model) attachDoc(path string) (Model, tea.Cmd) {
 
 	m.docPath = abs
 	m.docContent = string(data)
-	m.docFocus = false
 	m.docReview = false
 	m.docEdits = nil
 	m.store.UpdateDocPath(m.conv.ID, abs)
 	m.conv.DocPath = abs
 
-	m.applyLayout()
-	m.refreshDocPane()
-	m.refreshContent()
-	m.injectSystemLine("attached " + filepath.Base(abs) + " — ctrl+o to focus the doc pane, :doc off to close")
+	m.injectSystemLine("attached " + filepath.Base(abs) + " — :doc edit opens it in your editor, :doc off closes")
 	return m, nil
 }
 
@@ -118,14 +113,11 @@ func (m Model) detachDoc() (Model, tea.Cmd) {
 	name := filepath.Base(m.docPath)
 	m.docPath = ""
 	m.docContent = ""
-	m.docFocus = false
 	m.docReview = false
 	m.docEdits = nil
 	m.store.UpdateDocPath(m.conv.ID, "")
 	m.conv.DocPath = ""
 
-	m.applyLayout()
-	m.refreshContent()
 	m.injectSystemLine("closed " + name)
 	return m, nil
 }
@@ -141,150 +133,9 @@ func (m *Model) reloadDoc() {
 		return
 	}
 	m.docContent = string(data)
-	m.refreshDocPane()
 }
 
-// ── Layout ───────────────────────────────────────────────────────────────────
-
-// chatWidth is the chat viewport width — full width, or right half in doc mode.
-func (m Model) chatWidth() int {
-	if m.docPath == "" {
-		return m.width
-	}
-	return m.width - m.docWidth() - 1 // 1 col divider
-}
-
-func (m Model) docWidth() int {
-	return m.width / 2
-}
-
-// applyLayout sizes the chat viewport, doc pane, and input for the current mode.
-func (m *Model) applyLayout() {
-	if !m.ready {
-		return
-	}
-	m.viewport.Width = m.chatWidth()
-	m.viewport.Height = m.viewportHeight()
-	m.input.SetWidth(m.width - 4)
-	if m.docPath != "" {
-		m.docVP.Width = m.docWidth()
-		m.docVP.Height = m.viewportHeight() - 1 // header row
-		m.refreshDocPane()
-	}
-}
-
-// refreshDocPane re-renders the numbered, wrapped document into its viewport.
-func (m *Model) refreshDocPane() {
-	w := m.docVP.Width
-	if w < 8 {
-		return
-	}
-	lines := strings.Split(m.docContent, "\n")
-	numW := len(fmt.Sprint(len(lines)))
-	avail := w - numW - 1
-	if avail < 4 {
-		avail = 4
-	}
-	var sb strings.Builder
-	for i, ln := range lines {
-		for j, wl := range strings.Split(hardWrap(ln, avail), "\n") {
-			if j == 0 {
-				sb.WriteString(dimStyle.Render(fmt.Sprintf("%*d ", numW, i+1)))
-			} else {
-				sb.WriteString(strings.Repeat(" ", numW+1))
-			}
-			sb.WriteString(wl)
-			sb.WriteByte('\n')
-		}
-	}
-	m.docVP.SetContent(strings.TrimRight(sb.String(), "\n"))
-}
-
-// hardWrap word-wraps then force-breaks any line still longer than width
-// (long URLs etc.) so nothing bleeds into the chat pane.
-func hardWrap(text string, width int) string {
-	wrapped := wordWrap(text, width)
-	var out []string
-	for _, ln := range strings.Split(wrapped, "\n") {
-		for utf8.RuneCountInString(ln) > width {
-			r := []rune(ln)
-			out = append(out, string(r[:width]))
-			ln = string(r[width:])
-		}
-		out = append(out, ln)
-	}
-	return strings.Join(out, "\n")
-}
-
-// docPaneView renders header + document viewport (left pane).
-func (m Model) docPaneView() string {
-	name := filepath.Base(m.docPath)
-	hint := "  ctrl+o focus"
-	if m.docFocus {
-		hint = "  j/k scroll · e edit · r reload · esc back"
-	}
-	header := name + dimStyle.Render(hint)
-	maxW := m.docWidth()
-	if lipgloss.Width(header) > maxW {
-		header = name
-		if utf8.RuneCountInString(header) > maxW {
-			header = string([]rune(header)[:maxW-1]) + "…"
-		}
-	}
-	style := dimStyle
-	if m.docFocus {
-		style = docHeaderStyle
-	}
-	return lipgloss.JoinVertical(lipgloss.Left,
-		style.Render(padRight(header, maxW)),
-		m.docVP.View(),
-	)
-}
-
-func padRight(s string, w int) string {
-	if d := w - lipgloss.Width(s); d > 0 {
-		return s + strings.Repeat(" ", d)
-	}
-	return s
-}
-
-// docDivider is the vertical line between the doc and chat panes.
-func (m Model) docDivider() string {
-	h := m.viewportHeight()
-	col := make([]string, h)
-	for i := range col {
-		col[i] = sepStyle.Render("│")
-	}
-	return strings.Join(col, "\n")
-}
-
-// ── Doc-pane key handling (when focused) ─────────────────────────────────────
-
-func (m Model) updateDocFocus(msg tea.KeyMsg) (Model, tea.Cmd) {
-	switch msg.String() {
-	case "j", "down":
-		m.docVP.LineDown(1)
-	case "k", "up":
-		m.docVP.LineUp(1)
-	case "d", "ctrl+d", "pgdown":
-		m.docVP.HalfViewDown()
-	case "u", "ctrl+u", "pgup":
-		m.docVP.HalfViewUp()
-	case "g":
-		m.docVP.GotoTop()
-	case "G":
-		m.docVP.GotoBottom()
-	case "r":
-		m.reloadDoc()
-	case "e":
-		return m.openDocEditor()
-	case "esc", "tab", "ctrl+o":
-		m.docFocus = false
-	case "ctrl+c":
-		return m, tea.Quit
-	}
-	return m, nil
-}
+// ── Opening the doc in the user's editor ─────────────────────────────────────
 
 // openDocEditor opens the attached document in the editor. Inside tmux it
 // opens a split pane beside cx; otherwise it suspends cx into $EDITOR.
@@ -295,7 +146,6 @@ func (m Model) openDocEditor() (Model, tea.Cmd) {
 	}
 	if os.Getenv("TMUX") != "" {
 		if err := exec.Command("tmux", "split-window", "-h", "-b", editor, m.docPath).Run(); err == nil {
-			m.docFocus = false
 			return m, nil
 		}
 	}
@@ -407,14 +257,13 @@ func (m *Model) applyDocEdit(i int) bool {
 	}
 	m.docContent = newContent
 	e.applied = true
-	m.refreshDocPane()
 	return true
 }
 
 // showDocEdit injects the current pending edit as a colored diff into the chat.
 func (m *Model) showDocEdit() {
 	e := m.docEdits[m.docEditIdx]
-	maxW := m.chatWidth() - 6
+	maxW := m.width - 6
 	if maxW < 20 {
 		maxW = 20
 	}
