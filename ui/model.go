@@ -130,9 +130,10 @@ type Model struct {
 	pendingSel *docSelection // editor highlight riding along the next message
 
 	// doc picker state
-	docFiles  []string
-	docFilter string
-	docCursor int
+	docFiles       []string
+	docFilter      string
+	docCursor      int
+	docPickerQuits bool // launched via `cx doc`: esc quits instead of returning to chat
 
 	// system
 	systemPrompt string

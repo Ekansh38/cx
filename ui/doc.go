@@ -604,6 +604,7 @@ func (m Model) enterDocPicker() (Model, tea.Cmd) {
 // StartInDocPicker opens the document picker on launch (used by `cx doc`).
 func (m Model) StartInDocPicker() Model {
 	m2, _ := m.enterDocPicker()
+	m2.docPickerQuits = true
 	return m2
 }
 
@@ -617,16 +618,23 @@ func cwdBase() string {
 func (m Model) updateDocPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEsc, tea.KeyCtrlC:
+		if m.docPickerQuits {
+			return m, tea.Quit
+		}
 		m.state = stateChat
 		return m, nil
 
 	case tea.KeyEnter:
 		filtered := m.filteredDocFiles()
 		if len(filtered) == 0 {
+			if m.docPickerQuits {
+				return m, tea.Quit
+			}
 			m.state = stateChat
 			return m, nil
 		}
 		m.state = stateChat
+		m.docPickerQuits = false
 		m2, cmd := m.attachDoc(filtered[m.docCursor])
 		m2.autoEditorSplit()
 		return m2, cmd
@@ -754,6 +762,10 @@ func (m Model) docPickerView() string {
 	}
 
 	sb.WriteString("\n\n")
-	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter attach  esc back"))
+	escHint := "esc back"
+	if m.docPickerQuits {
+		escHint = "esc quit"
+	}
+	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter attach  " + escHint))
 	return sb.String()
 }
