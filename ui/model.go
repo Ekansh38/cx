@@ -30,11 +30,12 @@ import (
 type appState int
 
 const (
-	stateChat        appState = iota
-	statePicker               // conversation picker overlay
-	stateSearch               // inline message search
-	stateModelPicker          // model switcher
-	stateDocPicker            // document picker for :doc
+	stateChat          appState = iota
+	statePicker                 // conversation picker overlay
+	stateSearch                 // inline message search
+	stateModelPicker            // model switcher
+	stateDocPicker              // filesystem document picker for :doc
+	stateDocListPicker          // connected-docs picker (:disconnect doc / :doc edit)
 )
 
 // ── tea.Msg types ─────────────────────────────────────────────────────────────
@@ -67,7 +68,8 @@ type searchResult struct {
 // ── available :commands ───────────────────────────────────────────────────────
 
 var commands = []string{
-	":clear", ":copy", ":copy prompt", ":debug", ":delete", ":doc",
+	":clear", ":connect doc", ":copy", ":copy prompt", ":debug",
+	":delete", ":disconnect doc", ":doc",
 	":edit", ":forget ", ":grep", ":help", ":img ",
 	":list", ":memory", ":model ", ":models", ":new",
 	":paste", ":q", ":quit", ":r", ":remember ",
@@ -95,8 +97,8 @@ type Model struct {
 	input        textarea.Model
 	pendingImage string // base64 data URL for next message
 	atBottom     bool
-	autoTitled  bool   // prevent re-triggering auto-title
-	errMsg      string // shown on separator row, cleared on next input
+	autoTitled   bool   // prevent re-triggering auto-title
+	errMsg       string // shown on separator row, cleared on next input
 
 	// streaming
 	streaming    bool
@@ -116,24 +118,32 @@ type Model struct {
 	searchCursor int
 
 	// model picker state
-	modelList     []llm.ModelInfo
-	modelFilter   string
-	modelCursor   int
-	modelLoading  bool
+	modelList    []llm.ModelInfo
+	modelFilter  string
+	modelCursor  int
+	modelLoading bool
 
-	// doc chat state (the doc renders in the user's editor, not in cx)
-	docPath    string
-	docContent string
+	// doc chat state (docs render in the user's editor, not in cx)
+	docs       []*attachedDoc
 	docReview  bool
 	docEdits   []docEdit
 	docEditIdx int
+	extGroups  []editGroup   // per-file edit batches queued for in-editor review
+	extNotes   []string      // per-file review summaries accumulated across groups
+	extRetry   bool          // a rejection carried a note: auto-retry when done
 	pendingSel *docSelection // editor highlight riding along the next message
 
-	// doc picker state
+	// doc picker state (:doc with no path)
 	docFiles       []string
 	docFilter      string
 	docCursor      int
 	docPickerQuits bool // launched via `cx doc`: esc quits instead of returning to chat
+
+	// connected-docs list picker state (:disconnect doc / :doc edit)
+	docListMode   string // "open" or "disconnect"
+	docListItems  []string
+	docListFilter string
+	docListCursor int
 
 	// system
 	systemPrompt string
@@ -175,13 +185,8 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 		streamBuf:    &strings.Builder{},
 		mdCache:      make(map[*store.Message]string),
 	}
-	// Restore an attached doc from a previous session
-	if conv.DocPath != "" {
-		if data, err := os.ReadFile(conv.DocPath); err == nil {
-			m.docPath = conv.DocPath
-			m.docContent = string(data)
-		}
-	}
+	// Restore connected docs from a previous session
+	m.loadConvDocs()
 	return m
 }
 
@@ -212,30 +217,51 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case docReloadMsg:
-		m.reloadDoc()
+		m.reloadDocs()
 		return m, nil
 
 	case extReviewTickMsg:
+		if len(m.extGroups) == 0 {
+			return m, nil
+		}
 		results, done := readExternalReviewResults()
 		if !done {
 			if msg.n > 3600 { // ~30 min: assume the review was abandoned
+				m.extGroups = nil
+				m.extNotes = nil
+				m.extRetry = false
 				return m, nil
 			}
 			return m, extReviewTick(msg.n + 1)
 		}
-		m.reloadDoc() // neovim wrote the file
+		m.reloadDocs() // neovim wrote the file
 
 		// A rejection with a note means "try again, differently": retry
-		// automatically instead of waiting for the user to ask.
-		retry := false
+		// automatically once all groups are reviewed.
 		for _, r := range results {
 			if !r.Applied && r.Reason != "" && r.Reason != "not found in buffer" {
-				retry = true
+				m.extRetry = true
 			}
 		}
-		note := summarizeReview(results, filepath.Base(m.docPath))
+		g := m.extGroups[0]
+		m.extGroups = m.extGroups[1:]
+		m.extNotes = append(m.extNotes, summarizeReview(results, filepath.Base(g.file)))
+
+		// More files to review: hand the next group to neovim
+		if len(m.extGroups) > 0 {
+			if startExternalReview(m.extGroups[0].file, m.extGroups[0].edits) {
+				return m, extReviewTick(0)
+			}
+			m.extNotes = append(m.extNotes, fmt.Sprintf("review of %s could not start", filepath.Base(m.extGroups[0].file)))
+			m.extGroups = nil
+		}
+
+		note := strings.Join(m.extNotes, "; ")
+		retry := m.extRetry
+		m.extNotes = nil
+		m.extRetry = false
 		if retry {
-			note += " Revise the rejected edits to address the notes and propose updated <edit> blocks."
+			note += ". Revise the rejected edits to address the notes and propose updated <edit> blocks."
 		}
 		if saved, err := m.store.AddMessage(m.conv.ID, "note", note); err == nil {
 			m.messages = append(m.messages, saved)
@@ -297,14 +323,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		m.atBottom = true
 
-		// Doc mode: hand proposed edits to neovim for review, or fall back
-		// to the in-cx y/n flow when the editor bridge isn't up.
+		// Doc mode: hand proposed edits to neovim for review (per file, in
+		// sequence), or fall back to the in-cx y/n flow without the bridge.
 		var reviewCmd tea.Cmd
-		if m.docPath != "" && content != "" {
-			m.reloadDoc() // match edits against the latest on-disk content
-			if edits := parseDocEdits(content); len(edits) > 0 {
-				if startExternalReview(m.docPath, edits) {
-					m.docEdits = edits
+		if len(m.docs) > 0 && content != "" {
+			m.reloadDocs() // match edits against the latest on-disk content
+			if edits := resolveEditFiles(parseDocEdits(content), m.docs); len(edits) > 0 {
+				groups := groupEditsByFile(edits)
+				if len(groups) > 0 && startExternalReview(groups[0].file, groups[0].edits) {
+					m.extGroups = groups
+					m.extNotes = nil
+					m.extRetry = false
 					word := "edits"
 					if len(edits) == 1 {
 						word = "edit"
@@ -386,10 +415,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				persisted = append(persisted, pm)
 			}
 		}
-		recentCount := 6
-		if recentCount > len(persisted) {
-			recentCount = len(persisted)
-		}
+		recentCount := min(6, len(persisted))
 		recent := persisted[len(persisted)-recentCount:]
 
 		// Persist the summary just before the recent messages so it survives
@@ -418,6 +444,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateModelPicker(msg)
 		case stateDocPicker:
 			return m.updateDocPicker(msg)
+		case stateDocListPicker:
+			return m.updateDocListPicker(msg)
 		default:
 			return m.updateChat(msg)
 		}
@@ -564,22 +592,20 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	}
 
 	// Pick up an editor highlight, if one was sent over (see README: neovim bridge).
-	// Selections from a file other than the attached doc are ignored.
+	// Selections from files that aren't connected docs are ignored.
 	display := input
 	if sel := readSelection(); sel != nil {
-		if m.docPath == "" {
-			m, _ = m.attachDoc(sel.file) // auto-attach the highlighted file
+		if len(m.docs) == 0 {
+			m, _ = m.connectDoc(sel.file) // auto-connect the highlighted file
 		}
-		if sel.file == m.docPath {
+		if m.findDoc(sel.file) != nil {
 			m.pendingSel = sel
 			consumeSelection()
 			display += fmt.Sprintf("\n[highlighted L%d-%d in %s]", sel.start, sel.end, filepath.Base(sel.file))
 		}
 	}
-	// Re-read the doc so the pane and payload reflect external editor saves
-	if m.docPath != "" {
-		m.reloadDoc()
-	}
+	// Re-read the docs so the payload reflects external editor saves
+	m.reloadDocs()
 
 	if saved, err := m.store.AddMessage(m.conv.ID, "user", display); err == nil {
 		m.messages = append(m.messages, saved)
@@ -632,7 +658,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.autoTitled = false
 		m.state = stateChat
 		m.errMsg = ""
-		m.loadConvDoc()
+		m.loadConvDocs()
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		m.atBottom = true
@@ -692,8 +718,8 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 	case ":debug":
 		msgs := m.buildLLMMessages()
 		var sb strings.Builder
-		sb.WriteString(fmt.Sprintf("── debug: %s ──\n", m.model))
-		sb.WriteString(fmt.Sprintf("── %d messages in payload ──\n\n", len(msgs)))
+		fmt.Fprintf(&sb, "── debug: %s ──\n", m.model)
+		fmt.Fprintf(&sb, "── %d messages in payload ──\n\n", len(msgs))
 		for i, msg := range msgs {
 			imgNote := ""
 			if len(msg.Images) > 0 {
@@ -755,7 +781,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		if role == "user" {
 			// Strip display-only placeholder lines
 			var lines []string
-			for _, line := range strings.Split(last, "\n") {
+			for line := range strings.SplitSeq(last, "\n") {
 				if !strings.HasPrefix(line, "[image: ") && !strings.HasPrefix(line, "[highlighted ") {
 					lines = append(lines, line)
 				}
@@ -805,7 +831,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		content := lastMsg.Content
 		// Strip image / highlight placeholder lines
 		var lines []string
-		for _, line := range strings.Split(content, "\n") {
+		for line := range strings.SplitSeq(content, "\n") {
 			if !strings.HasPrefix(line, "[image: ") && !strings.HasPrefix(line, "[highlighted ") {
 				lines = append(lines, line)
 			}
@@ -915,18 +941,56 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		arg := strings.TrimSpace(parts[1])
 		switch arg {
 		case "off", "close":
-			return m.detachDoc()
+			return m.disconnectDocFlow()
 		case "edit":
-			if m.docPath == "" {
-				m.errMsg = "no document attached"
+			switch len(m.docs) {
+			case 0:
+				m.errMsg = "no documents connected"
 				return m, nil
+			case 1:
+				return m.openDocEditor(m.docs[0].path)
+			default:
+				return m.enterDocListPicker("open")
 			}
-			return m.openDocEditor()
 		}
 		path, _ := splitPathToken(arg)
-		m2, cmd := m.attachDoc(path)
-		m2.autoEditorSplit()
+		m2, cmd := m.connectDoc(path)
+		if len(m2.docs) > 0 {
+			m2.autoEditorSplit(m2.docs[len(m2.docs)-1].path)
+		}
 		return m2, cmd
+
+	case ":connect":
+		if m.streaming {
+			m.errMsg = "wait for the response to finish (or :stop)"
+			return m, nil
+		}
+		arg := ""
+		if len(parts) > 1 {
+			arg = strings.TrimSpace(parts[1])
+		}
+		if arg != "doc" && !strings.HasPrefix(arg, "doc ") {
+			m.errMsg = "usage: :connect doc [path]"
+			return m, nil
+		}
+		path := strings.TrimSpace(strings.TrimPrefix(arg, "doc"))
+		if path == "" {
+			path = lastDocPath()
+			if path == "" {
+				m.errMsg = "no remembered doc yet (connect one with a path first)"
+				return m, nil
+			}
+		} else {
+			path, _ = splitPathToken(path)
+		}
+		return m.connectDoc(path)
+
+	case ":disconnect":
+		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "doc" {
+			m.errMsg = "usage: :disconnect doc"
+			return m, nil
+		}
+		return m.disconnectDocFlow()
 
 	case ":sel":
 		if len(parts) > 1 && strings.TrimSpace(parts[1]) == "clear" {
@@ -944,8 +1008,8 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			preview = preview[:500] + "…"
 		}
 		note := "(attached to your next message · :sel clear to drop)"
-		if m.docPath != "" && sel.file != m.docPath {
-			note = "(from a DIFFERENT file than the attached doc, will NOT be sent)"
+		if len(m.docs) > 0 && m.findDoc(sel.file) == nil {
+			note = "(from a file that isn't a connected doc, will NOT be sent)"
 		}
 		m.injectSystemLine(fmt.Sprintf("── selection: L%d-%d of %s ──\n%s\n%s",
 			sel.start, sel.end, filepath.Base(sel.file), preview, note))
@@ -1027,8 +1091,13 @@ commands  (type : to see completions)
   :img <path> [text]    send an image (png/jpg/gif/webp)
                         (or just paste/drop an image path, auto-detected)
   :paste [text]         send the image on your clipboard
-  :doc [path]           attach a document to discuss/edit (no path = picker)
-  :doc off              close the attached document
+  :doc [path]           connect a document and open it in your editor
+                        (no path = fuzzy picker over the current directory)
+  :doc edit             reopen a connected doc in your editor
+  :doc off              disconnect (same as :disconnect doc)
+  :connect doc [path]   connect a doc without opening the editor
+                        (no path = the last doc you connected)
+  :disconnect doc       disconnect a doc (picker with ALL when several)
   :sel                  preview the editor selection waiting for your next msg
   :sel clear            drop it
   :stop                 stop the current response (same as ctrl+c)
@@ -1043,15 +1112,16 @@ commands  (type : to see completions)
   :debug                show full API payload
   :wipe                 delete ALL conversations and messages (asks confirm)
 
-doc mode  (:doc)
-  the document lives in YOUR editor (opened beside cx in tmux);
-  cx just knows the file. the whole doc is sent to the model every
-  turn, re-read from disk, so every save is picked up automatically.
+doc mode  (:doc / :connect doc)
+  documents live in YOUR editor (opened beside cx in tmux);
+  cx just knows the files. a chat can have several docs connected;
+  all of them are sent to the model every turn, re-read from disk,
+  so every save is picked up automatically.
   reference passages as @L12, @L12-30, @## Heading.
-  :doc edit reopens the file in your editor.
-  proposed edits are reviewed IN NEOVIM as an inline diff:
+  proposed edits are reviewed IN NEOVIM as an inline diff, one
+  file at a time:
   [y] apply  [n] skip  [N] reject with a note  [a] all  [q] quit
-  rejection notes go back to the model so its next try improves.
+  rejection notes go back to the model and it retries automatically.
   (without the neovim bridge, the y/n review happens in cx instead)
 
 neovim side-by-side
@@ -1129,10 +1199,16 @@ func listenToken(ch <-chan string) tea.Cmd {
 
 func (m Model) buildLLMMessages() []llm.Message {
 	out := []llm.Message{{Role: "system", Content: m.systemPrompt}}
-	// Attach the live document (read fresh so external edits are picked up)
-	if m.docPath != "" {
-		if data, err := os.ReadFile(m.docPath); err == nil {
-			out = append(out, llm.Message{Role: "system", Content: docContextMsg(m.docPath, string(data))})
+	// Attach the live documents (read fresh so external edits are picked up)
+	if len(m.docs) > 0 {
+		docs := make([]*attachedDoc, 0, len(m.docs))
+		for _, d := range m.docs {
+			if data, err := os.ReadFile(d.path); err == nil {
+				docs = append(docs, &attachedDoc{path: d.path, content: string(data)})
+			}
+		}
+		if len(docs) > 0 {
+			out = append(out, llm.Message{Role: "system", Content: docsContextMsg(docs)})
 		}
 	}
 	// Editor highlight riding along this turn
@@ -1186,8 +1262,8 @@ func (m Model) contextTokens() int {
 		}
 	}
 	n := llm.EstimateTokens(m.systemPrompt)
-	if m.docPath != "" {
-		n += llm.EstimateTokens(m.docContent)
+	for _, d := range m.docs {
+		n += llm.EstimateTokens(d.content)
 	}
 	for i, msg := range m.messages {
 		if i < start || (msg.Role != "user" && msg.Role != "assistant" && msg.Role != "summary" && msg.Role != "note") {
@@ -1457,10 +1533,7 @@ func (m Model) startCompaction() (Model, tea.Cmd) {
 	m.streaming = true // show streaming indicator
 	m.injectSystemLine("compacting context...")
 
-	recentCount := 6
-	if recentCount > len(m.messages) {
-		recentCount = len(m.messages)
-	}
+	recentCount := min(6, len(m.messages))
 	cutoff := len(m.messages) - recentCount
 
 	// Start after the last prior summary — that history is already compacted.
@@ -1620,34 +1693,12 @@ func (m Model) switchConversation(id int64) (Model, tea.Cmd) {
 	m.autoTitled = conv.Title != "Untitled"
 	m.state = stateChat
 	m.errMsg = ""
-	m.loadConvDoc()
+	m.loadConvDocs()
 
 	m.refreshContent()
 	m.viewport.GotoBottom()
 	m.atBottom = true
 	return m, nil
-}
-
-// loadConvDoc restores (or clears) the attached doc for the current conversation.
-func (m *Model) loadConvDoc() {
-	m.docReview = false
-	m.docEdits = nil
-	if m.conv.DocPath == "" {
-		m.docPath = ""
-		m.docContent = ""
-		return
-	}
-	data, err := os.ReadFile(m.conv.DocPath)
-	if err != nil {
-		// File moved/deleted — detach quietly
-		m.docPath = ""
-		m.docContent = ""
-		m.store.UpdateDocPath(m.conv.ID, "")
-		m.conv.DocPath = ""
-		return
-	}
-	m.docPath = m.conv.DocPath
-	m.docContent = string(data)
 }
 
 func (m Model) newConversation() (Model, tea.Cmd) {
@@ -1664,7 +1715,7 @@ func (m Model) newConversation() (Model, tea.Cmd) {
 	m.autoTitled = false
 	m.state = stateChat
 	m.errMsg = ""
-	m.loadConvDoc()
+	m.loadConvDocs()
 
 	m.refreshContent()
 	m.viewport.GotoBottom()
@@ -1881,10 +1932,7 @@ func (m Model) modelPickerView() string {
 		if len(filtered) == 0 {
 			sb.WriteString(dimStyle.Render("   no matches") + "\n")
 		} else {
-			maxVisible := m.height - 10
-			if maxVisible < 1 {
-				maxVisible = 1
-			}
+			maxVisible := max(m.height-10, 1)
 			start := 0
 			if m.modelCursor >= maxVisible {
 				start = m.modelCursor - maxVisible + 1
@@ -1907,10 +1955,7 @@ func (m Model) modelPickerView() string {
 				}
 
 				name := mi.ID
-				maxName := m.width - 8
-				if maxName < 20 {
-					maxName = 20
-				}
+				maxName := max(m.width-8, 20)
 				if utf8.RuneCountInString(name) > maxName {
 					name = string([]rune(name)[:maxName-1]) + "…"
 				}
@@ -1978,6 +2023,8 @@ func (m Model) View() string {
 		return m.modelPickerView()
 	case stateDocPicker:
 		return m.docPickerView()
+	case stateDocListPicker:
+		return m.docListPickerView()
 	default:
 		return m.chatView()
 	}
@@ -2027,14 +2074,7 @@ func (m *Model) syncInputHeight() {
 }
 
 func (m Model) inputHeight() int {
-	lines := m.input.LineCount()
-	if lines < 1 {
-		lines = 1
-	}
-	if lines > 10 {
-		lines = 10
-	}
-	return lines
+	return min(max(m.input.LineCount(), 1), 10)
 }
 
 func (m Model) statusView() string {
@@ -2045,10 +2085,14 @@ func (m Model) statusView() string {
 	}
 
 	left := "  " + modelDisplay + "  ·  " + m.conv.Title
-	if m.docPath != "" {
-		left += "  ·  doc: " + filepath.Base(m.docPath)
+	switch len(m.docs) {
+	case 0:
+	case 1:
+		left += "  ·  doc: " + filepath.Base(m.docs[0].path)
+	default:
+		left += fmt.Sprintf("  ·  docs: %d", len(m.docs))
 	}
-	if sel := readSelection(); sel != nil && (m.docPath == "" || sel.file == m.docPath) {
+	if sel := readSelection(); sel != nil && (len(m.docs) == 0 || m.findDoc(sel.file) != nil) {
 		left += fmt.Sprintf("  ·  sel L%d-%d", sel.start, sel.end)
 	}
 
@@ -2067,10 +2111,7 @@ func (m Model) statusView() string {
 		right = tokDisplay + "  "
 	}
 
-	pad := m.width - lipgloss.Width(left) - lipgloss.Width(right)
-	if pad < 1 {
-		pad = 1
-	}
+	pad := max(m.width-lipgloss.Width(left)-lipgloss.Width(right), 1)
 	return statusStyle.Render(left + strings.Repeat(" ", pad) + right)
 }
 
@@ -2078,19 +2119,13 @@ func (m Model) statusView() string {
 
 func (m Model) pickerView() string {
 	filtered := m.filteredConvs()
-	maxVisible := m.height - 10
-	if maxVisible < 1 {
-		maxVisible = 1
-	}
+	maxVisible := max(m.height-10, 1)
 
 	start := 0
 	if m.pickerCursor >= maxVisible {
 		start = m.pickerCursor - maxVisible + 1
 	}
-	end := start + maxVisible
-	if end > len(filtered) {
-		end = len(filtered)
-	}
+	end := min(start+maxVisible, len(filtered))
 
 	var sb strings.Builder
 	sb.WriteString("\n\n")
@@ -2109,10 +2144,7 @@ func (m Model) pickerView() string {
 			c := filtered[i]
 			age := dimStyle.Render(timeAgo(c.UpdatedAt))
 			title := c.Title
-			maxTitle := m.width - 18
-			if maxTitle < 10 {
-				maxTitle = 10
-			}
+			maxTitle := max(m.width-18, 10)
 			if utf8.RuneCountInString(title) > maxTitle {
 				title = string([]rune(title)[:maxTitle-1]) + "…"
 			}
@@ -2151,19 +2183,13 @@ func (m Model) pickerView() string {
 
 func (m Model) searchView() string {
 	filtered := m.filteredSearch()
-	maxVisible := m.height - 10
-	if maxVisible < 1 {
-		maxVisible = 1
-	}
+	maxVisible := max(m.height-10, 1)
 
 	start := 0
 	if m.searchCursor >= maxVisible {
 		start = m.searchCursor - maxVisible + 1
 	}
-	end := start + maxVisible
-	if end > len(filtered) {
-		end = len(filtered)
-	}
+	end := min(start+maxVisible, len(filtered))
 
 	var sb strings.Builder
 	sb.WriteString("\n\n")
@@ -2193,10 +2219,7 @@ func (m Model) searchView() string {
 			if nl := strings.Index(preview, "\n"); nl >= 0 {
 				preview = preview[:nl]
 			}
-			maxPreview := m.width - maxTitle - 16
-			if maxPreview < 20 {
-				maxPreview = 20
-			}
+			maxPreview := max(m.width-maxTitle-16, 20)
 			if utf8.RuneCountInString(preview) > maxPreview {
 				preview = string([]rune(preview)[:maxPreview-1]) + "…"
 			}
@@ -2345,11 +2368,7 @@ func (m *Model) renderMarkdown(content string) string {
 
 func (m Model) viewportHeight() int {
 	// sep(1) + input(dynamic) + blank(1) + status(1) = 3 + inputHeight
-	h := m.height - 3 - m.inputHeight()
-	if h < 1 {
-		h = 1
-	}
-	return h
+	return max(m.height-3-m.inputHeight(), 1)
 }
 
 // wordWrap wraps text at width, preserving explicit newlines.

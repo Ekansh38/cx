@@ -75,7 +75,7 @@ func main() {
 		}
 	}
 
-	// Doc mode: reuse the conversation already attached to this file, or start one
+	// Doc mode: reuse the conversation already connected to this file, or start one
 	if docPath != "" {
 		dc, _ := st.FindConversationByDoc(docPath)
 		if dc == nil {
@@ -83,9 +83,9 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			st.UpdateDocPath(dc.ID, docPath)
-			dc.DocPath = docPath
+			st.AddDoc(dc.ID, docPath)
 		}
+		ui.SaveLastDoc(docPath)
 		conv = dc
 		if conv.Model != "" && conv.Model != model {
 			if p2, err := llm.ForModel(conv.Model, cfg); err == nil {
@@ -166,7 +166,7 @@ func launchDocSplit(path string) string {
 }
 
 func buildSystemPrompt(memory string) string {
-	base := "You are a helpful, direct, and thoughtful assistant. Be concise unless detail is needed."
+	base := "You are a helpful, direct, and thoughtful buddy. No need to sugar-coat, be BLUNT. No need to agree for no reason."
 	if strings.TrimSpace(memory) == "" {
 		return base
 	}

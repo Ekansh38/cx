@@ -1,9 +1,10 @@
 package ui
 
-// Doc-chat mode: attach a document to a conversation and discuss/edit it.
-// The doc renders in a left pane with line numbers; chat lives on the right.
-// The full document is sent as a system message on every turn, and the model
-// can propose edits as SEARCH/REPLACE blocks the user approves one by one.
+// Doc-chat mode: connect documents to a conversation and discuss/edit them.
+// Docs render in the user's editor (neovim in a tmux split, opened with the
+// cx RPC bridge), not in cx. Every connected doc is sent as a system message
+// on each turn, re-read from disk. The model proposes SEARCH/REPLACE edit
+// blocks, reviewed hunk-by-hunk in neovim (fallback: in-cx y/n review).
 
 import (
 	"bytes"
@@ -28,19 +29,32 @@ import (
 type docReloadMsg struct{}
 type extReviewTickMsg struct{ n int }
 
+// attachedDoc is one document connected to the conversation.
+type attachedDoc struct {
+	path    string
+	content string
+}
+
 // docEdit is one model-proposed SEARCH/REPLACE change awaiting review.
 type docEdit struct {
+	file    string // target document (absolute path)
 	search  string
 	replace string
 	applied bool
 	failed  bool
 }
 
+// editGroup batches edits per target file for sequential in-editor review.
+type editGroup struct {
+	file  string
+	edits []docEdit
+}
+
 // ── LLM-facing document context ──────────────────────────────────────────────
 
-const docEditInstructions = `You can discuss the document and, when the user asks for changes, propose edits using this exact format:
+const docEditInstructions = `You can discuss the documents and, when the user asks for changes, propose edits using this exact format:
 
-<edit>
+<edit file="/absolute/path/to/the/document">
 <<<<<<< SEARCH
 exact text copied verbatim from the document (do NOT include the line numbers)
 =======
@@ -49,27 +63,55 @@ the replacement text
 </edit>
 
 Rules:
+- Always include the file attribute with the document's absolute path.
 - The SEARCH text must match the document exactly, character for character.
 - Keep each edit small and focused; use multiple <edit> blocks for separate changes.
 - The user reviews and approves each edit before it is applied, so don't repeat the diff in prose.
 - The user may reference locations like @L12, @L12-30, or @## Heading Name.`
 
-// docContextMsg builds the system message carrying the live document.
-func docContextMsg(path, content string) string {
+// docsContextMsg builds the system message carrying all connected documents.
+func docsContextMsg(docs []*attachedDoc) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "The user has attached a document to this conversation: %s\n\n", path)
-	sb.WriteString("Current document content (line numbers added for reference — they are NOT part of the file):\n<document>\n")
-	for i, ln := range strings.Split(content, "\n") {
-		fmt.Fprintf(&sb, "%d│%s\n", i+1, ln)
+	if len(docs) == 1 {
+		fmt.Fprintf(&sb, "The user has connected a document to this conversation: %s\n\n", docs[0].path)
+	} else {
+		fmt.Fprintf(&sb, "The user has connected %d documents to this conversation.\n\n", len(docs))
 	}
-	sb.WriteString("</document>\n\n")
+	sb.WriteString("Current content (line numbers added for reference — they are NOT part of the files):\n")
+	for _, d := range docs {
+		fmt.Fprintf(&sb, "<document path=%q>\n", d.path)
+		for i, ln := range strings.Split(d.content, "\n") {
+			fmt.Fprintf(&sb, "%d│%s\n", i+1, ln)
+		}
+		sb.WriteString("</document>\n")
+	}
+	sb.WriteString("\n")
 	sb.WriteString(docEditInstructions)
 	return sb.String()
 }
 
-// ── Attach / detach / reload ─────────────────────────────────────────────────
+// ── Connect / disconnect / reload ────────────────────────────────────────────
 
-func (m Model) attachDoc(path string) (Model, tea.Cmd) {
+// lastDocPathFile remembers the most recently connected doc for `:connect doc`.
+func lastDocPathFile() string {
+	return filepath.Join(config.DataDir(), "last-doc.txt")
+}
+
+// SaveLastDoc records the path for later no-arg :connect doc.
+func SaveLastDoc(path string) {
+	os.WriteFile(lastDocPathFile(), []byte(path+"\n"), 0o644)
+}
+
+func lastDocPath() string {
+	data, err := os.ReadFile(lastDocPathFile())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// resolveDocPath expands ~, resolves to absolute, and validates the file.
+func resolveDocPath(path string) (string, error) {
 	if strings.HasPrefix(path, "~") {
 		if home, err := os.UserHomeDir(); err == nil {
 			path = home + path[1:]
@@ -77,66 +119,130 @@ func (m Model) attachDoc(path string) (Model, tea.Cmd) {
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		m.errMsg = "invalid path: " + err.Error()
-		return m, nil
+		return "", err
 	}
 	data, err := os.ReadFile(abs)
 	if err != nil {
-		m.errMsg = "doc: " + err.Error()
-		return m, nil
+		return "", err
 	}
 	if len(data) > 512*1024 {
-		m.errMsg = "doc too large (>512KB)"
-		return m, nil
+		return "", fmt.Errorf("doc too large (>512KB)")
 	}
 	head := data
 	if len(head) > 8192 {
 		head = head[:8192]
 	}
 	if bytes.IndexByte(head, 0) >= 0 {
-		m.errMsg = "doc looks binary, attach a text file"
-		return m, nil
+		return "", fmt.Errorf("looks binary, connect a text file")
 	}
-
-	m.docPath = abs
-	m.docContent = string(data)
-	m.docReview = false
-	m.docEdits = nil
-	m.store.UpdateDocPath(m.conv.ID, abs)
-	m.conv.DocPath = abs
-
-	m.injectSystemLine("attached " + filepath.Base(abs))
-	return m, nil
+	return abs, nil
 }
 
-func (m Model) detachDoc() (Model, tea.Cmd) {
-	if m.docPath == "" {
-		m.errMsg = "no document attached"
-		return m, nil
-	}
-	name := filepath.Base(m.docPath)
-	m.docPath = ""
-	m.docContent = ""
-	m.docReview = false
-	m.docEdits = nil
-	m.store.UpdateDocPath(m.conv.ID, "")
-	m.conv.DocPath = ""
-
-	m.injectSystemLine("closed " + name)
-	return m, nil
-}
-
-// reloadDoc re-reads the attached document from disk.
-func (m *Model) reloadDoc() {
-	if m.docPath == "" {
-		return
-	}
-	data, err := os.ReadFile(m.docPath)
+// connectDoc connects a document to the conversation and remembers it as the
+// last doc. No-op (with a note) if already connected.
+func (m Model) connectDoc(path string) (Model, tea.Cmd) {
+	abs, err := resolveDocPath(path)
 	if err != nil {
-		m.errMsg = "doc reload: " + err.Error()
+		m.errMsg = "doc: " + err.Error()
+		return m, nil
+	}
+	if m.findDoc(abs) != nil {
+		m.injectSystemLine(filepath.Base(abs) + " is already connected")
+		return m, nil
+	}
+	data, _ := os.ReadFile(abs)
+	m.docs = append(m.docs, &attachedDoc{path: abs, content: string(data)})
+	m.store.AddDoc(m.conv.ID, abs)
+	SaveLastDoc(abs)
+	m.injectSystemLine("connected " + filepath.Base(abs))
+	return m, nil
+}
+
+// disconnectDoc removes one connected document.
+func (m *Model) disconnectDoc(path string) {
+	var kept []*attachedDoc
+	for _, d := range m.docs {
+		if d.path != path {
+			kept = append(kept, d)
+		}
+	}
+	m.docs = kept
+	m.store.RemoveDoc(m.conv.ID, path)
+	m.injectSystemLine("disconnected " + filepath.Base(path))
+}
+
+// disconnectAllDocs removes every connected document.
+func (m *Model) disconnectAllDocs() {
+	n := len(m.docs)
+	m.docs = nil
+	m.store.ClearDocs(m.conv.ID)
+	m.injectSystemLine(fmt.Sprintf("disconnected all %d docs", n))
+}
+
+// findDoc returns the connected doc with the given path, or nil.
+func (m Model) findDoc(path string) *attachedDoc {
+	for _, d := range m.docs {
+		if d.path == path {
+			return d
+		}
+	}
+	return nil
+}
+
+// docPaths lists the connected document paths in order.
+func (m Model) docPaths() []string {
+	out := make([]string, len(m.docs))
+	for i, d := range m.docs {
+		out[i] = d.path
+	}
+	return out
+}
+
+// reloadDocs re-reads all connected documents from disk.
+func (m *Model) reloadDocs() {
+	for _, d := range m.docs {
+		if data, err := os.ReadFile(d.path); err == nil {
+			d.content = string(data)
+		}
+	}
+}
+
+// loadConvDocs restores the connected docs for the current conversation,
+// silently dropping files that no longer exist.
+func (m *Model) loadConvDocs() {
+	m.docReview = false
+	m.docEdits = nil
+	m.extGroups = nil
+	m.extNotes = nil
+	m.extRetry = false
+	m.docs = nil
+	paths, err := m.store.GetDocs(m.conv.ID)
+	if err != nil {
 		return
 	}
-	m.docContent = string(data)
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			m.store.RemoveDoc(m.conv.ID, p) // moved or deleted
+			continue
+		}
+		m.docs = append(m.docs, &attachedDoc{path: p, content: string(data)})
+	}
+}
+
+// disconnectDocFlow handles :disconnect doc / :doc off — instant when one
+// doc is connected, a picker (with ALL) when several are.
+func (m Model) disconnectDocFlow() (Model, tea.Cmd) {
+	switch len(m.docs) {
+	case 0:
+		m.errMsg = "no documents connected"
+		return m, nil
+	case 1:
+		m.disconnectDoc(m.docs[0].path)
+		return m, nil
+	default:
+		return m.enterDocListPicker("disconnect")
+	}
 }
 
 // ── Opening the doc in the user's editor ─────────────────────────────────────
@@ -190,10 +296,10 @@ func pokeChecktime() {
 	exec.Command("nvim", "--server", sock, "--remote-expr", "v:lua.CxChecktime()").Run()
 }
 
-// openDocEditor opens the attached document in the editor. Inside tmux it
+// openDocEditor opens a connected document in the editor. Inside tmux it
 // opens a split pane beside cx; otherwise it suspends cx into $EDITOR.
-func (m Model) openDocEditor() (Model, tea.Cmd) {
-	args := EditorArgs(m.docPath)
+func (m Model) openDocEditor(path string) (Model, tea.Cmd) {
+	args := EditorArgs(path)
 	if os.Getenv("TMUX") != "" {
 		tmuxArgs := append([]string{"split-window", "-h", "-b"}, args...)
 		if err := exec.Command("tmux", tmuxArgs...).Run(); err == nil {
@@ -207,11 +313,11 @@ func (m Model) openDocEditor() (Model, tea.Cmd) {
 
 // autoEditorSplit opens the editor beside cx after an explicit :doc attach
 // (no-op outside tmux; keeps focus on cx).
-func (m *Model) autoEditorSplit() {
-	if m.docPath == "" || os.Getenv("TMUX") == "" {
+func (m *Model) autoEditorSplit(path string) {
+	if path == "" || os.Getenv("TMUX") == "" {
 		return
 	}
-	tmuxArgs := append([]string{"split-window", "-h", "-b", "-d"}, EditorArgs(m.docPath)...)
+	tmuxArgs := append([]string{"split-window", "-h", "-b", "-d"}, EditorArgs(path)...)
 	exec.Command("tmux", tmuxArgs...).Run()
 }
 
@@ -307,30 +413,87 @@ func extReviewTick(n int) tea.Cmd {
 // ── Edit blocks: parse / apply / review ──────────────────────────────────────
 
 // parseDocEdits extracts SEARCH/REPLACE blocks from an assistant response.
+// The open tag may carry a file attribute: <edit file="/abs/path">.
 func parseDocEdits(s string) []docEdit {
 	var edits []docEdit
 	for {
-		start := strings.Index(s, "<edit>")
+		start := strings.Index(s, "<edit")
 		if start < 0 {
 			break
 		}
+		tagEnd := strings.Index(s[start:], ">")
+		if tagEnd < 0 {
+			break
+		}
+		openTag := s[start : start+tagEnd+1]
 		rel := strings.Index(s[start:], "</edit>")
 		if rel < 0 {
 			break
 		}
-		block := s[start+len("<edit>") : start+rel]
+		block := s[start+tagEnd+1 : start+rel]
 		s = s[start+rel+len("</edit>"):]
 		if e, ok := parseEditBlock(block); ok {
+			e.file = parseFileAttr(openTag)
 			edits = append(edits, e)
 		}
 	}
 	return edits
 }
 
+// parseFileAttr extracts the file="..." value from an <edit ...> open tag.
+func parseFileAttr(tag string) string {
+	i := strings.Index(tag, `file="`)
+	if i < 0 {
+		return ""
+	}
+	rest := tag[i+len(`file="`):]
+	j := strings.IndexByte(rest, '"')
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+// resolveEditFiles fills in missing edit targets: single doc means that doc;
+// otherwise the doc whose content contains the SEARCH text.
+func resolveEditFiles(edits []docEdit, docs []*attachedDoc) []docEdit {
+	for i := range edits {
+		if edits[i].file != "" {
+			continue
+		}
+		if len(docs) == 1 {
+			edits[i].file = docs[0].path
+			continue
+		}
+		for _, d := range docs {
+			if _, ok := applyEditTo(d.content, edits[i].search, edits[i].replace); ok {
+				edits[i].file = d.path
+				break
+			}
+		}
+	}
+	return edits
+}
+
+// groupEditsByFile batches edits per target file, preserving order.
+func groupEditsByFile(edits []docEdit) []editGroup {
+	var groups []editGroup
+	idx := map[string]int{}
+	for _, e := range edits {
+		if i, ok := idx[e.file]; ok {
+			groups[i].edits = append(groups[i].edits, e)
+			continue
+		}
+		idx[e.file] = len(groups)
+		groups = append(groups, editGroup{file: e.file, edits: []docEdit{e}})
+	}
+	return groups
+}
+
 func parseEditBlock(b string) (docEdit, bool) {
 	var search, replace []string
 	mode := 0
-	for _, ln := range strings.Split(b, "\n") {
+	for ln := range strings.SplitSeq(b, "\n") {
 		t := strings.TrimSpace(ln)
 		switch {
 		case strings.HasPrefix(t, "<<<<<<<"):
@@ -379,20 +542,25 @@ func applyEditTo(content, search, replace string) (string, bool) {
 	return content, false
 }
 
-// applyDocEdit applies edit i to the document and writes it to disk.
+// applyDocEdit applies edit i to its target document and writes it to disk.
 func (m *Model) applyDocEdit(i int) bool {
 	e := &m.docEdits[i]
-	newContent, ok := applyEditTo(m.docContent, e.search, e.replace)
+	doc := m.findDoc(e.file)
+	if doc == nil {
+		e.failed = true
+		return false
+	}
+	newContent, ok := applyEditTo(doc.content, e.search, e.replace)
 	if !ok {
 		e.failed = true
 		return false
 	}
-	if err := os.WriteFile(m.docPath, []byte(newContent), 0o644); err != nil {
+	if err := os.WriteFile(doc.path, []byte(newContent), 0o644); err != nil {
 		m.errMsg = "doc write: " + err.Error()
 		e.failed = true
 		return false
 	}
-	m.docContent = newContent
+	doc.content = newContent
 	e.applied = true
 	pokeChecktime() // hot-reload the buffer in a bridged editor
 	return true
@@ -401,16 +569,17 @@ func (m *Model) applyDocEdit(i int) bool {
 // showDocEdit injects the current pending edit as a colored diff into the chat.
 func (m *Model) showDocEdit() {
 	e := m.docEdits[m.docEditIdx]
-	maxW := m.width - 6
-	if maxW < 20 {
-		maxW = 20
-	}
+	maxW := max(m.width-6, 20)
 	var sb strings.Builder
-	sb.WriteString(dimStyle.Render(fmt.Sprintf("── proposed edit %d/%d ──", m.docEditIdx+1, len(m.docEdits))) + "\n")
-	for _, l := range strings.Split(e.search, "\n") {
+	header := fmt.Sprintf("── proposed edit %d/%d", m.docEditIdx+1, len(m.docEdits))
+	if e.file != "" {
+		header += " · " + filepath.Base(e.file)
+	}
+	sb.WriteString(dimStyle.Render(header+" ──") + "\n")
+	for l := range strings.SplitSeq(e.search, "\n") {
 		sb.WriteString(diffOldStyle.Render(truncate("  - "+l, maxW)) + "\n")
 	}
-	for _, l := range strings.Split(e.replace, "\n") {
+	for l := range strings.SplitSeq(e.replace, "\n") {
 		sb.WriteString(diffNewStyle.Render(truncate("  + "+l, maxW)) + "\n")
 	}
 	sb.WriteString(dimStyle.Render("  [y] apply   [n] skip   [a] apply all   [esc] cancel"))
@@ -466,7 +635,7 @@ func (m *Model) advanceDocReview() {
 			failed++
 		}
 	}
-	note := fmt.Sprintf("applied %d/%d edits to %s", applied, len(m.docEdits), filepath.Base(m.docPath))
+	note := fmt.Sprintf("applied %d/%d edits", applied, len(m.docEdits))
 	if failed > 0 {
 		note += fmt.Sprintf(" (%d couldn't be located)", failed)
 	}
@@ -477,7 +646,7 @@ func (m *Model) advanceDocReview() {
 func stripEditBlocks(s string) string {
 	n := 0
 	for {
-		start := strings.Index(s, "<edit>")
+		start := strings.Index(s, "<edit")
 		if start < 0 {
 			break
 		}
@@ -635,8 +804,10 @@ func (m Model) updateDocPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		m.state = stateChat
 		m.docPickerQuits = false
-		m2, cmd := m.attachDoc(filtered[m.docCursor])
-		m2.autoEditorSplit()
+		m2, cmd := m.connectDoc(filtered[m.docCursor])
+		if len(m2.docs) > 0 {
+			m2.autoEditorSplit(m2.docs[len(m2.docs)-1].path)
+		}
 		return m2, cmd
 
 	case tea.KeyUp:
@@ -712,18 +883,12 @@ func fuzzyMatch(query, s string) bool {
 
 func (m Model) docPickerView() string {
 	filtered := m.filteredDocFiles()
-	maxVisible := m.height - 10
-	if maxVisible < 1 {
-		maxVisible = 1
-	}
+	maxVisible := max(m.height-10, 1)
 	start := 0
 	if m.docCursor >= maxVisible {
 		start = m.docCursor - maxVisible + 1
 	}
-	end := start + maxVisible
-	if end > len(filtered) {
-		end = len(filtered)
-	}
+	end := min(start+maxVisible, len(filtered))
 
 	var sb strings.Builder
 	sb.WriteString("\n\n")
@@ -740,10 +905,7 @@ func (m Model) docPickerView() string {
 	} else {
 		for i := start; i < end; i++ {
 			f := filtered[i]
-			maxName := m.width - 8
-			if maxName < 20 {
-				maxName = 20
-			}
+			maxName := max(m.width-8, 20)
 			if utf8.RuneCountInString(f) > maxName {
 				f = "…" + string([]rune(f)[utf8.RuneCountInString(f)-maxName+1:])
 			}
@@ -767,5 +929,141 @@ func (m Model) docPickerView() string {
 		escHint = "esc quit"
 	}
 	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter attach  " + escHint))
+	return sb.String()
+}
+
+// ── Connected-docs list picker (:disconnect doc / :doc edit with many) ───────
+
+const docListAll = "ALL"
+
+// enterDocListPicker opens a fuzzy list of connected docs. mode is "open"
+// (open in editor) or "disconnect" (which also offers ALL).
+func (m Model) enterDocListPicker(mode string) (Model, tea.Cmd) {
+	if len(m.docs) == 0 {
+		m.errMsg = "no documents connected"
+		return m, nil
+	}
+	m.docListMode = mode
+	m.docListItems = nil
+	if mode == "disconnect" {
+		m.docListItems = append(m.docListItems, docListAll)
+	}
+	m.docListItems = append(m.docListItems, m.docPaths()...)
+	m.docListFilter = ""
+	m.docListCursor = 0
+	m.state = stateDocListPicker
+	return m, nil
+}
+
+func (m Model) filteredDocList() []string {
+	if m.docListFilter == "" {
+		return m.docListItems
+	}
+	q := strings.ToLower(m.docListFilter)
+	var exact, fuzzy []string
+	for _, f := range m.docListItems {
+		lf := strings.ToLower(f)
+		switch {
+		case strings.Contains(lf, q):
+			exact = append(exact, f)
+		case fuzzyMatch(q, lf):
+			fuzzy = append(fuzzy, f)
+		}
+	}
+	return append(exact, fuzzy...)
+}
+
+func (m Model) updateDocListPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.state = stateChat
+		return m, nil
+
+	case tea.KeyEnter:
+		filtered := m.filteredDocList()
+		if len(filtered) == 0 {
+			m.state = stateChat
+			return m, nil
+		}
+		sel := filtered[m.docListCursor]
+		m.state = stateChat
+		if m.docListMode == "disconnect" {
+			if sel == docListAll {
+				m.disconnectAllDocs()
+			} else {
+				m.disconnectDoc(sel)
+			}
+			return m, nil
+		}
+		return m.openDocEditor(sel)
+
+	case tea.KeyUp:
+		if m.docListCursor > 0 {
+			m.docListCursor--
+		}
+		return m, nil
+
+	case tea.KeyDown:
+		if m.docListCursor < len(m.filteredDocList())-1 {
+			m.docListCursor++
+		}
+		return m, nil
+
+	case tea.KeyBackspace, tea.KeyDelete:
+		if len(m.docListFilter) > 0 {
+			_, size := utf8.DecodeLastRuneInString(m.docListFilter)
+			m.docListFilter = m.docListFilter[:len(m.docListFilter)-size]
+			m.docListCursor = 0
+		}
+		return m, nil
+
+	case tea.KeySpace:
+		m.docListFilter += " "
+		m.docListCursor = 0
+		return m, nil
+
+	case tea.KeyRunes:
+		m.docListFilter += string(msg.Runes)
+		m.docListCursor = 0
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) docListPickerView() string {
+	filtered := m.filteredDocList()
+	title := "Open document"
+	if m.docListMode == "disconnect" {
+		title = "Disconnect document"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n\n")
+	sb.WriteString(pickerTitleStyle.Render("   "+title) + "\n\n")
+
+	filterText := m.docListFilter
+	if filterText == "" {
+		filterText = dimStyle.Render("type to filter...")
+	}
+	sb.WriteString(promptStyle.Render("   > ") + filterText + "\n\n")
+
+	if len(filtered) == 0 {
+		sb.WriteString(dimStyle.Render("   no matches") + "\n")
+	} else {
+		for i, f := range filtered {
+			name, dir := f, ""
+			if f != docListAll {
+				name, dir = filepath.Base(f), "  "+dimStyle.Render(filepath.Dir(f))
+			}
+			if i == m.docListCursor {
+				sb.WriteString(pickerSelectedStyle.Render(" › "+name) + dir + "\n")
+			} else {
+				sb.WriteString(pickerRowStyle.Render("   "+name) + dir + "\n")
+			}
+		}
+	}
+
+	sb.WriteString("\n\n")
+	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter select  esc back"))
 	return sb.String()
 }

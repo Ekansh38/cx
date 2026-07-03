@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS messages (
 	created_at      INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS conversation_docs (
+	conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+	path            TEXT    NOT NULL,
+	UNIQUE(conversation_id, path)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC);
 `
@@ -33,7 +39,6 @@ type Conversation struct {
 	ID        int64
 	Title     string
 	Model     string
-	DocPath   string
 	CreatedAt int64
 	UpdatedAt int64
 }
@@ -61,7 +66,9 @@ func New(path string) (*Store, error) {
 	}
 	// Migrations — safe to re-run (errors ignored if column already exists)
 	db.Exec(`ALTER TABLE messages ADD COLUMN image_path TEXT NOT NULL DEFAULT ''`)
-	db.Exec(`ALTER TABLE conversations ADD COLUMN doc_path TEXT NOT NULL DEFAULT ''`)
+	// Move legacy single-doc attachments into conversation_docs (the doc_path
+	// column only exists on older DBs; the error is ignored on fresh ones)
+	db.Exec(`INSERT OR IGNORE INTO conversation_docs (conversation_id, path) SELECT id, doc_path FROM conversations WHERE doc_path != ''`)
 	return &Store{db: db}, nil
 }
 
@@ -85,9 +92,9 @@ func (s *Store) CreateConversation(model string) (*Conversation, error) {
 
 // GetConversation returns a single conversation by ID.
 func (s *Store) GetConversation(id int64) (*Conversation, error) {
-	row := s.db.QueryRow(`SELECT id, title, model, doc_path, created_at, updated_at FROM conversations WHERE id = ?`, id)
+	row := s.db.QueryRow(`SELECT id, title, model, created_at, updated_at FROM conversations WHERE id = ?`, id)
 	var c Conversation
-	if err := row.Scan(&c.ID, &c.Title, &c.Model, &c.DocPath, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	if err := row.Scan(&c.ID, &c.Title, &c.Model, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -95,9 +102,9 @@ func (s *Store) GetConversation(id int64) (*Conversation, error) {
 
 // MostRecent returns the most recently updated conversation, or nil if none exist.
 func (s *Store) MostRecent() (*Conversation, error) {
-	row := s.db.QueryRow(`SELECT id, title, model, doc_path, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 1`)
+	row := s.db.QueryRow(`SELECT id, title, model, created_at, updated_at FROM conversations ORDER BY updated_at DESC LIMIT 1`)
 	var c Conversation
-	if err := row.Scan(&c.ID, &c.Title, &c.Model, &c.DocPath, &c.CreatedAt, &c.UpdatedAt); err == sql.ErrNoRows {
+	if err := row.Scan(&c.ID, &c.Title, &c.Model, &c.CreatedAt, &c.UpdatedAt); err == sql.ErrNoRows {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
@@ -107,7 +114,7 @@ func (s *Store) MostRecent() (*Conversation, error) {
 
 // ListConversations returns all conversations, newest first.
 func (s *Store) ListConversations() ([]*Conversation, error) {
-	rows, err := s.db.Query(`SELECT id, title, model, doc_path, created_at, updated_at FROM conversations ORDER BY updated_at DESC`)
+	rows, err := s.db.Query(`SELECT id, title, model, created_at, updated_at FROM conversations ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +123,7 @@ func (s *Store) ListConversations() ([]*Conversation, error) {
 	var convs []*Conversation
 	for rows.Next() {
 		var c Conversation
-		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &c.DocPath, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Title, &c.Model, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
 		convs = append(convs, &c)
@@ -124,15 +131,17 @@ func (s *Store) ListConversations() ([]*Conversation, error) {
 	return convs, rows.Err()
 }
 
-// FindConversationByDoc returns the most recent conversation attached to a
+// FindConversationByDoc returns the most recent conversation connected to a
 // document path, or nil if none.
 func (s *Store) FindConversationByDoc(path string) (*Conversation, error) {
 	row := s.db.QueryRow(
-		`SELECT id, title, model, doc_path, created_at, updated_at FROM conversations WHERE doc_path = ? ORDER BY updated_at DESC LIMIT 1`,
+		`SELECT c.id, c.title, c.model, c.created_at, c.updated_at FROM conversations c
+		 JOIN conversation_docs d ON d.conversation_id = c.id
+		 WHERE d.path = ? ORDER BY c.updated_at DESC, c.id DESC LIMIT 1`,
 		path,
 	)
 	var c Conversation
-	if err := row.Scan(&c.ID, &c.Title, &c.Model, &c.DocPath, &c.CreatedAt, &c.UpdatedAt); err == sql.ErrNoRows {
+	if err := row.Scan(&c.ID, &c.Title, &c.Model, &c.CreatedAt, &c.UpdatedAt); err == sql.ErrNoRows {
 		return nil, nil
 	} else if err != nil {
 		return nil, err
@@ -140,9 +149,40 @@ func (s *Store) FindConversationByDoc(path string) (*Conversation, error) {
 	return &c, nil
 }
 
-// UpdateDocPath attaches (or detaches, with "") a document to a conversation.
-func (s *Store) UpdateDocPath(id int64, path string) error {
-	_, err := s.db.Exec(`UPDATE conversations SET doc_path = ?, updated_at = ? WHERE id = ?`, path, time.Now().Unix(), id)
+// GetDocs returns the document paths connected to a conversation.
+func (s *Store) GetDocs(convID int64) ([]string, error) {
+	rows, err := s.db.Query(`SELECT path FROM conversation_docs WHERE conversation_id = ? ORDER BY rowid ASC`, convID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var paths []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		paths = append(paths, p)
+	}
+	return paths, rows.Err()
+}
+
+// AddDoc connects a document to a conversation (no-op if already connected).
+func (s *Store) AddDoc(convID int64, path string) error {
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO conversation_docs (conversation_id, path) VALUES (?, ?)`, convID, path)
+	return err
+}
+
+// RemoveDoc disconnects a document from a conversation.
+func (s *Store) RemoveDoc(convID int64, path string) error {
+	_, err := s.db.Exec(`DELETE FROM conversation_docs WHERE conversation_id = ? AND path = ?`, convID, path)
+	return err
+}
+
+// ClearDocs disconnects all documents from a conversation.
+func (s *Store) ClearDocs(convID int64) error {
+	_, err := s.db.Exec(`DELETE FROM conversation_docs WHERE conversation_id = ?`, convID)
 	return err
 }
 
