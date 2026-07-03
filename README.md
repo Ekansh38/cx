@@ -89,11 +89,10 @@ cx doc notes.md   # same, with the file given directly
 
 ### Doc chat
 
-Attach a markdown/text file with `:doc` (fuzzy picker over the current directory) or `:doc <path>`. The document renders in a left pane with line numbers; chat lives on the right. The full file is sent to the model every turn, so you can just talk about it — reference passages as `@L12`, `@L12-30`, or `@## Heading`.
+Attach a markdown/text file with `:doc` (fuzzy picker over the current directory) or `:doc <path>`. The document lives in *your editor* — inside tmux, cx opens it beside itself automatically. The full file is sent to the model every turn (re-read from disk, so every save is picked up), and you just talk about it — reference passages as `@L12`, `@L12-30`, or `@## Heading`.
 
-- `ctrl+o` focuses the doc pane: `j/k` `u/d` `g/G` scroll, `e` opens the file in `$EDITOR` (reloads on exit), `r` reloads, `esc` back to chat
 - When the model proposes changes, each edit shows as a diff: `y` apply, `n` skip, `a` apply all, `esc` cancel — accepted edits are written straight to the file
-- The attachment persists with the conversation; `:doc off` closes it
+- `:doc edit` reopens the file in your editor; `:doc off` closes the attachment (it persists with the conversation otherwise)
 
 #### Neovim side-by-side
 

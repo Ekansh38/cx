@@ -128,11 +128,3 @@ func TestFuzzyMatch(t *testing.T) {
 	}
 }
 
-func TestHardWrap(t *testing.T) {
-	long := strings.Repeat("x", 25)
-	for _, ln := range strings.Split(hardWrap(long, 10), "\n") {
-		if len(ln) > 10 {
-			t.Errorf("line %q exceeds width", ln)
-		}
-	}
-}

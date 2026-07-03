@@ -59,11 +59,6 @@ var (
 			Foreground(lipgloss.Color("6")).
 			Bold(true)
 
-	// Doc pane header when focused
-	docHeaderStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("4"))
-
 	// Proposed-edit diff lines
 	diffOldStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 	diffNewStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
