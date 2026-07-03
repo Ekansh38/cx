@@ -1119,10 +1119,13 @@ doc mode  (:doc / :connect doc)
   all of them are sent to the model every turn, re-read from disk,
   so every save is picked up automatically.
   reference passages as @L12, @L12-30, @## Heading.
-  proposed edits are reviewed IN NEOVIM as an inline diff, one
-  file at a time:
-  [y] apply  [n] skip  [N] reject with a note  [a] all  [q] quit
-  rejection notes go back to the model and it retries automatically.
+  proposed edits are reviewed IN NEOVIM: every hunk renders at once
+  as an inline diff (word-level for small changes) and fills the
+  quickfix list, so ]q / [q jump between them. with the cursor on
+  a hunk: [y] apply  [n] skip  [N] reject with a note  [a] all
+  [q] quit. u undoes applied hunks like any edit (file saves when
+  the review ends). rejection notes go back to the model and it
+  retries automatically.
   (without the neovim bridge, the y/n review happens in cx instead)
 
 neovim side-by-side
@@ -1228,8 +1231,15 @@ func (m Model) buildLLMMessages() []llm.Message {
 		if i < start {
 			continue
 		}
-		if msg.Role == "summary" || msg.Role == "note" {
+		if msg.Role == "summary" {
 			out = append(out, llm.Message{Role: "system", Content: msg.Content})
+			continue
+		}
+		if msg.Role == "note" {
+			// Review feedback is the user's words; sending it as a user turn
+			// also keeps the payload valid for models that reject trailing
+			// system messages (which silently broke auto-retry).
+			out = append(out, llm.Message{Role: "user", Content: msg.Content})
 			continue
 		}
 		if msg.Role != "user" && msg.Role != "assistant" {
