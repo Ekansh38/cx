@@ -2303,7 +2303,7 @@ func (m *Model) refreshContent() {
 	if m.streaming {
 		sb.WriteString(assistantLabelStyle.Render("cx") + "\n")
 		if m.streamBuf.Len() > 0 {
-			sb.WriteString(m.renderMarkdown(m.streamBuf.String()))
+			sb.WriteString(m.renderMarkdown(stripEditBlocks(m.streamBuf.String())))
 			sb.WriteString(cursorStyle.Render(" █"))
 		} else {
 			frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -2350,11 +2350,7 @@ func (m Model) renderMsg(msg *store.Message) string {
 
 	default: // assistant
 		label := assistantLabelStyle.Render("cx")
-		content := msg.Content
-		if strings.Contains(content, "<edit>") {
-			content = stripEditBlocks(content)
-		}
-		body := m.renderMarkdown(content)
+		body := m.renderMarkdown(stripEditBlocks(msg.Content))
 		return label + "\n" + body + "\n"
 	}
 }
