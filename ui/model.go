@@ -224,6 +224,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.extGroups) == 0 {
 			return m, nil
 		}
+		// N fired mid-review: send the revision request right away, while the
+		// user keeps reviewing the remaining hunks.
+		if !m.streaming && m.provider != nil {
+			if reasons := consumeRejectNow(); len(reasons) > 0 {
+				var sb strings.Builder
+				for _, r := range reasons {
+					fmt.Fprintf(&sb, "I rejected a proposed edit: %q. ", r)
+				}
+				sb.WriteString("Revise it now and propose an updated <edit> block. The other proposed edits are still under review; do not resend them.")
+				note := sb.String()
+				if saved, err := m.store.AddMessage(m.conv.ID, "note", note); err == nil {
+					m.messages = append(m.messages, saved)
+				} else {
+					m.messages = append(m.messages, &store.Message{Role: "note", Content: note})
+				}
+				m.refreshContent()
+				if m.atBottom {
+					m.viewport.GotoBottom()
+				}
+				m2, cmd := m.startStream()
+				return m2, tea.Batch(cmd, extReviewTick(msg.n+1))
+			}
+		}
 		results, done := readExternalReviewResults()
 		if !done {
 			if msg.n > 3600 { // ~30 min: assume the review was abandoned
@@ -236,10 +259,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.reloadDocs() // neovim wrote the file
 
-		// A rejection with a note means "try again, differently": retry
-		// automatically once all groups are reviewed.
+		// A rejection with a note means "try again, differently": retry once
+		// all groups are reviewed, unless it already fired via reject-now.
 		for _, r := range results {
-			if !r.Applied && r.Reason != "" && r.Reason != "not found in buffer" {
+			if !r.Applied && !r.Reported && r.Reason != "" && r.Reason != "not found in buffer" {
 				m.extRetry = true
 			}
 		}
@@ -329,7 +352,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.docs) > 0 && content != "" {
 			m.reloadDocs() // match edits against the latest on-disk content
 			edits := explodeEdits(resolveEditFiles(parseDocEdits(content), m.docs), m.docs)
-			if len(edits) > 0 {
+			if len(edits) > 0 && len(m.extGroups) > 0 {
+				// A review is already on screen in neovim: queue these after it
+				m.extGroups = append(m.extGroups, groupEditsByFile(edits)...)
+				m.injectSystemLine(fmt.Sprintf("queued %d more edits behind the current review", len(edits)))
+			} else if len(edits) > 0 {
 				groups := groupEditsByFile(edits)
 				if len(groups) > 0 && startExternalReview(groups[0].file, groups[0].edits) {
 					m.extGroups = groups
@@ -1127,7 +1154,8 @@ doc mode  (:doc / :connect doc)
   and fills the quickfix list: ]q / [q jump between them. with the
   cursor on a hunk:
   [y] apply  [n] skip  [N] reject+note  [a] all  [u] undo  [q] quit
-  rejection notes go back to the model and it retries automatically.
+  N fires the revision immediately; new edits queue behind the
+  current review.
   (without the neovim bridge, the y/n review happens in cx instead)
 
 neovim side-by-side

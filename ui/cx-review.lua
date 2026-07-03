@@ -135,9 +135,23 @@ local function hunk_at(line)
   return nil
 end
 
+-- common_affixes counts identical leading/trailing lines between two lists.
+local function common_affixes(a, b)
+  local p = 0
+  local maxp = math.min(#a, #b)
+  while p < maxp and a[p + 1] == b[p + 1] do
+    p = p + 1
+  end
+  local sfx = 0
+  while sfx < math.min(#a, #b) - p and a[#a - sfx] == b[#b - sfx] do
+    sfx = sfx + 1
+  end
+  return p, sfx
+end
+
 -- render draws every undecided hunk, refreshes the quickfix list, and
--- finishes when nothing is left. Re-locates hunks each pass since earlier
--- applies shift line numbers.
+-- finishes when nothing is left. Context lines stay unpainted (GitHub-style):
+-- only truly deleted lines go red, only inserted lines show green.
 local function render()
   clear_marks()
   local qf = {}
@@ -150,41 +164,62 @@ local function render()
         h.result = { applied = false, reason = "not found in buffer" }
       else
         h.start = start
+        local p, sfx = common_affixes(h.search, h.replace)
+        local delN = #h.search - p - sfx
+        local insN = #h.replace - p - sfx
+        local delStart = start + p -- 0-based first deleted row
         local virt = {}
-        local oneline = #h.search == 1 and #h.replace == 1
-          and is_ascii(h.search[1]) and is_ascii(h.replace[1])
-        if oneline then
-          -- word-level: highlight only the changed span
-          local p, oe, ne = split_diff(h.search[1], h.replace[1])
-          if oe > p then
-            vim.api.nvim_buf_set_extmark(S.buf, ns, start, p, {
+        local anchor, above = delStart + delN - 1, false
+        if delN == 0 then
+          if delStart > 0 then
+            anchor = delStart - 1
+          else
+            anchor, above = 0, true
+          end
+        end
+
+        if delN == 1 and insN == 1
+          and is_ascii(h.search[p + 1]) and is_ascii(h.replace[p + 1]) then
+          -- word-level diff, snapped to word boundaries
+          local oldl, newl = h.search[p + 1], h.replace[p + 1]
+          local wp, oe, ne = split_diff(oldl, newl)
+          while wp > 0 and oldl:sub(wp, wp) ~= " " do
+            wp = wp - 1
+          end
+          while oe < #oldl and ne < #newl and oldl:sub(oe + 1, oe + 1) ~= " " do
+            oe = oe + 1
+            ne = ne + 1
+          end
+          if oe > wp then
+            vim.api.nvim_buf_set_extmark(S.buf, ns, delStart, wp, {
               end_col = oe,
               hl_group = "DiffDelete",
             })
           end
-          local new = h.replace[1]
           local chunks = {}
-          if p > 0 then
-            table.insert(chunks, { new:sub(1, p), "Comment" })
+          if wp > 0 then
+            table.insert(chunks, { newl:sub(1, wp), "Comment" })
           end
-          if ne > p then
-            table.insert(chunks, { new:sub(p + 1, ne), "DiffAdd" })
+          if ne > wp then
+            table.insert(chunks, { newl:sub(wp + 1, ne), "DiffAdd" })
           end
-          if ne < #new then
-            table.insert(chunks, { new:sub(ne + 1), "Comment" })
+          if ne < #newl then
+            table.insert(chunks, { newl:sub(ne + 1), "Comment" })
           end
           if #chunks == 0 then
-            chunks = { { new, "DiffAdd" } }
+            chunks = { { newl, "DiffAdd" } }
           end
           virt = { chunks }
         else
-          vim.api.nvim_buf_set_extmark(S.buf, ns, start, 0, {
-            end_row = start + #h.search,
-            hl_group = "DiffDelete",
-            hl_eol = true,
-          })
-          for _, l in ipairs(h.replace) do
-            vim.list_extend(virt, wrap_virt(l, width, "DiffAdd"))
+          if delN > 0 then
+            vim.api.nvim_buf_set_extmark(S.buf, ns, delStart, 0, {
+              end_row = delStart + delN,
+              hl_group = "DiffDelete",
+              hl_eol = true,
+            })
+          end
+          for k = p + 1, #h.replace - sfx do
+            vim.list_extend(virt, wrap_virt(h.replace[k], width, "DiffAdd"))
           end
         end
         table.insert(virt, {
@@ -193,10 +228,13 @@ local function render()
             "Comment",
           },
         })
-        vim.api.nvim_buf_set_extmark(S.buf, ns, start + #h.search - 1, 0, { virt_lines = virt })
+        vim.api.nvim_buf_set_extmark(S.buf, ns, anchor, 0, {
+          virt_lines = virt,
+          virt_lines_above = above,
+        })
         table.insert(qf, {
           bufnr = S.buf,
-          lnum = start + 1,
+          lnum = delStart + 1,
           text = string.format("cx edit %d/%d", i, S.total),
         })
       end
@@ -314,6 +352,15 @@ local function decide(action)
     vim.ui.input({ prompt = "why? " }, function(reason)
       h.done = true
       h.result = { applied = false, reason = reason or "" }
+      if reason and reason ~= "" then
+        -- tell cx immediately so the revision fires while review continues
+        h.result.reported = true
+        local f = io.open(datadir .. "/reject-now.jsonl", "a")
+        if f then
+          f:write(vim.json.encode({ reason = reason }) .. "\n")
+          f:close()
+        end
+      end
       table.insert(S.hist, h)
       render()
     end)
