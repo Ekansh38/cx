@@ -328,7 +328,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var reviewCmd tea.Cmd
 		if len(m.docs) > 0 && content != "" {
 			m.reloadDocs() // match edits against the latest on-disk content
-			if edits := resolveEditFiles(parseDocEdits(content), m.docs); len(edits) > 0 {
+			edits := explodeEdits(resolveEditFiles(parseDocEdits(content), m.docs), m.docs)
+			if len(edits) > 0 {
 				groups := groupEditsByFile(edits)
 				if len(groups) > 0 && startExternalReview(groups[0].file, groups[0].edits) {
 					m.extGroups = groups
@@ -1119,13 +1120,14 @@ doc mode  (:doc / :connect doc)
   all of them are sent to the model every turn, re-read from disk,
   so every save is picked up automatically.
   reference passages as @L12, @L12-30, @## Heading.
-  proposed edits are reviewed IN NEOVIM: every hunk renders at once
-  as an inline diff (word-level for small changes) and fills the
-  quickfix list, so ]q / [q jump between them. with the cursor on
-  a hunk: [y] apply  [n] skip  [N] reject with a note  [a] all
-  [q] quit. u undoes applied hunks like any edit (file saves when
-  the review ends). rejection notes go back to the model and it
-  retries automatically.
+  proposed edits are reviewed IN NEOVIM. cx diffs whatever the
+  model sends and splits it into minimal hunks, so a typo fix is
+  a one-line diff even if the model rewrote the whole file. every
+  hunk renders at once (word-level highlighting for small changes)
+  and fills the quickfix list: ]q / [q jump between them. with the
+  cursor on a hunk:
+  [y] apply  [n] skip  [N] reject+note  [a] all  [u] undo  [q] quit
+  rejection notes go back to the model and it retries automatically.
   (without the neovim bridge, the y/n review happens in cx instead)
 
 neovim side-by-side

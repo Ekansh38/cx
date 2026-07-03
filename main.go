@@ -159,7 +159,7 @@ func launchDocSplit(path string) string {
 
 	// Inside tmux — open the editor in a pane to the left of cx,
 	// wired up with the cx bridge (RPC socket + review lua) when it's neovim
-	args := append([]string{"split-window", "-h", "-b", "-l", "70%"}, ui.EditorArgs(abs)...)
+	args := append([]string{"split-window", "-h", "-b", "-l", "60%"}, ui.EditorArgs(abs)...)
 	exec.Command("tmux", args...).Run()
 	return abs
 }

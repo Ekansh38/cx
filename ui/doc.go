@@ -65,7 +65,9 @@ the replacement text
 Rules:
 - Always include the file attribute with the document's absolute path.
 - The SEARCH text must match the document exactly, character for character.
-- Keep each edit small and focused; use multiple <edit> blocks for separate changes.
+- Each edit must be MINIMAL: only the line(s) actually changing, plus at most
+  1-2 unchanged lines when needed to disambiguate. NEVER send large unchanged
+  regions or the whole document; one <edit> block per independent change.
 - The user reviews and approves each edit before it is applied, so don't repeat the diff in prose.
 - The user may reference locations like @L12, @L12-30, or @## Heading Name.`
 
@@ -301,7 +303,7 @@ func pokeChecktime() {
 func (m Model) openDocEditor(path string) (Model, tea.Cmd) {
 	args := EditorArgs(path)
 	if os.Getenv("TMUX") != "" {
-		tmuxArgs := append([]string{"split-window", "-h", "-b", "-l", "70%"}, args...)
+		tmuxArgs := append([]string{"split-window", "-h", "-b", "-l", "60%"}, args...)
 		if err := exec.Command("tmux", tmuxArgs...).Run(); err == nil {
 			return m, nil
 		}
@@ -317,7 +319,7 @@ func (m *Model) autoEditorSplit(path string) {
 	if path == "" || os.Getenv("TMUX") == "" {
 		return
 	}
-	tmuxArgs := append([]string{"split-window", "-h", "-b", "-d", "-l", "70%"}, EditorArgs(path)...)
+	tmuxArgs := append([]string{"split-window", "-h", "-b", "-d", "-l", "60%"}, EditorArgs(path)...)
 	exec.Command("tmux", tmuxArgs...).Run()
 }
 
