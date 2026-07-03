@@ -96,7 +96,7 @@ Connect markdown/text files with `:doc` (fuzzy picker over the current directory
 
 Reference passages as `@L12`, `@L12-30`, or `@## Heading`. Disconnect with `:disconnect doc` — instant with one doc, a fuzzy picker (including an ALL option) with several.
 
-- When the model proposes changes, the review happens **in neovim**, one file at a time: each hunk shows as an inline diff right in your buffer (old lines red, proposed lines green). `y` apply, `n` skip, `N` reject with a note, `a` apply all, `q` quit. Approved hunks are applied by neovim itself — no reload races — and rejection notes flow back into the conversation, triggering an automatic retry.
+- When the model proposes changes, the review happens **in neovim**: every hunk renders at once as an inline diff right in your buffer (old text red, proposed text green — word-level highlighting for single-line changes) and fills the quickfix list, so `]q` / `[q` jump between edits. With the cursor on a hunk: `y` apply, `n` skip, `N` reject with a note, `a` apply all, `q` quit. Hunks are applied by neovim itself, so `u` undoes them like any edit; the file saves when the review ends. Rejection notes flow back into the conversation and trigger an automatic retry.
 - cx spawns neovim with an RPC socket (`--listen`), which also powers hot reload: when cx writes the file, your buffer refreshes instantly.
 - Without the neovim bridge (different `$EDITOR`, no socket), the y/n review falls back to cx's chat pane.
 - Connections persist with the conversation; reopening a chat reconnects its docs

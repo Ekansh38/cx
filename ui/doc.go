@@ -301,7 +301,7 @@ func pokeChecktime() {
 func (m Model) openDocEditor(path string) (Model, tea.Cmd) {
 	args := EditorArgs(path)
 	if os.Getenv("TMUX") != "" {
-		tmuxArgs := append([]string{"split-window", "-h", "-b"}, args...)
+		tmuxArgs := append([]string{"split-window", "-h", "-b", "-l", "70%"}, args...)
 		if err := exec.Command("tmux", tmuxArgs...).Run(); err == nil {
 			return m, nil
 		}
@@ -317,7 +317,7 @@ func (m *Model) autoEditorSplit(path string) {
 	if path == "" || os.Getenv("TMUX") == "" {
 		return
 	}
-	tmuxArgs := append([]string{"split-window", "-h", "-b", "-d"}, EditorArgs(path)...)
+	tmuxArgs := append([]string{"split-window", "-h", "-b", "-d", "-l", "70%"}, EditorArgs(path)...)
 	exec.Command("tmux", tmuxArgs...).Run()
 }
 
