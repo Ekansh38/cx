@@ -67,7 +67,7 @@ type searchResult struct {
 // ── available :commands ───────────────────────────────────────────────────────
 
 var commands = []string{
-	":clear", ":copy", ":debug", ":delete", ":doc",
+	":clear", ":copy", ":copy prompt", ":debug", ":delete", ":doc",
 	":edit", ":forget ", ":grep", ":help", ":img ",
 	":list", ":memory", ":model ", ":models", ":new",
 	":paste", ":q", ":quit", ":r", ":remember ",
@@ -696,16 +696,30 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m, nil
 
 	case ":copy":
-		// Copy last assistant message to clipboard
+		// :copy = last assistant message, :copy prompt = your last message
+		role, what := "assistant", "response"
+		if len(parts) > 1 && strings.TrimSpace(parts[1]) == "prompt" {
+			role, what = "user", "prompt"
+		}
 		var last string
 		for i := len(m.messages) - 1; i >= 0; i-- {
-			if m.messages[i].Role == "assistant" {
+			if m.messages[i].Role == role {
 				last = m.messages[i].Content
 				break
 			}
 		}
+		if role == "user" {
+			// Strip display-only placeholder lines
+			var lines []string
+			for _, line := range strings.Split(last, "\n") {
+				if !strings.HasPrefix(line, "[image: ") && !strings.HasPrefix(line, "[highlighted ") {
+					lines = append(lines, line)
+				}
+			}
+			last = strings.TrimSpace(strings.Join(lines, "\n"))
+		}
 		if last == "" {
-			m.errMsg = "no assistant message to copy"
+			m.errMsg = "no " + what + " to copy"
 			return m, nil
 		}
 		if err := copyToClipboard(last); err != nil {
@@ -713,7 +727,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.errMsg = ""
-		m.injectSystemLine("copied to clipboard")
+		m.injectSystemLine("copied " + what + " to clipboard")
 		return m, nil
 
 	case ":delete":
@@ -952,6 +966,7 @@ commands  (type : to see completions)
   :list                 conversation picker
   :grep                 search messages
   :copy                 copy last assistant message to clipboard
+  :copy prompt          copy your last message to clipboard
   :edit                 edit your last message (loads into input, re-send)
   :retry / :r           re-send last message (gets a new response)
   :img <path> [text]    send an image (png/jpg/gif/webp)
