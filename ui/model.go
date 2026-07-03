@@ -217,13 +217,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case extReviewTickMsg:
 		results, done := readExternalReviewResults()
 		if !done {
-			if msg.n > 3600 { // ~30 min — assume the review was abandoned
+			if msg.n > 3600 { // ~30 min: assume the review was abandoned
 				return m, nil
 			}
 			return m, extReviewTick(msg.n + 1)
 		}
 		m.reloadDoc() // neovim wrote the file
+
+		// A rejection with a note means "try again, differently": retry
+		// automatically instead of waiting for the user to ask.
+		retry := false
+		for _, r := range results {
+			if !r.Applied && r.Reason != "" && r.Reason != "not found in buffer" {
+				retry = true
+			}
+		}
 		note := summarizeReview(results, filepath.Base(m.docPath))
+		if retry {
+			note += " Revise the rejected edits to address the notes and propose updated <edit> blocks."
+		}
 		if saved, err := m.store.AddMessage(m.conv.ID, "note", note); err == nil {
 			m.messages = append(m.messages, saved)
 		} else {
@@ -232,6 +244,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshContent()
 		if m.atBottom {
 			m.viewport.GotoBottom()
+		}
+		if retry && !m.streaming && m.provider != nil {
+			return m.startStream()
 		}
 		return m, nil
 
@@ -543,7 +558,7 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	}
 
 	if m.provider == nil {
-		m.errMsg = "no provider — set GEMINI_API_KEY, OPENAI_API_KEY, or configure ollama"
+		m.errMsg = "no provider (set GEMINI_API_KEY, OPENAI_API_KEY, or configure ollama)"
 		return m, nil
 	}
 
@@ -920,7 +935,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		}
 		sel := readSelection()
 		if sel == nil {
-			m.injectSystemLine("no editor selection — highlight in neovim and press <leader>cs (see README)")
+			m.injectSystemLine("no editor selection. highlight in neovim and press <leader>cs (see README)")
 			return m, nil
 		}
 		preview := sel.text
@@ -929,7 +944,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		}
 		note := "(attached to your next message · :sel clear to drop)"
 		if m.docPath != "" && sel.file != m.docPath {
-			note = "(from a DIFFERENT file than the attached doc — will NOT be sent)"
+			note = "(from a DIFFERENT file than the attached doc, will NOT be sent)"
 		}
 		m.injectSystemLine(fmt.Sprintf("── selection: L%d-%d of %s ──\n%s\n%s",
 			sel.start, sel.end, filepath.Base(sel.file), preview, note))
@@ -942,7 +957,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			return m, nil
 		}
 		if content == "" {
-			m.injectSystemLine("memory is empty — chat or use :remember <fact>")
+			m.injectSystemLine("memory is empty. chat or use :remember <fact>")
 			return m, nil
 		}
 		m.injectSystemLine("── memory file ──\n" + content)
@@ -955,7 +970,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		}
 		fact := strings.TrimSpace(parts[1])
 		m.injectSystemLine("updating memory...")
-		return m, m.editMemoryCmd("Remember this: "+fact, "memory updated — remembered: "+fact)
+		return m, m.editMemoryCmd("Remember this: "+fact, "memory updated, remembered: "+fact)
 
 	case ":forget":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
@@ -964,7 +979,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		}
 		query := strings.TrimSpace(parts[1])
 		m.injectSystemLine("updating memory...")
-		return m, m.editMemoryCmd("Forget/remove anything related to: "+query, "memory updated — forgot: "+query)
+		return m, m.editMemoryCmd("Forget/remove anything related to: "+query, "memory updated, forgot: "+query)
 
 	case ":wipe":
 		m.injectSystemLine("this will delete ALL conversations and messages.\ntype  :wipe confirm  to proceed, or anything else to cancel.")
@@ -1009,7 +1024,7 @@ commands  (type : to see completions)
   :edit                 edit your last message (loads into input, re-send)
   :retry / :r           re-send last message (gets a new response)
   :img <path> [text]    send an image (png/jpg/gif/webp)
-                        (or just paste/drop an image path — auto-detected)
+                        (or just paste/drop an image path, auto-detected)
   :paste [text]         send the image on your clipboard
   :doc [path]           attach a document to discuss/edit (no path = picker)
   :doc off              close the attached document
@@ -1030,7 +1045,7 @@ commands  (type : to see completions)
 doc mode  (:doc)
   the document lives in YOUR editor (opened beside cx in tmux);
   cx just knows the file. the whole doc is sent to the model every
-  turn, re-read from disk — every save is picked up automatically.
+  turn, re-read from disk, so every save is picked up automatically.
   reference passages as @L12, @L12-30, @## Heading.
   :doc edit reopens the file in your editor.
   proposed edits are reviewed IN NEOVIM as an inline diff:
@@ -1043,7 +1058,7 @@ neovim side-by-side
   session with neovim on the left, cx on the right, doc attached.
   inside tmux, :doc / the doc picker / e also auto-open the editor
   in a split pane. add the keybinding from the README, highlight
-  text in neovim, press <leader>cs — cx attaches the selection to
+  text in neovim, press <leader>cs, and cx attaches the selection to
   your next message (auto-attaching the doc if needed). status bar
   shows "sel L12-30" while one is waiting; :sel previews it.
 
@@ -1051,7 +1066,7 @@ memory
   cx keeps a structured markdown profile at ~/.config/cx/memory.md,
   organized into sections like Identity / Preferences / Projects /
   Tools & Workflow / Feedback / References.
-  after each response, the memory model rewrites the file —
+  after each response, the memory model rewrites the file:
   merging, generalizing, and pruning what it knows about you.
   :remember and :forget also route through the model so edits stay
   organized and don't leave dangling bullets.
@@ -1272,7 +1287,7 @@ Rules:
 - Never invent facts or extrapolate beyond what was actually said.
 
 The "## Recent conversations" section is an episodic log so future sessions know what was already discussed:
-- Exactly one bullet per conversation: "- {date} · {title} — {one sentence: what was discussed, decided, or concluded}"
+- Exactly one bullet per conversation: "- {date} · {title}: {one sentence: what was discussed, decided, or concluded}"
 - The current conversation is "%s" (today: %s). If it already has a bullet, UPDATE that bullet to reflect the conversation so far; otherwise add one at the top of the section. If the title is "Untitled", write a short descriptive title yourself — and if the newest bullet from today clearly describes this same discussion, update it rather than adding a duplicate.
 - Newest first. Keep at most 15 bullets; drop the oldest beyond that.
 - Before dropping an old bullet, promote anything still durable into the appropriate section above.
@@ -2498,7 +2513,7 @@ func pasteClipboardImage() (string, error) {
 	switch runtime.GOOS {
 	case "darwin":
 		if _, err := exec.LookPath("pngpaste"); err != nil {
-			return "", fmt.Errorf("pngpaste not installed — brew install pngpaste")
+			return "", fmt.Errorf("pngpaste not installed (brew install pngpaste)")
 		}
 		if out, err := exec.Command("pngpaste", path).CombinedOutput(); err != nil {
 			return "", fmt.Errorf("no image on clipboard (%s)", strings.TrimSpace(string(out)))

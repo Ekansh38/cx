@@ -62,7 +62,7 @@ local function finish()
   for _, r in ipairs(S.results) do
     if r.applied then applied = applied + 1 end
   end
-  vim.notify(string.format("cx: review done — %d/%d applied", applied, #S.results))
+  vim.notify(string.format("cx: review done, %d/%d applied", applied, #S.results))
   S.edits = nil
 end
 

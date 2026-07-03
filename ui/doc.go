@@ -94,7 +94,7 @@ func (m Model) attachDoc(path string) (Model, tea.Cmd) {
 		head = head[:8192]
 	}
 	if bytes.IndexByte(head, 0) >= 0 {
-		m.errMsg = "doc looks binary — attach a text file"
+		m.errMsg = "doc looks binary, attach a text file"
 		return m, nil
 	}
 
@@ -486,7 +486,7 @@ func stripEditBlocks(s string) string {
 			break
 		}
 		n++
-		s = s[:start] + fmt.Sprintf("*[proposed edit %d — review below]*", n) + s[start+rel+len("</edit>"):]
+		s = s[:start] + fmt.Sprintf("*[proposed edit %d]*", n) + s[start+rel+len("</edit>"):]
 	}
 	return s
 }
@@ -591,7 +591,7 @@ func listDocFiles() []string {
 func (m Model) enterDocPicker() (Model, tea.Cmd) {
 	files := listDocFiles()
 	if len(files) == 0 {
-		m.errMsg = "no .md/.txt files found under " + cwdBase() + " — use :doc <path>"
+		m.errMsg = "no .md/.txt files found under " + cwdBase() + " (use :doc <path>)"
 		return m, nil
 	}
 	m.state = stateDocPicker
