@@ -332,10 +332,32 @@ func (m *Model) autoEditorSplit(path string) {
 
 func editsReqPath() string  { return filepath.Join(config.DataDir(), "edits.json") }
 func editsDonePath() string { return filepath.Join(config.DataDir(), "edits-done.json") }
+func rejectNowPath() string { return filepath.Join(config.DataDir(), "reject-now.jsonl") }
 
 type editResult struct {
-	Applied bool   `json:"applied"`
-	Reason  string `json:"reason"`
+	Applied  bool   `json:"applied"`
+	Reason   string `json:"reason"`
+	Reported bool   `json:"reported"` // already sent to the model via reject-now
+}
+
+// consumeRejectNow returns rejection reasons neovim flagged for an immediate
+// revision (written the moment the user presses N, mid-review).
+func consumeRejectNow() []string {
+	data, err := os.ReadFile(rejectNowPath())
+	if err != nil {
+		return nil
+	}
+	os.Remove(rejectNowPath())
+	var reasons []string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
+		var ev struct {
+			Reason string `json:"reason"`
+		}
+		if json.Unmarshal([]byte(line), &ev) == nil && ev.Reason != "" {
+			reasons = append(reasons, ev.Reason)
+		}
+	}
+	return reasons
 }
 
 // startExternalReview hands the edits to neovim. Returns false (caller falls
@@ -361,6 +383,7 @@ func startExternalReview(docPath string, edits []docEdit) bool {
 		return false
 	}
 	os.Remove(editsDonePath())
+	os.Remove(rejectNowPath())
 	if err := os.WriteFile(editsReqPath(), buf, 0o644); err != nil {
 		return false
 	}
