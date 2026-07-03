@@ -79,6 +79,20 @@ func MemoryPath() string {
 	return filepath.Join(Dir(), "memory.md")
 }
 
+// LastModel returns the model the user most recently selected ("" if none).
+func LastModel() string {
+	data, err := os.ReadFile(filepath.Join(DataDir(), "last-model.txt"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// SaveLastModel remembers an explicit model selection across sessions.
+func SaveLastModel(model string) {
+	os.WriteFile(filepath.Join(DataDir(), "last-model.txt"), []byte(model+"\n"), 0o644)
+}
+
 // LoadMemory reads memory.md if it exists, returning its content.
 func LoadMemory() string {
 	data, err := os.ReadFile(MemoryPath())

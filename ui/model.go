@@ -758,6 +758,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.model = newModel
 		m.provider = prov
 		m.store.UpdateModel(m.conv.ID, newModel)
+		config.SaveLastModel(newModel)
 		m.injectSystemLine("switched to " + newModel)
 		return m, nil
 
@@ -1861,6 +1862,7 @@ func (m Model) updateModelPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.model = sel.ID
 		m.provider = prov
 		m.store.UpdateModel(m.conv.ID, sel.ID)
+		config.SaveLastModel(sel.ID)
 		m.state = stateChat
 		m.injectSystemLine("switched to " + sel.ID)
 		return m, nil
