@@ -289,7 +289,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if edits := parseDocEdits(content); len(edits) > 0 {
 				if startExternalReview(m.docPath, edits) {
 					m.docEdits = edits
-					m.injectSystemLine(fmt.Sprintf("%d proposed edit(s) — review in neovim: y apply · n skip · N reject+note · a all · q quit", len(edits)))
+					word := "edits"
+					if len(edits) == 1 {
+						word = "edit"
+					}
+					m.injectSystemLine(fmt.Sprintf("proposed %d %s in neovim", len(edits), word))
 					reviewCmd = extReviewTick(0)
 				} else {
 					m.docEdits = edits

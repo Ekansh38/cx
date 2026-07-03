@@ -116,10 +116,10 @@ func TestSummarizeReview(t *testing.T) {
 		{Applied: false},
 	}
 	note := summarizeReview(results, "notes.md")
-	if !strings.Contains(note, "1/3 applied") {
+	if !strings.Contains(note, "applied 1/3 edits") {
 		t.Errorf("note = %q; want applied count", note)
 	}
-	if !strings.Contains(note, `edit 2 rejected — "too wordy"`) {
+	if !strings.Contains(note, `edit 2 rejected: "too wordy"`) {
 		t.Errorf("note = %q; want rejection reason", note)
 	}
 	if !strings.Contains(note, "edit 3 skipped") {
