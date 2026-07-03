@@ -7,6 +7,8 @@ package ui
 
 import (
 	"bytes"
+	_ "embed"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
@@ -14,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -23,6 +26,7 @@ import (
 )
 
 type docReloadMsg struct{}
+type extReviewTickMsg struct{ n int }
 
 // docEdit is one model-proposed SEARCH/REPLACE change awaiting review.
 type docEdit struct {
@@ -137,19 +141,66 @@ func (m *Model) reloadDoc() {
 
 // ── Opening the doc in the user's editor ─────────────────────────────────────
 
+//go:embed cx-review.lua
+var reviewLua string
+
+func nvimSockPath() string {
+	return filepath.Join(config.DataDir(), "nvim.sock")
+}
+
+func reviewLuaPath() string {
+	return filepath.Join(config.DataDir(), "cx-review.lua")
+}
+
+// EditorArgs builds the command to open the doc in the user's editor.
+// For neovim it wires up the cx bridge: an RPC socket (hot reload + in-editor
+// edit review) and the embedded review lua.
+func EditorArgs(docPath string) []string {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "nvim"
+	}
+	if !strings.Contains(filepath.Base(editor), "nvim") {
+		return []string{editor, docPath}
+	}
+	os.WriteFile(reviewLuaPath(), []byte(reviewLua), 0o644)
+	sock := nvimSockPath()
+	if !nvimAlive(sock) {
+		os.Remove(sock) // stale socket would block --listen
+		return []string{editor, "--listen", sock, "-c", "luafile " + reviewLuaPath(), docPath}
+	}
+	// An earlier cx-spawned nvim already owns the socket — plain open.
+	return []string{editor, docPath}
+}
+
+// nvimAlive reports whether a cx-spawned neovim is listening on the socket.
+func nvimAlive(sock string) bool {
+	if _, err := os.Stat(sock); err != nil {
+		return false
+	}
+	return exec.Command("nvim", "--server", sock, "--remote-expr", "1").Run() == nil
+}
+
+// pokeChecktime asks the bridged neovim to re-read changed files from disk.
+func pokeChecktime() {
+	sock := nvimSockPath()
+	if _, err := os.Stat(sock); err != nil {
+		return
+	}
+	exec.Command("nvim", "--server", sock, "--remote-expr", "v:lua.CxChecktime()").Run()
+}
+
 // openDocEditor opens the attached document in the editor. Inside tmux it
 // opens a split pane beside cx; otherwise it suspends cx into $EDITOR.
 func (m Model) openDocEditor() (Model, tea.Cmd) {
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = "vim"
-	}
+	args := EditorArgs(m.docPath)
 	if os.Getenv("TMUX") != "" {
-		if err := exec.Command("tmux", "split-window", "-h", "-b", editor, m.docPath).Run(); err == nil {
+		tmuxArgs := append([]string{"split-window", "-h", "-b"}, args...)
+		if err := exec.Command("tmux", tmuxArgs...).Run(); err == nil {
 			return m, nil
 		}
 	}
-	return m, tea.ExecProcess(exec.Command(editor, m.docPath), func(err error) tea.Msg {
+	return m, tea.ExecProcess(exec.Command(args[0], args[1:]...), func(err error) tea.Msg {
 		return docReloadMsg{}
 	})
 }
@@ -160,11 +211,97 @@ func (m *Model) autoEditorSplit() {
 	if m.docPath == "" || os.Getenv("TMUX") == "" {
 		return
 	}
-	editor := os.Getenv("EDITOR")
-	if editor == "" {
-		editor = "nvim"
+	tmuxArgs := append([]string{"split-window", "-h", "-b", "-d"}, EditorArgs(m.docPath)...)
+	exec.Command("tmux", tmuxArgs...).Run()
+}
+
+// ── In-neovim edit review ────────────────────────────────────────────────────
+//
+// When the bridged neovim is alive, proposed edits are reviewed there instead
+// of in cx: cx writes edits.json, calls CxReview() over RPC, and polls for
+// edits-done.json. Neovim renders the inline diff, applies approved hunks to
+// the buffer itself (no reload races), and records rejection reasons.
+
+func editsReqPath() string  { return filepath.Join(config.DataDir(), "edits.json") }
+func editsDonePath() string { return filepath.Join(config.DataDir(), "edits-done.json") }
+
+type editResult struct {
+	Applied bool   `json:"applied"`
+	Reason  string `json:"reason"`
+}
+
+// startExternalReview hands the edits to neovim. Returns false (caller falls
+// back to the in-cx review) if the bridge isn't up.
+func startExternalReview(docPath string, edits []docEdit) bool {
+	sock := nvimSockPath()
+	if !nvimAlive(sock) {
+		return false
 	}
-	exec.Command("tmux", "split-window", "-h", "-b", "-d", editor, m.docPath).Run()
+	type reqEdit struct {
+		Search  string `json:"search"`
+		Replace string `json:"replace"`
+	}
+	req := struct {
+		File  string    `json:"file"`
+		Edits []reqEdit `json:"edits"`
+	}{File: docPath}
+	for _, e := range edits {
+		req.Edits = append(req.Edits, reqEdit{Search: e.search, Replace: e.replace})
+	}
+	buf, err := json.Marshal(req)
+	if err != nil {
+		return false
+	}
+	os.Remove(editsDonePath())
+	if err := os.WriteFile(editsReqPath(), buf, 0o644); err != nil {
+		return false
+	}
+	return exec.Command("nvim", "--server", sock, "--remote-expr", "v:lua.CxReview()").Run() == nil
+}
+
+// readExternalReviewResults returns the decisions once neovim wrote them.
+func readExternalReviewResults() ([]editResult, bool) {
+	data, err := os.ReadFile(editsDonePath())
+	if err != nil {
+		return nil, false
+	}
+	var out struct {
+		Results []editResult `json:"results"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, false
+	}
+	os.Remove(editsDonePath())
+	os.Remove(editsReqPath())
+	return out.Results, true
+}
+
+// summarizeReview builds the note persisted into the conversation — the model
+// sees this, including WHY edits were rejected.
+func summarizeReview(results []editResult, docName string) string {
+	applied := 0
+	var parts []string
+	for i, r := range results {
+		switch {
+		case r.Applied:
+			applied++
+		case r.Reason != "":
+			parts = append(parts, fmt.Sprintf("edit %d rejected — %q", i+1, r.Reason))
+		default:
+			parts = append(parts, fmt.Sprintf("edit %d skipped", i+1))
+		}
+	}
+	note := fmt.Sprintf("Edit review in editor: %d/%d applied to %s.", applied, len(results), docName)
+	if len(parts) > 0 {
+		note += " " + strings.Join(parts, "; ") + "."
+	}
+	return note
+}
+
+func extReviewTick(n int) tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg {
+		return extReviewTickMsg{n: n}
+	})
 }
 
 // ── Edit blocks: parse / apply / review ──────────────────────────────────────
@@ -257,6 +394,7 @@ func (m *Model) applyDocEdit(i int) bool {
 	}
 	m.docContent = newContent
 	e.applied = true
+	pokeChecktime() // hot-reload the buffer in a bridged editor
 	return true
 }
 

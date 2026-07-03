@@ -109,6 +109,24 @@ func TestSelectionParse(t *testing.T) {
 	}
 }
 
+func TestSummarizeReview(t *testing.T) {
+	results := []editResult{
+		{Applied: true},
+		{Applied: false, Reason: "too wordy"},
+		{Applied: false},
+	}
+	note := summarizeReview(results, "notes.md")
+	if !strings.Contains(note, "1/3 applied") {
+		t.Errorf("note = %q; want applied count", note)
+	}
+	if !strings.Contains(note, `edit 2 rejected — "too wordy"`) {
+		t.Errorf("note = %q; want rejection reason", note)
+	}
+	if !strings.Contains(note, "edit 3 skipped") {
+		t.Errorf("note = %q; want skip", note)
+	}
+}
+
 func TestFuzzyMatch(t *testing.T) {
 	cases := []struct {
 		q, s string
