@@ -134,7 +134,7 @@ When conversations get long, cx automatically summarizes older messages to stay 
 Configure in `config.toml`:
 
 ```toml
-memory_model = "google/gemini-2.0-flash-001"  # model for memory curation + compaction
+memory_model = "google/gemini-2.5-flash-lite"  # model for memory curation + compaction
 max_context_tokens = 128000
 max_tokens = 16384  # max output tokens per response
 ```
@@ -143,7 +143,7 @@ max_tokens = 16384  # max output tokens per response
 
 cx works with any OpenAI-compatible API:
 
-- **OpenRouter** (recommended): Models like `anthropic/claude-sonnet-4-5`, `openai/gpt-4o`, `google/gemini-2.0-flash-001`
+- **OpenRouter** (recommended): Models like `anthropic/claude-sonnet-4-5`, `openai/gpt-4o`, `google/gemini-2.5-flash-lite`
 - **Gemini**: `gemini-2.0-flash`, `gemini-1.5-pro`
 - **OpenAI**: `gpt-4o`, `gpt-4o-mini`
 - **Ollama**: Any local model (`llama3.2`, `qwen2.5:32b`, etc.)

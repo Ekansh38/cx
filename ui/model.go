@@ -1276,7 +1276,7 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 	return func() tea.Msg {
 		memModel := cfg.MemoryModel
 		if memModel == "" {
-			memModel = "google/gemini-2.0-flash-001"
+			memModel = "google/gemini-2.5-flash-lite"
 		}
 		prov, err := llm.ForModel(memModel, cfg)
 		if err != nil {
@@ -1353,7 +1353,7 @@ func (m Model) editMemoryCmd(instruction, successNote string) tea.Cmd {
 	return func() tea.Msg {
 		memModel := cfg.MemoryModel
 		if memModel == "" {
-			memModel = "google/gemini-2.0-flash-001"
+			memModel = "google/gemini-2.5-flash-lite"
 		}
 		prov, err := llm.ForModel(memModel, cfg)
 		if err != nil {
