@@ -50,10 +50,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Resolve model: env var > most recent conversation > config > fallback
+	// Resolve model: env var > last explicitly selected > most recent
+	// conversation > config > fallback
 	model := cfg.Model
 	if conv != nil && conv.Model != "" {
 		model = conv.Model
+	}
+	if lm := config.LastModel(); lm != "" {
+		model = lm
 	}
 	if m := os.Getenv("CX_MODEL"); m != "" {
 		model = m
@@ -87,11 +91,6 @@ func main() {
 		}
 		ui.SaveLastDoc(docPath)
 		conv = dc
-		if conv.Model != "" && conv.Model != model {
-			if p2, err := llm.ForModel(conv.Model, cfg); err == nil {
-				model, prov = conv.Model, p2
-			}
-		}
 	}
 
 	// Load messages
