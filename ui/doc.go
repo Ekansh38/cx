@@ -105,7 +105,7 @@ func (m Model) attachDoc(path string) (Model, tea.Cmd) {
 	m.store.UpdateDocPath(m.conv.ID, abs)
 	m.conv.DocPath = abs
 
-	m.injectSystemLine("attached " + filepath.Base(abs) + " — :doc edit opens it in your editor, :doc off closes")
+	m.injectSystemLine("attached " + filepath.Base(abs))
 	return m, nil
 }
 
@@ -286,14 +286,14 @@ func summarizeReview(results []editResult, docName string) string {
 		case r.Applied:
 			applied++
 		case r.Reason != "":
-			parts = append(parts, fmt.Sprintf("edit %d rejected — %q", i+1, r.Reason))
+			parts = append(parts, fmt.Sprintf("edit %d rejected: %q", i+1, r.Reason))
 		default:
 			parts = append(parts, fmt.Sprintf("edit %d skipped", i+1))
 		}
 	}
-	note := fmt.Sprintf("Edit review in editor: %d/%d applied to %s.", applied, len(results), docName)
+	note := fmt.Sprintf("applied %d/%d edits to %s", applied, len(results), docName)
 	if len(parts) > 0 {
-		note += " " + strings.Join(parts, "; ") + "."
+		note += " (" + strings.Join(parts, "; ") + ")"
 	}
 	return note
 }
@@ -432,7 +432,7 @@ func (m Model) updateDocReview(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.String() {
 	case "y":
 		if !m.applyDocEdit(m.docEditIdx) {
-			m.injectSystemLine("couldn't locate that text in the document — skipped (doc may have changed)")
+			m.injectSystemLine("couldn't locate that text in the doc, skipped")
 		}
 		m.advanceDocReview()
 	case "n":
@@ -445,7 +445,7 @@ func (m Model) updateDocReview(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.advanceDocReview()
 	case "esc", "q", "ctrl+c":
 		m.docReview = false
-		m.injectSystemLine("edit review cancelled — remaining edits discarded")
+		m.injectSystemLine("review cancelled")
 	}
 	return m, nil
 }
@@ -466,9 +466,9 @@ func (m *Model) advanceDocReview() {
 			failed++
 		}
 	}
-	note := fmt.Sprintf("applied %d/%d edit(s) to %s", applied, len(m.docEdits), filepath.Base(m.docPath))
+	note := fmt.Sprintf("applied %d/%d edits to %s", applied, len(m.docEdits), filepath.Base(m.docPath))
 	if failed > 0 {
-		note += fmt.Sprintf(" — %d couldn't be located", failed)
+		note += fmt.Sprintf(" (%d couldn't be located)", failed)
 	}
 	m.injectSystemLine(note)
 }
