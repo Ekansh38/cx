@@ -109,6 +109,25 @@ func TestSelectionParse(t *testing.T) {
 	}
 }
 
+func TestFuzzyMatch(t *testing.T) {
+	cases := []struct {
+		q, s string
+		want bool
+	}{
+		{"", "anything", true},
+		{"nts", "notes.md", true},          // subsequence
+		{"docmd", "docs/readme.md", true},  // spans path segments
+		{"xyz", "notes.md", false},
+		{"nst", "notes.md", false},         // wrong order
+		{"notes", "notes.md", true},
+	}
+	for _, c := range cases {
+		if got := fuzzyMatch(c.q, c.s); got != c.want {
+			t.Errorf("fuzzyMatch(%q, %q) = %v; want %v", c.q, c.s, got, c.want)
+		}
+	}
+}
+
 func TestHardWrap(t *testing.T) {
 	long := strings.Repeat("x", 25)
 	for _, ln := range strings.Split(hardWrap(long, 10), "\n") {

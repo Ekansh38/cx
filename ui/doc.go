@@ -614,6 +614,12 @@ func (m Model) enterDocPicker() (Model, tea.Cmd) {
 	return m, nil
 }
 
+// StartInDocPicker opens the document picker on launch (used by `cx doc`).
+func (m Model) StartInDocPicker() Model {
+	m2, _ := m.enterDocPicker()
+	return m2
+}
+
 func cwdBase() string {
 	if wd, err := os.Getwd(); err == nil {
 		return filepath.Base(wd)
@@ -676,13 +682,37 @@ func (m Model) filteredDocFiles() []string {
 		return m.docFiles
 	}
 	q := strings.ToLower(m.docFilter)
-	var out []string
+	// Substring matches rank above fuzzy (subsequence) matches
+	var exact, fuzzy []string
 	for _, f := range m.docFiles {
-		if strings.Contains(strings.ToLower(f), q) {
-			out = append(out, f)
+		lf := strings.ToLower(f)
+		switch {
+		case strings.Contains(lf, q):
+			exact = append(exact, f)
+		case fuzzyMatch(q, lf):
+			fuzzy = append(fuzzy, f)
 		}
 	}
-	return out
+	return append(exact, fuzzy...)
+}
+
+// fuzzyMatch reports whether all runes of query appear in s in order
+// (fzf-style subsequence matching). Both inputs must be lowercased.
+func fuzzyMatch(query, s string) bool {
+	if query == "" {
+		return true
+	}
+	qr := []rune(query)
+	i := 0
+	for _, r := range s {
+		if r == qr[i] {
+			i++
+			if i == len(qr) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m Model) docPickerView() string {

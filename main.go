@@ -17,14 +17,17 @@ import (
 )
 
 func main() {
-	// cx doc <file> — auto-launch a split: editor on the left, cx on the right
+	// cx doc [file] — auto-launch a split: editor on the left, cx on the right.
+	// Without a file, cx starts in the fuzzy document picker.
 	var docPath string
+	startDocPicker := false
 	if len(os.Args) >= 2 && os.Args[1] == "doc" {
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: cx doc <file>")
-			os.Exit(1)
+		if len(os.Args) >= 3 {
+			docPath = launchDocSplit(os.Args[2])
+		} else {
+			ensureTmuxSession("doc") // so the editor split can open after picking
+			startDocPicker = true
 		}
-		docPath = launchDocSplit(os.Args[2])
 	}
 
 	cfg, err := config.Load()
@@ -102,11 +105,36 @@ func main() {
 
 	// Launch TUI
 	m := ui.New(cfg, st, conv, msgs, prov, model, sysPrompt)
+	if startDocPicker {
+		m = m.StartInDocPicker()
+	}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// ensureTmuxSession re-execs cx inside a new tmux session when run outside
+// one (and exits). Inside tmux, or when tmux isn't installed, it's a no-op —
+// without tmux the doc view still works, just without the editor split.
+func ensureTmuxSession(args ...string) {
+	if os.Getenv("TMUX") != "" {
+		return
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		exe = os.Args[0]
+	}
+	cmd := exec.Command("tmux", append([]string{"new-session", exe}, args...)...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 // launchDocSplit resolves the doc path and sets up the tmux split view.
@@ -128,23 +156,7 @@ func launchDocSplit(path string) string {
 		os.Exit(1)
 	}
 
-	if os.Getenv("TMUX") == "" {
-		// Not in tmux — start one running this same command, then exit
-		if _, err := exec.LookPath("tmux"); err != nil {
-			fmt.Fprintln(os.Stderr, "cx doc needs tmux for the split view — install tmux, or run :doc inside cx")
-			os.Exit(1)
-		}
-		exe, err := os.Executable()
-		if err != nil {
-			exe = os.Args[0]
-		}
-		cmd := exec.Command("tmux", "new-session", exe, "doc", abs)
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-		if err := cmd.Run(); err != nil {
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
+	ensureTmuxSession("doc", abs)
 
 	// Inside tmux — open the editor in a pane to the left of cx
 	editor := os.Getenv("EDITOR")
