@@ -94,6 +94,28 @@ func TestStripEditBlocks(t *testing.T) {
 	}
 }
 
+func TestStripEditBlocksFileAttrAndUnclosed(t *testing.T) {
+	// file attribute on the open tag must still strip
+	withAttr := `text <edit file="/a.md">` + "\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n</edit> after"
+	out := stripEditBlocks(withAttr)
+	if strings.Contains(out, "SEARCH") || strings.Contains(out, "REPLACE") {
+		t.Errorf("file-attr block not stripped: %q", out)
+	}
+	if !strings.Contains(out, "after") {
+		t.Error("trailing prose lost")
+	}
+
+	// unterminated block (mid-stream) must be hidden, not rendered raw
+	partial := "prose <edit file=\"/a.md\">\n<<<<<<< SEARCH\nold text\n======="
+	out = stripEditBlocks(partial)
+	if strings.Contains(out, "SEARCH") || strings.Contains(out, "=======") {
+		t.Errorf("unterminated block leaked: %q", out)
+	}
+	if !strings.Contains(out, "[proposing edit 1") {
+		t.Errorf("streaming placeholder missing: %q", out)
+	}
+}
+
 func TestSelectionParse(t *testing.T) {
 	good := "/tmp/notes.md\n12-30\nselected line one\nselected line two\n"
 	if sel := parseSelectionText(good); sel == nil ||

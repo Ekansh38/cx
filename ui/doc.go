@@ -642,7 +642,10 @@ func (m *Model) advanceDocReview() {
 	m.injectSystemLine(note)
 }
 
-// stripEditBlocks replaces raw <edit> blocks with a compact placeholder for display.
+// stripEditBlocks replaces raw <edit> blocks with a compact placeholder for
+// display. An unterminated trailing block (mid-stream, or a model that forgot
+// the closing tag) is hidden too — raw SEARCH/REPLACE markers render as
+// blockquote garbage otherwise.
 func stripEditBlocks(s string) string {
 	n := 0
 	for {
@@ -652,6 +655,7 @@ func stripEditBlocks(s string) string {
 		}
 		rel := strings.Index(s[start:], "</edit>")
 		if rel < 0 {
+			s = s[:start] + fmt.Sprintf("*[proposing edit %d…]*", n+1)
 			break
 		}
 		n++
