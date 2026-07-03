@@ -9,7 +9,7 @@
 local ns = vim.api.nvim_create_namespace("cx_review")
 local datadir = vim.fn.expand("~/.local/share/cx")
 
-local S = { hunks = nil, buf = nil, total = 0 }
+local S = { hunks = nil, buf = nil, total = 0, hist = {} }
 
 local function lines_of(s)
   return vim.split(s, "\n", { plain = true })
@@ -105,7 +105,7 @@ end
 
 local function finish()
   clear_marks()
-  for _, lhs in ipairs({ "y", "n", "N", "a", "q" }) do
+  for _, lhs in ipairs({ "y", "n", "N", "a", "u", "q" }) do
     pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
   end
   pcall(vim.api.nvim_buf_call, S.buf, function()
@@ -187,7 +187,12 @@ local function render()
             vim.list_extend(virt, wrap_virt(l, width, "DiffAdd"))
           end
         end
-        table.insert(virt, { { string.format("cx %d/%d", i, S.total), "Comment" } })
+        table.insert(virt, {
+          {
+            string.format("cx %d/%d · y apply  n skip  N reject+note  a all  u undo  q quit", i, S.total),
+            "Comment",
+          },
+        })
         vim.api.nvim_buf_set_extmark(S.buf, ns, start + #h.search - 1, 0, { virt_lines = virt })
         table.insert(qf, {
           bufnr = S.buf,
@@ -231,8 +236,36 @@ local function current_hunk()
   return hunk_at(vim.api.nvim_win_get_cursor(win)[1])
 end
 
+-- undo_last reverts the most recent decision: applied hunks are restored in
+-- the buffer, skips/rejects simply become pending again.
+local function undo_last()
+  local h = table.remove(S.hist)
+  if not h then
+    vim.notify("cx: nothing to undo")
+    return
+  end
+  if h.result and h.result.applied then
+    local start = locate(S.buf, h.replace)
+    if start then
+      vim.api.nvim_buf_set_lines(S.buf, start, start + #h.replace, false, h.search)
+    end
+  end
+  h.done = false
+  h.result = nil
+  render()
+  -- put the cursor back on the undone hunk so y/n/N target it directly
+  local win = vim.fn.bufwinid(S.buf)
+  if win ~= -1 and h.start then
+    vim.api.nvim_win_set_cursor(win, { h.start + 1, 0 })
+  end
+end
+
 local function decide(action)
   if not S.hunks then
+    return
+  end
+  if action == "undo" then
+    undo_last()
     return
   end
   if action == "all" then
@@ -246,6 +279,7 @@ local function decide(action)
           h.done = true
           h.result = { applied = false, reason = "not found in buffer" }
         end
+        table.insert(S.hist, h)
       end
     end
     render()
@@ -269,15 +303,18 @@ local function decide(action)
   end
   if action == "apply" then
     apply(h)
+    table.insert(S.hist, h)
     render()
   elseif action == "skip" then
     h.done = true
     h.result = { applied = false }
+    table.insert(S.hist, h)
     render()
   elseif action == "reject" then
     vim.ui.input({ prompt = "why? " }, function(reason)
       h.done = true
       h.result = { applied = false, reason = reason or "" }
+      table.insert(S.hist, h)
       render()
     end)
   end
@@ -318,11 +355,12 @@ function CxReview()
   S.buf = buf
   S.total = #req.edits
   S.hunks = {}
+  S.hist = {}
   for _, e in ipairs(req.edits) do
     table.insert(S.hunks, { search = lines_of(e.search), replace = lines_of(e.replace) })
   end
 
-  for lhs, action in pairs({ y = "apply", n = "skip", N = "reject", a = "all", q = "quit" }) do
+  for lhs, action in pairs({ y = "apply", n = "skip", N = "reject", a = "all", u = "undo", q = "quit" }) do
     vim.keymap.set("n", lhs, function()
       decide(action)
     end, { buffer = buf, nowait = true })
