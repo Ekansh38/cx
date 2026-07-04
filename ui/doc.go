@@ -94,12 +94,12 @@ func docsContextMsg(docs []*attachedDoc) string {
 
 // ── Connect / disconnect / reload ────────────────────────────────────────────
 
-// lastDocPathFile remembers the most recently connected doc for `:connect doc`.
+// lastDocPathFile remembers the most recently connected doc for `/connect doc`.
 func lastDocPathFile() string {
 	return filepath.Join(config.DataDir(), "last-doc.txt")
 }
 
-// SaveLastDoc records the path for later no-arg :connect doc.
+// SaveLastDoc records the path for later no-arg /connect doc.
 func SaveLastDoc(path string) {
 	os.WriteFile(lastDocPathFile(), []byte(path+"\n"), 0o644)
 }
@@ -232,7 +232,7 @@ func (m *Model) loadConvDocs() {
 	}
 }
 
-// disconnectDocFlow handles :disconnect doc / :doc off — instant when one
+// disconnectDocFlow handles /disconnect doc / /doc off — instant when one
 // doc is connected, a picker (with ALL) when several are.
 func (m Model) disconnectDocFlow() (Model, tea.Cmd) {
 	switch len(m.docs) {
@@ -313,7 +313,7 @@ func (m Model) openDocEditor(path string) (Model, tea.Cmd) {
 	})
 }
 
-// autoEditorSplit opens the editor beside cx after an explicit :doc attach
+// autoEditorSplit opens the editor beside cx after an explicit /doc attach
 // (no-op outside tmux; keeps focus on cx).
 func (m *Model) autoEditorSplit(path string) {
 	if path == "" || os.Getenv("TMUX") == "" {
@@ -746,7 +746,7 @@ func selectionContextMsg(sel *docSelection) string {
 	)
 }
 
-// ── Doc file picker (:doc with no args) ──────────────────────────────────────
+// ── Doc file picker (/doc with no args) ──────────────────────────────────────
 
 var docSkipDirs = map[string]bool{
 	"node_modules": true, "vendor": true, "target": true,
@@ -789,7 +789,7 @@ func listDocFiles() []string {
 func (m Model) enterDocPicker() (Model, tea.Cmd) {
 	files := listDocFiles()
 	if len(files) == 0 {
-		m.errMsg = "no .md/.txt files found under " + cwdBase() + " (use :doc <path>)"
+		m.errMsg = "no .md/.txt files found under " + cwdBase() + " (use /doc <path>)"
 		return m, nil
 	}
 	m.state = stateDocPicker
@@ -961,7 +961,7 @@ func (m Model) docPickerView() string {
 	return sb.String()
 }
 
-// ── Connected-docs list picker (:disconnect doc / :doc edit with many) ───────
+// ── Connected-docs list picker (/disconnect doc / /doc edit with many) ───────
 
 const docListAll = "ALL"
 

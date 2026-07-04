@@ -5,7 +5,7 @@
 // thing — organizing into sections (Identity / Preferences / Projects / Tools
 // & Workflow / Feedback / References), merging, generalizing, and pruning.
 //
-// :remember and :forget also route through the model so edits stay organized.
+// /remember and /forget also route through the model so edits stay organized.
 // This package only provides the raw read/write; the LLM prompting lives in ui.
 package memory
 
@@ -16,7 +16,7 @@ import (
 )
 
 // maxLines is a hard safety cap so a runaway model can't bloat the file.
-const maxLines = 100
+const maxLines = 200
 
 var mu sync.Mutex
 

@@ -27,7 +27,7 @@ type ProviderCf struct {
 func Load() (*Config, error) {
 	cfg := &Config{
 		Model:            "", // no default — uses most recent conversation's model
-		MemoryModel:      "google/gemini-2.5-flash-lite",
+		MemoryModel:      "google/gemini-2.5-flash",
 		MaxContextTokens: 128000,
 		MaxTokens:        16384,
 		Ollama:           ProviderCf{BaseURL: "http://localhost:11434/v1"},
