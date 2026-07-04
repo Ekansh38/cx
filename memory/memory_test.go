@@ -30,14 +30,14 @@ func TestSaveAndRaw(t *testing.T) {
 
 func TestSaveRawLineCap(t *testing.T) {
 	p := tmpFile(t)
-	long := strings.Repeat("- line\n", 200)
+	long := strings.Repeat("- line\n", 500)
 	if err := SaveRaw(p, long); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(p)
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) > 100 {
-		t.Errorf("file has %d lines; want <= 100", len(lines))
+	if len(lines) > 200 {
+		t.Errorf("file has %d lines; want <= 200", len(lines))
 	}
 }
 

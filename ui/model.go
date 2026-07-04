@@ -34,8 +34,8 @@ const (
 	statePicker                 // conversation picker overlay
 	stateSearch                 // inline message search
 	stateModelPicker            // model switcher
-	stateDocPicker              // filesystem document picker for :doc
-	stateDocListPicker          // connected-docs picker (:disconnect doc / :doc edit)
+	stateDocPicker              // filesystem document picker for /doc
+	stateDocListPicker          // connected-docs picker (/disconnect doc / /doc edit)
 )
 
 // ── tea.Msg types ─────────────────────────────────────────────────────────────
@@ -65,15 +65,15 @@ type searchResult struct {
 	msg  *store.Message
 }
 
-// ── available :commands ───────────────────────────────────────────────────────
+// ── available /commands ───────────────────────────────────────────────────────
 
 var commands = []string{
-	":clear", ":connect doc", ":copy", ":copy prompt", ":debug",
-	":delete", ":disconnect doc", ":doc",
-	":edit", ":forget ", ":grep", ":help", ":img ",
-	":list", ":memory", ":model ", ":models", ":new",
-	":paste", ":q", ":quit", ":r", ":remember ",
-	":rename ", ":retry", ":sel", ":stop", ":wipe",
+	"/clear", "/connect doc", "/copy", "/copy prompt", "/debug",
+	"/delete", "/disconnect doc", "/doc", "/editor",
+	"/edit", "/forget ", "/grep", "/help", "/img ",
+	"/list", "/memory", "/model ", "/models", "/new",
+	"/paste", "/q", "/quit", "/r", "/remember ",
+	"/rename ", "/retry", "/sel", "/stop", "/wipe",
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -133,13 +133,13 @@ type Model struct {
 	extRetry   bool          // a rejection carried a note: auto-retry when done
 	pendingSel *docSelection // editor highlight riding along the next message
 
-	// doc picker state (:doc with no path)
+	// doc picker state (/doc with no path)
 	docFiles       []string
 	docFilter      string
 	docCursor      int
 	docPickerQuits bool // launched via `cx doc`: esc quits instead of returning to chat
 
-	// connected-docs list picker state (:disconnect doc / :doc edit)
+	// connected-docs list picker state (/disconnect doc / /doc edit)
 	docListMode   string // "open" or "disconnect"
 	docListItems  []string
 	docListFilter string
@@ -324,7 +324,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case streamEndMsg:
-		// If the stream was cancelled (ctrl+c / :stop), the partial response
+		// If the stream was cancelled (ctrl+c / /stop), the partial response
 		// was already saved — drop this late completion to avoid duplicates.
 		if !m.streaming {
 			return m, nil
@@ -525,7 +525,7 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if input == "" {
 			return m, nil
 		}
-		if m.streaming && !strings.HasPrefix(input, ":") {
+		if m.streaming && !strings.HasPrefix(input, "/") {
 			return m, nil
 		}
 		m.input.Reset()
@@ -603,15 +603,26 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 // ── Input handling ────────────────────────────────────────────────────────────
 
 func (m Model) handleInput(input string) (Model, tea.Cmd) {
-	if strings.HasPrefix(input, ":") {
-		return m.handleCommand(input)
+	if strings.HasPrefix(input, "/") {
+		if isKnownCommand(input) {
+			return m.handleCommand(input)
+		}
+		// Not a command: an absolute path (or /file) falls through as a
+		// normal message; a lone /typo gets an error instead of being sent.
+		verb := strings.SplitN(input, " ", 2)[0]
+		if !strings.Contains(verb[1:], "/") {
+			if _, err := os.Stat(verb); err != nil {
+				m.errMsg = "unknown command: " + verb + " (tab to complete, /help for list)"
+				return m, nil
+			}
+		}
 	}
 
 	// Auto-detect image paths: if the input (or first word) is a file path
-	// ending in an image extension, treat it like :img <path> [rest as text].
+	// ending in an image extension, treat it like /img <path> [rest as text].
 	// This makes drag-and-drop work — terminals paste the file path.
 	if imgPath, text, ok := m.detectImagePath(input); ok {
-		return m.handleCommand(`:img "` + imgPath + `" ` + text)
+		return m.handleCommand(`/img "` + imgPath + `" ` + text)
 	}
 
 	if m.provider == nil {
@@ -657,7 +668,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 	verb := parts[0]
 
 	switch input {
-	case ":delete confirm":
+	case "/delete confirm":
 		if err := m.store.DeleteConversation(m.conv.ID); err != nil {
 			m.errMsg = "delete failed: " + err.Error()
 			return m, nil
@@ -669,7 +680,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		}
 		return m.switchConversation(convs[0].ID)
 
-	case ":wipe confirm":
+	case "/wipe confirm":
 		if err := m.store.WipeAll(); err != nil {
 			m.errMsg = "wipe failed: " + err.Error()
 			return m, nil
@@ -694,7 +705,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 	}
 
 	switch verb {
-	case ":stop":
+	case "/stop":
 		if !m.streaming {
 			m.errMsg = "not currently streaming"
 			return m, nil
@@ -716,22 +727,22 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		return m, nil
 
-	case ":q", ":quit":
+	case "/q", "/quit":
 		if m.streaming {
 			m.cancelStream()
 		}
 		return m, tea.Quit
 
-	case ":new":
+	case "/new":
 		return m.newConversation()
 
-	case ":list":
+	case "/list":
 		return m.enterPicker()
 
-	case ":grep":
+	case "/grep":
 		return m.enterSearch()
 
-	case ":clear":
+	case "/clear":
 		// Remove display-only system annotations (ID=0); keep all persisted messages
 		var kept []*store.Message
 		for _, msg := range m.messages {
@@ -743,7 +754,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.refreshContent()
 		return m, nil
 
-	case ":debug":
+	case "/debug":
 		msgs := m.buildLLMMessages()
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "── debug: %s ──\n", m.model)
@@ -758,12 +769,12 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.injectSystemLine(sb.String())
 		return m, nil
 
-	case ":models":
+	case "/models":
 		return m.enterModelPicker()
 
-	case ":rename":
+	case "/rename":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-			m.errMsg = "usage: :rename <title>"
+			m.errMsg = "usage: /rename <title>"
 			return m, nil
 		}
 		title := strings.TrimSpace(parts[1])
@@ -772,7 +783,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.autoTitled = true // don't auto-overwrite a manual rename
 		return m, nil
 
-	case ":model":
+	case "/model":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
 			m.injectSystemLine("current model: " + m.model)
 			return m, nil
@@ -790,12 +801,15 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.injectSystemLine("switched to " + newModel)
 		return m, nil
 
-	case ":help":
+	case "/editor":
+		return m.openEditor()
+
+	case "/help":
 		m.injectSystemLine(helpText)
 		return m, nil
 
-	case ":copy":
-		// :copy = last assistant message, :copy prompt = your last message
+	case "/copy":
+		// /copy = last assistant message, /copy prompt = your last message
 		role, what := "assistant", "response"
 		if len(parts) > 1 && strings.TrimSpace(parts[1]) == "prompt" {
 			role, what = "user", "prompt"
@@ -829,11 +843,11 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.injectSystemLine("copied " + what + " to clipboard")
 		return m, nil
 
-	case ":delete":
-		m.injectSystemLine("delete this conversation? type  :delete confirm  to proceed.")
+	case "/delete":
+		m.injectSystemLine("delete this conversation? type  /delete confirm  to proceed.")
 		return m, nil
 
-	case ":edit":
+	case "/edit":
 		if m.streaming {
 			return m, nil
 		}
@@ -873,7 +887,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.atBottom = true
 		return m, nil
 
-	case ":retry", ":r":
+	case "/retry", "/r":
 		if m.streaming {
 			return m, nil
 		}
@@ -896,13 +910,13 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.atBottom = true
 		return m.startStream()
 
-	case ":img":
+	case "/img":
 		if m.streaming {
-			m.errMsg = "wait for the response to finish (or :stop)"
+			m.errMsg = "wait for the response to finish (or /stop)"
 			return m, nil
 		}
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-			m.errMsg = "usage: :img /path/to/image.png [optional message]"
+			m.errMsg = "usage: /img /path/to/image.png [optional message]"
 			return m, nil
 		}
 		// Split into path and optional message (handles quoted / escaped spaces)
@@ -943,9 +957,9 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		}
 		return m.startStream()
 
-	case ":paste":
+	case "/paste":
 		if m.streaming {
-			m.errMsg = "wait for the response to finish (or :stop)"
+			m.errMsg = "wait for the response to finish (or /stop)"
 			return m, nil
 		}
 		path, err := pasteClipboardImage()
@@ -957,11 +971,11 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		if len(parts) > 1 {
 			text = strings.TrimSpace(parts[1])
 		}
-		return m.handleCommand(`:img "` + path + `" ` + text)
+		return m.handleCommand(`/img "` + path + `" ` + text)
 
-	case ":doc":
+	case "/doc":
 		if m.streaming {
-			m.errMsg = "wait for the response to finish (or :stop)"
+			m.errMsg = "wait for the response to finish (or /stop)"
 			return m, nil
 		}
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
@@ -989,9 +1003,9 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		}
 		return m2, cmd
 
-	case ":connect":
+	case "/connect":
 		if m.streaming {
-			m.errMsg = "wait for the response to finish (or :stop)"
+			m.errMsg = "wait for the response to finish (or /stop)"
 			return m, nil
 		}
 		arg := ""
@@ -999,7 +1013,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			arg = strings.TrimSpace(parts[1])
 		}
 		if arg != "doc" && !strings.HasPrefix(arg, "doc ") {
-			m.errMsg = "usage: :connect doc [path]"
+			m.errMsg = "usage: /connect doc [path]"
 			return m, nil
 		}
 		path := strings.TrimSpace(strings.TrimPrefix(arg, "doc"))
@@ -1014,14 +1028,14 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		}
 		return m.connectDoc(path)
 
-	case ":disconnect":
+	case "/disconnect":
 		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "doc" {
-			m.errMsg = "usage: :disconnect doc"
+			m.errMsg = "usage: /disconnect doc"
 			return m, nil
 		}
 		return m.disconnectDocFlow()
 
-	case ":sel":
+	case "/sel":
 		if len(parts) > 1 && strings.TrimSpace(parts[1]) == "clear" {
 			consumeSelection()
 			m.injectSystemLine("selection cleared")
@@ -1036,7 +1050,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		if len(preview) > 500 {
 			preview = preview[:500] + "…"
 		}
-		note := "(attached to your next message · :sel clear to drop)"
+		note := "(attached to your next message · /sel clear to drop)"
 		if len(m.docs) > 0 && m.findDoc(sel.file) == nil {
 			note = "(from a file that isn't a connected doc, will NOT be sent)"
 		}
@@ -1044,43 +1058,43 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			sel.start, sel.end, filepath.Base(sel.file), preview, note))
 		return m, nil
 
-	case ":memory":
+	case "/memory":
 		content, err := memory.Raw(config.MemoryPath())
 		if err != nil {
 			m.errMsg = "memory error: " + err.Error()
 			return m, nil
 		}
 		if content == "" {
-			m.injectSystemLine("memory is empty. chat or use :remember <fact>")
+			m.injectSystemLine("memory is empty. chat or use /remember <fact>")
 			return m, nil
 		}
 		m.injectSystemLine("── memory file ──\n" + content)
 		return m, nil
 
-	case ":remember":
+	case "/remember":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-			m.errMsg = "usage: :remember <fact>"
+			m.errMsg = "usage: /remember <fact>"
 			return m, nil
 		}
 		fact := strings.TrimSpace(parts[1])
 		m.injectSystemLine("updating memory...")
 		return m, m.editMemoryCmd("Remember this: "+fact, "memory updated, remembered: "+fact)
 
-	case ":forget":
+	case "/forget":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-			m.errMsg = "usage: :forget <query>"
+			m.errMsg = "usage: /forget <query>"
 			return m, nil
 		}
 		query := strings.TrimSpace(parts[1])
 		m.injectSystemLine("updating memory...")
 		return m, m.editMemoryCmd("Forget/remove anything related to: "+query, "memory updated, forgot: "+query)
 
-	case ":wipe":
-		m.injectSystemLine("this will delete ALL conversations and messages.\ntype  :wipe confirm  to proceed, or anything else to cancel.")
+	case "/wipe":
+		m.injectSystemLine("this will delete ALL conversations and messages.\ntype  /wipe confirm  to proceed, or anything else to cancel.")
 		return m, nil
 
 	default:
-		m.errMsg = "unknown command: " + verb + "  (tab to complete, :help for list)"
+		m.errMsg = "unknown command: " + verb + "  (tab to complete, /help for list)"
 		return m, nil
 	}
 }
@@ -1095,7 +1109,7 @@ func (m *Model) injectSystemLine(text string) {
 }
 
 const helpText = `keybindings
-  ctrl+c       cancel stream / quit (or :stop)
+  ctrl+c       cancel stream / quit (or /stop)
   ctrl+l       conversation picker
   ctrl+n       new conversation
   ctrl+g       search all messages
@@ -1105,43 +1119,44 @@ const helpText = `keybindings
   alt+enter    newline (multiline input)
   esc          clear the input field
   ↑ ↓          scroll one line
-  tab          autocomplete :command
+  tab          autocomplete /command
 
-commands  (type : to see completions)
-  :help                 this help
-  :q / :quit            quit
-  :new                  new conversation
-  :list                 conversation picker
-  :grep                 search messages
-  :copy                 copy last assistant message to clipboard
-  :copy prompt          copy your last message to clipboard
-  :edit                 edit your last message (loads into input, re-send)
-  :retry / :r           re-send last message (gets a new response)
-  :img <path> [text]    send an image (png/jpg/gif/webp)
+commands  (type / to see completions)
+  /help                 this help
+  /q / /quit            quit
+  /new                  new conversation
+  /list                 conversation picker
+  /grep                 search messages
+  /copy                 copy last assistant message to clipboard
+  /copy prompt          copy your last message to clipboard
+  /edit                 edit your last message (loads into input, re-send)
+  /editor               open $EDITOR for long input (same as ctrl+e)
+  /retry / /r           re-send last message (gets a new response)
+  /img <path> [text]    send an image (png/jpg/gif/webp)
                         (or just paste/drop an image path, auto-detected)
-  :paste [text]         send the image on your clipboard
-  :doc [path]           connect a document and open it in your editor
+  /paste [text]         send the image on your clipboard
+  /doc [path]           connect a document and open it in your editor
                         (no path = fuzzy picker over the current directory)
-  :doc edit             reopen a connected doc in your editor
-  :doc off              disconnect (same as :disconnect doc)
-  :connect doc [path]   connect a doc without opening the editor
+  /doc edit             reopen a connected doc in your editor
+  /doc off              disconnect (same as /disconnect doc)
+  /connect doc [path]   connect a doc without opening the editor
                         (no path = the last doc you connected)
-  :disconnect doc       disconnect a doc (picker with ALL when several)
-  :sel                  preview the editor selection waiting for your next msg
-  :sel clear            drop it
-  :stop                 stop the current response (same as ctrl+c)
-  :delete               delete current conversation (asks confirm)
-  :rename <title>       rename this conversation
-  :model <name>         switch model mid-conversation
-  :models               model switcher (fetches from OpenRouter)
-  :memory               show the memory file
-  :remember <fact>      ask the memory model to add a fact
-  :forget <query>       ask the memory model to drop matching content
-  :clear                clear injected notes (history kept)
-  :debug                show full API payload
-  :wipe                 delete ALL conversations and messages (asks confirm)
+  /disconnect doc       disconnect a doc (picker with ALL when several)
+  /sel                  preview the editor selection waiting for your next msg
+  /sel clear            drop it
+  /stop                 stop the current response (same as ctrl+c)
+  /delete               delete current conversation (asks confirm)
+  /rename <title>       rename this conversation
+  /model <name>         switch model mid-conversation
+  /models               model switcher (fetches from OpenRouter)
+  /memory               show the memory file
+  /remember <fact>      ask the memory model to add a fact
+  /forget <query>       ask the memory model to drop matching content
+  /clear                clear injected notes (history kept)
+  /debug                show full API payload
+  /wipe                 delete ALL conversations and messages (asks confirm)
 
-doc mode  (:doc / :connect doc)
+doc mode  (/doc / /connect doc)
   documents live in YOUR editor (opened beside cx in tmux);
   cx just knows the files. a chat can have several docs connected;
   all of them are sent to the model every turn, re-read from disk,
@@ -1161,11 +1176,11 @@ doc mode  (:doc / :connect doc)
 neovim side-by-side
   cx doc <file>   (from your shell) sets everything up: a tmux
   session with neovim on the left, cx on the right, doc attached.
-  inside tmux, :doc / the doc picker / e also auto-open the editor
+  inside tmux, /doc / the doc picker / e also auto-open the editor
   in a split pane. add the keybinding from the README, highlight
   text in neovim, press <leader>cs, and cx attaches the selection to
   your next message (auto-attaching the doc if needed). status bar
-  shows "sel L12-30" while one is waiting; :sel previews it.
+  shows "sel L12-30" while one is waiting; /sel previews it.
 
 memory
   cx keeps a structured markdown profile at ~/.config/cx/memory.md,
@@ -1173,7 +1188,7 @@ memory
   Tools & Workflow / Feedback / References.
   after each response, the memory model rewrites the file:
   merging, generalizing, and pruning what it knows about you.
-  :remember and :forget also route through the model so edits stay
+  /remember and /forget also route through the model so edits stay
   organized and don't leave dangling bullets.
   set memory_model in config.toml to pick a stronger curation model.
   context auto-compacted when the conversation gets long.`
@@ -1401,7 +1416,7 @@ Rules:
 - Consolidate duplicates; generalize when patterns emerge (three similar facts become one insight)
 - Drop stale, trivial, or conversation-specific details (except in Recent conversations).
 - Every ## section that survives must have at least one bullet.
-- Keep the total file under 100 lines. Quality over quantity.
+- Keep the total file under 200 lines. Quality over quantity.
 - Never invent facts or extrapolate beyond what was actually said.
 
 The "## Recent conversations" section is an episodic log so future sessions know what was already discussed:
@@ -1450,7 +1465,7 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 	return func() tea.Msg {
 		memModel := cfg.MemoryModel
 		if memModel == "" {
-			memModel = "google/gemini-2.5-flash-lite"
+			memModel = "google/gemini-2.5-flash"
 		}
 		prov, err := llm.ForModel(memModel, cfg)
 		if err != nil {
@@ -1488,7 +1503,7 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 	}
 }
 
-// editMemoryPrompt is used by :remember and :forget — an explicit instruction
+// editMemoryPrompt is used by /remember and /forget — an explicit instruction
 // from the user that the memory model applies to the file.
 const editMemoryPrompt = `You are the long-term memory manager for a personal AI assistant. The user has issued an EXPLICIT instruction to update their memory file.
 
@@ -1507,7 +1522,7 @@ Rules:
 - When forgetting/removing, drop the matching content but keep surrounding context intact.
 - Rich, substantive bullets — not one-word tags. Merge related facts.
 - Every ## section that survives must have at least one bullet.
-- Keep the total file under 80 lines.
+- Keep the total file under 200 lines.
 
 Reply with ONLY the complete new memory file content — no code fences, no commentary.
 If the instruction has literally no effect (e.g. forget something that isn't there), reply with exactly: NO_CHANGES
@@ -1527,7 +1542,7 @@ func (m Model) editMemoryCmd(instruction, successNote string) tea.Cmd {
 	return func() tea.Msg {
 		memModel := cfg.MemoryModel
 		if memModel == "" {
-			memModel = "google/gemini-2.5-flash-lite"
+			memModel = "google/gemini-2.5-flash"
 		}
 		prov, err := llm.ForModel(memModel, cfg)
 		if err != nil {
@@ -1761,7 +1776,7 @@ func (m Model) newConversation() (Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── Search (ctrl+g / :grep) ───────────────────────────────────────────────────
+// ── Search (ctrl+g / /grep) ───────────────────────────────────────────────────
 
 func (m Model) enterSearch() (Model, tea.Cmd) {
 	convs, _ := m.store.ListConversations()
@@ -1854,7 +1869,7 @@ func (m Model) filteredSearch() []searchResult {
 	return out
 }
 
-// ── Model picker (ctrl+t / :models) ──────────────────────────────────────────
+// ── Model picker (ctrl+t / /models) ──────────────────────────────────────────
 
 func (m Model) enterModelPicker() (Model, tea.Cmd) {
 	m.state = stateModelPicker
@@ -2082,7 +2097,7 @@ func (m Model) chatView() string {
 
 func (m Model) sepView() string {
 	val := strings.TrimSpace(m.input.Value())
-	if strings.HasPrefix(val, ":") {
+	if strings.HasPrefix(val, "/") {
 		matches := completionsFor(val)
 		if len(matches) > 0 {
 			return completionStyle.Render("  " + strings.Join(matches, "  "))
@@ -2456,9 +2471,23 @@ func wrapParagraph(text string, width int) string {
 	return strings.Join(lines, "\n")
 }
 
+// isKnownCommand reports whether input starts with a known /command verb.
+func isKnownCommand(input string) bool {
+	verb := strings.SplitN(strings.TrimSpace(input), " ", 2)[0]
+	for _, c := range commands {
+		if strings.SplitN(strings.TrimSpace(c), " ", 2)[0] == verb {
+			return true
+		}
+	}
+	return false
+}
+
 func completionsFor(input string) []string {
-	if !strings.HasPrefix(input, ":") {
+	if !strings.HasPrefix(input, "/") {
 		return nil
+	}
+	if strings.Contains(strings.SplitN(input, " ", 2)[0][1:], "/") {
+		return nil // an absolute path, not a command
 	}
 	var out []string
 	for _, c := range commands {
