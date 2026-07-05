@@ -52,24 +52,53 @@ type editGroup struct {
 
 // ── LLM-facing document context ──────────────────────────────────────────────
 
-const docEditInstructions = `You can discuss the documents and, when the user asks for changes, propose edits using this exact format:
+const docEditInstructions = `You can discuss the documents, and when the user wants changes you propose edits. The user reviews each edit as a diff in their editor and applies, skips, or rejects it (rejections come back to you with the reason).
+
+Edit format (exact):
 
 <edit file="/absolute/path/to/the/document">
 <<<<<<< SEARCH
-exact text copied verbatim from the document (do NOT include the line numbers)
+text copied verbatim from the document
 =======
 the replacement text
 >>>>>>> REPLACE
 </edit>
 
-Rules:
-- Always include the file attribute with the document's absolute path.
-- The SEARCH text must match the document exactly, character for character.
-- Each edit must be MINIMAL: only the line(s) actually changing, plus at most
-  1-2 unchanged lines when needed to disambiguate. NEVER send large unchanged
-  regions or the whole document; one <edit> block per independent change.
-- The user reviews and approves each edit before it is applied, so don't repeat the diff in prose.
-- The user may reference locations like @L12, @L12-30, or @## Heading Name.`
+THE RULES BELOW MATTER. Violating them makes edits silently fail or become unreviewable.
+
+1. ANCHOR AGAINST THE CURRENT DOCUMENT, VERBATIM.
+   The SEARCH text must be copied character-for-character from the document
+   content shown above (without the line numbers). Only include lines that
+   actually exist: do not add a blank line before the first line or after
+   the last line of the file. If line 17 is the last line, a SEARCH ending
+   at line 17 ends with that line's text, nothing after it.
+
+2. EVERY EDIT IS INDEPENDENT. NEVER CHAIN.
+   Each SEARCH must match the document AS IT IS NOW, never the document as
+   it would look after another of your edits was applied. The user may
+   apply, skip, or reject any subset in any order. If two changes touch the
+   same lines, merge them into one edit block.
+
+3. MINIMAL HUNKS.
+   Only the line(s) actually changing, plus at most 1-2 unchanged neighbor
+   lines when needed to make the SEARCH unambiguous. Never resend large
+   unchanged regions and never the whole document. One <edit> block per
+   independent change: a typo fix and a new paragraph are two blocks.
+
+4. INSERTIONS anchor on an existing line:
+   - append at the end: SEARCH = the current last line; REPLACE = that same
+     line, then the new lines.
+   - insert at the top: SEARCH = the current first line; REPLACE = the new
+     lines, then that same line.
+   - insert in the middle: SEARCH = the line above the insertion point;
+     REPLACE = that line, then the new lines.
+
+5. WHEN AN EDIT IS REJECTED with a reason, revise ONLY that edit and propose
+   an updated block anchored against the current document. Do not resend
+   edits that were applied or are still under review.
+
+6. Don't restate the diff in prose; a one-line summary per edit is plenty.
+   The user may reference locations as @L12, @L12-30, or @## Heading Name.`
 
 // docsContextMsg builds the system message carrying all connected documents.
 func docsContextMsg(docs []*attachedDoc) string {
