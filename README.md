@@ -140,7 +140,7 @@ Tip: if cx applies edits while the file is open in neovim, set `:set autoread` s
 
 ### Web search
 
-`/web` toggles live web search: cx routes requests through OpenRouter's web plugin (`model:online`), so answers are grounded in current web results with no extra API keys or setup. The status bar shows `web` while it's on. OpenRouter bills ~$4 per 1k search results on top of normal token costs.
+Web search works in natural language: messages that ask for live information ("search for X", "look up", "latest", "news", a URL, ...) automatically route through OpenRouter's web plugin (`model:online`), grounding the answer in current web results — no extra API keys or setup. `/web on` forces it for every message (status bar shows `web`), `/web off` disables the forcing. OpenRouter bills ~$4 per 1k search results on top of normal token costs, only on messages that actually search.
 
 ### Memory
 

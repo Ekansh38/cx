@@ -366,7 +366,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			edits = resolveEditFiles(edits, m.docs)
 			edits = deChainEdits(edits, m.docs)
 			edits = normalizeEdits(edits, m.docs)
-			edits = explodeEdits(edits, m.docs)
+			var noops int
+			edits, noops = explodeEdits(edits, m.docs)
+			if len(edits) == 0 && noops > 0 {
+				m.injectSystemLine(fmt.Sprintf("%d proposed edit(s) matched the document already, nothing to apply", noops))
+			}
 			if len(edits) > 0 && len(m.extGroups) > 0 {
 				// A review is already on screen in neovim: queue these after it
 				m.extGroups = append(m.extGroups, groupEditsByFile(edits)...)
@@ -382,7 +386,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if len(edits) == 1 {
 						word = "edit"
 					}
-					m.injectSystemLine(fmt.Sprintf("proposed %d %s in neovim", len(edits), word))
+					line := fmt.Sprintf("proposed %d %s in neovim", len(edits), word)
+					if noops > 0 {
+						line += fmt.Sprintf(" (%d proposed no change, dropped)", noops)
+					}
+					m.injectSystemLine(line)
 					reviewCmd = extReviewTick(0)
 				} else {
 					m.injectSystemLine("neovim bridge unavailable, review here")
@@ -1286,7 +1294,9 @@ commands  (type / to see completions)
   /edit                 edit your last message (loads into input, re-send)
   /editor               open $EDITOR for long input (same as ctrl+e)
   /undo                 revert the edits applied by the last review
-  /web [on|off]         toggle live web search (OpenRouter models)
+  /web [on|off]         force live web search on or off for every message
+                        (phrases like "search for", "latest", "news", or a
+                        URL trigger it automatically per message)
   /retry / /r           re-send last message (gets a new response)
   /img <path> [text]    send an image (png/jpg/gif/webp)
                         (or just paste/drop an image path, auto-detected)
@@ -1368,7 +1378,7 @@ func (m Model) startStream() (Model, tea.Cmd) {
 	m.pendingImages = nil // consumed
 	m.pendingSel = nil    // consumed
 	model := m.model
-	if m.webSearch && strings.Contains(model, "/") {
+	if strings.Contains(model, "/") && (m.webSearch || wantsWeb(m.messages)) {
 		model += ":online" // OpenRouter web plugin
 	}
 	return m, tea.Batch(
@@ -2677,6 +2687,30 @@ func lastMentionToken(input string) (string, string, bool) {
 		return "", "", false
 	}
 	return input[:i+1], tok[1:], true
+}
+
+// webCues are phrases that make a single message use live web search even
+// when /web is off, so "search for X" just works in natural language.
+var webCues = []string{
+	"search", "look up", "lookup", "google", "browse the web", "on the web",
+	"latest", "news", "currently", "as of today", "right now", "http://", "https://",
+}
+
+// wantsWeb reports whether the newest user message asks for live information.
+func wantsWeb(msgs []*store.Message) bool {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != "user" {
+			continue
+		}
+		lower := strings.ToLower(msgs[i].Content)
+		for _, cue := range webCues {
+			if strings.Contains(lower, cue) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // isKnownCommand reports whether input starts with a known /command verb.

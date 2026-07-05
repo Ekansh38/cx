@@ -85,9 +85,22 @@ func TestExplodeEditsDropsNoops(t *testing.T) {
 		{file: "/d.md", search: "y", replace: "Y"},  // kept
 		{file: "/other", search: "a", replace: "b"}, // unknown doc: passthrough
 	}
-	out := explodeEdits(edits, docs)
+	out, noops := explodeEdits(edits, docs)
 	if len(out) != 2 {
 		t.Fatalf("got %d edits; want 2", len(out))
+	}
+	if noops != 1 {
+		t.Errorf("noops = %d; want 1", noops)
+	}
+
+	// exact duplicates collapse to one
+	dups := []docEdit{
+		{file: "/d.md", search: "y", replace: "Y"},
+		{file: "/d.md", search: "y", replace: "Y"},
+	}
+	out, _ = explodeEdits(dups, docs)
+	if len(out) != 1 {
+		t.Errorf("duplicates not collapsed: %d edits", len(out))
 	}
 }
 

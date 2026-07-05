@@ -12,7 +12,8 @@
 -- skipped, both present = pending. The file is written when the review
 -- finishes; results land in edits-done.json for cx.
 
-local ns = vim.api.nvim_create_namespace("cx_review")
+local ns = vim.api.nvim_create_namespace("cx_review")        -- invisible tracking marks
+local paint = vim.api.nvim_create_namespace("cx_review_paint") -- highlights + footers, redrawn
 local aug = vim.api.nvim_create_augroup("cx_review", { clear = true })
 local datadir = vim.fn.expand("~/.local/share/cx")
 
@@ -154,34 +155,60 @@ local function hunk_row(h)
   return r and r[1] or nil
 end
 
--- repaint refreshes footers and the quickfix list from derived state. Runs
--- after decisions AND on TextChanged, so vim-native undo brings the full
--- review UX back.
+-- paint_hunk draws highlights for one pending hunk from its live tracking
+-- ranges (word-level for single-line changes).
+local function paint_hunk(h, idx)
+  local red = mark_info(h.redMark)
+  local green = mark_info(h.greenMark)
+  if h.word and red and green then
+    local wp, oe, ne = split_diff(h.old[1], h.new[1])
+    if oe > wp then
+      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], wp, { end_col = oe, hl_group = "DiffDelete" })
+    else
+      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], 0, { end_row = red[2], hl_group = "DiffDelete", hl_eol = true })
+    end
+    if ne > wp then
+      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], wp, { end_col = ne, hl_group = "DiffAdd" })
+    else
+      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], 0, { end_row = green[2], hl_group = "DiffAdd", hl_eol = true })
+    end
+  else
+    if red then
+      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], 0, { end_row = red[2], hl_group = "DiffDelete", hl_eol = true })
+    end
+    if green then
+      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], 0, { end_row = green[2], hl_group = "DiffAdd", hl_eol = true })
+    end
+  end
+  local anchor = green or red
+  if anchor then
+    vim.api.nvim_buf_set_extmark(S.buf, paint, anchor[2] - 1, 0, {
+      virt_lines = {
+        {
+          {
+            string.format("cx %d/%d · y apply  n skip  N reject+note  a all  q finish", idx, S.total),
+            "Comment",
+          },
+        },
+      },
+    })
+  end
+end
+
+-- repaint redraws all decorations and the quickfix list from derived state.
+-- Runs after decisions AND on TextChanged, so vim-native undo brings the
+-- full review UX back; decided hunks lose their coloring instantly.
 local function repaint()
   if not S.hunks then
     return
   end
+  vim.api.nvim_buf_clear_namespace(S.buf, paint, 0, -1)
   local qf = {}
   for i, h in ipairs(S.hunks) do
-    local st = state(h)
-    if h.footMark then
-      pcall(vim.api.nvim_buf_del_extmark, S.buf, ns, h.footMark)
-      h.footMark = nil
-    end
-    if st == "pending" then
+    if state(h) == "pending" then
+      paint_hunk(h, i)
       local row = hunk_row(h)
       if row then
-        local r = mark_info(h.greenMark) or mark_info(h.redMark)
-        h.footMark = vim.api.nvim_buf_set_extmark(S.buf, ns, r[2] - 1, 0, {
-          virt_lines = {
-            {
-              {
-                string.format("cx %d/%d · y apply  n skip  N reject+note  a all  q finish  (u = vim undo)", i, S.total),
-                "Comment",
-              },
-            },
-          },
-        })
         table.insert(qf, {
           bufnr = S.buf,
           lnum = row + 1,
@@ -254,6 +281,7 @@ local function finish()
     table.insert(results, r)
   end
   vim.api.nvim_buf_clear_namespace(S.buf, ns, 0, -1)
+  vim.api.nvim_buf_clear_namespace(S.buf, paint, 0, -1)
   vim.api.nvim_clear_autocmds({ group = aug, buffer = S.buf })
   for _, lhs in ipairs({ "y", "n", "N", "a", "q" }) do
     pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
@@ -355,57 +383,21 @@ local function decide(action)
   end
 end
 
--- decorate paints one hunk's red/green highlights. invalidate=true means the
--- marks report gone when their block is deleted; undo_restore (default)
--- brings them back when vim undo restores the text.
+-- decorate creates the invisible tracking marks for a hunk. They carry no
+-- highlight (paint_hunk draws those); invalidate=true reports the block as
+-- gone when deleted, and undo_restore (default) revives it on vim undo.
 local function decorate(h, oldStart, insStart)
-  if h.word then
-    local p, oe, ne = split_diff(h.old[1], h.new[1])
-    if oe > p then
-      h.redMark = vim.api.nvim_buf_set_extmark(S.buf, ns, oldStart, p, {
-        end_col = oe,
-        hl_group = "DiffDelete",
-        invalidate = true,
-      })
-    else
-      h.redMark = vim.api.nvim_buf_set_extmark(S.buf, ns, oldStart, 0, {
-        end_row = oldStart + 1,
-        hl_group = "DiffDelete",
-        hl_eol = true,
-        invalidate = true,
-      })
-    end
-    if ne > p then
-      h.greenMark = vim.api.nvim_buf_set_extmark(S.buf, ns, insStart, p, {
-        end_col = ne,
-        hl_group = "DiffAdd",
-        invalidate = true,
-      })
-    else
-      h.greenMark = vim.api.nvim_buf_set_extmark(S.buf, ns, insStart, 0, {
-        end_row = insStart + 1,
-        hl_group = "DiffAdd",
-        hl_eol = true,
-        invalidate = true,
-      })
-    end
-  else
-    if h.delN > 0 then
-      h.redMark = vim.api.nvim_buf_set_extmark(S.buf, ns, oldStart, 0, {
-        end_row = oldStart + h.delN,
-        hl_group = "DiffDelete",
-        hl_eol = true,
-        invalidate = true,
-      })
-    end
-    if h.insN > 0 then
-      h.greenMark = vim.api.nvim_buf_set_extmark(S.buf, ns, insStart, 0, {
-        end_row = insStart + h.insN,
-        hl_group = "DiffAdd",
-        hl_eol = true,
-        invalidate = true,
-      })
-    end
+  if h.delN > 0 then
+    h.redMark = vim.api.nvim_buf_set_extmark(S.buf, ns, oldStart, 0, {
+      end_row = oldStart + h.delN,
+      invalidate = true,
+    })
+  end
+  if h.insN > 0 then
+    h.greenMark = vim.api.nvim_buf_set_extmark(S.buf, ns, insStart, 0, {
+      end_row = insStart + h.insN,
+      invalidate = true,
+    })
   end
 end
 
@@ -539,6 +531,6 @@ function CxReview()
   })
 
   local word = S.total == 1 and "edit" or "edits"
-  vim.notify(string.format("cx: %d %s · y/n/N/a/q · u = vim undo · ]q next", S.total, word))
+  vim.notify(string.format("cx: %d %s · y/n/N/a/q · ]q next", S.total, word))
   return 1
 end

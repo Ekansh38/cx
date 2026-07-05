@@ -223,12 +223,23 @@ func deChainEdits(edits []docEdit, docs []*attachedDoc) []docEdit {
 }
 
 // explodeEdits splits every edit into minimal hunks against its target doc.
-// Edits that can't be split (unknown doc, no-op, oversized) pass through,
-// except pure no-ops which are dropped.
-func explodeEdits(edits []docEdit, docs []*attachedDoc) []docEdit {
+// Edits that can't be split (unknown doc, oversized) pass through. No-ops and
+// exact duplicates are dropped; the count of dropped no-ops is returned so
+// the user can be told (a silent drop reads as a lost edit).
+func explodeEdits(edits []docEdit, docs []*attachedDoc) ([]docEdit, int) {
+	noops := 0
+	seen := map[string]bool{}
 	var out []docEdit
+	add := func(e docEdit) {
+		key := e.file + "\x00" + e.search + "\x00" + e.replace
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, e)
+		}
+	}
 	for _, e := range edits {
 		if e.search == e.replace {
+			noops++
 			continue
 		}
 		var doc *attachedDoc
@@ -239,17 +250,17 @@ func explodeEdits(edits []docEdit, docs []*attachedDoc) []docEdit {
 			}
 		}
 		if doc == nil {
-			out = append(out, e)
+			add(e)
 			continue
 		}
 		hunks := splitEditHunks(e.search, e.replace, doc.content)
 		if hunks == nil {
-			out = append(out, e)
+			add(e)
 			continue
 		}
 		for _, h := range hunks {
-			out = append(out, docEdit{file: e.file, search: h[0], replace: h[1]})
+			add(docEdit{file: e.file, search: h[0], replace: h[1]})
 		}
 	}
-	return out
+	return out, noops
 }
