@@ -88,6 +88,8 @@ cx doc notes.md   # same, with the file given directly
 | `/disconnect doc` | Disconnect a doc (picker with ALL when several) |
 | `/memory` | Show current memory file |
 | `/debug` | Show full API payload |
+| `/debug expand` | Verbose mode: full notes, memory + context events |
+| `/debug collapse` | Back to the clean default |
 | `/wipe` | Delete all data (asks confirm) |
 
 ### @file mentions

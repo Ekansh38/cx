@@ -68,7 +68,7 @@ type searchResult struct {
 // ── available /commands ───────────────────────────────────────────────────────
 
 var commands = []string{
-	"/clear", "/connect doc", "/copy", "/copy prompt", "/debug",
+	"/clear", "/connect doc", "/copy", "/copy prompt", "/debug", "/debug expand", "/debug collapse",
 	"/delete", "/disconnect doc", "/doc", "/editor",
 	"/edit", "/forget ", "/grep", "/help", "/img ",
 	"/list", "/memory", "/model ", "/models", "/new",
@@ -147,6 +147,7 @@ type Model struct {
 
 	// system
 	systemPrompt string
+	verbose      bool // /debug expand: show full notes, memory + context events
 
 	// markdown rendering (cached — glamour is expensive)
 	mdRenderer *glamour.TermRenderer
@@ -432,6 +433,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.note != "" {
 			m.injectSystemLine(msg.note)
+		} else if m.verbose {
+			if msg.content != "" {
+				m.injectSystemLine(fmt.Sprintf("memory updated (%d lines)", strings.Count(msg.content, "\n")+1))
+			} else {
+				m.injectSystemLine("memory: no changes")
+			}
 		}
 		return m, nil
 
@@ -807,6 +814,22 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m, nil
 
 	case "/debug":
+		if len(parts) > 1 {
+			switch strings.TrimSpace(parts[1]) {
+			case "expand":
+				m.verbose = true
+				m.mdCache = make(map[*store.Message]string)
+				m.refreshContent()
+				m.injectSystemLine("verbose mode on: full notes, memory and context events (/debug collapse to turn off)")
+				return m, nil
+			case "collapse":
+				m.verbose = false
+				m.mdCache = make(map[*store.Message]string)
+				m.refreshContent()
+				m.injectSystemLine("clean mode on")
+				return m, nil
+			}
+		}
 		msgs := m.buildLLMMessages()
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "── debug: %s ──\n", m.model)
@@ -1208,6 +1231,8 @@ commands  (type / to see completions)
   /forget <query>       ask the memory model to drop matching content
   /clear                clear injected notes (history kept)
   /debug                show full API payload
+  /debug expand         verbose mode: full notes, memory + context events
+  /debug collapse       back to the clean default
   /wipe                 delete ALL conversations and messages (asks confirm)
 
 doc mode  (/doc / /connect doc)
@@ -2438,13 +2463,32 @@ func (m Model) renderMsg(msg *store.Message) string {
 		return label + "\n" + strings.Join(lines, "\n") + "\n"
 
 	case "summary":
+		if !m.verbose {
+			return dimStyle.Render("── context compacted ──") + "\n"
+		}
 		lines := strings.Split(wordWrap(msg.Content, w-4), "\n")
 		for i, l := range lines {
 			lines[i] = dimStyle.Render("  " + l)
 		}
 		return dimStyle.Render("── context ──") + "\n" + strings.Join(lines, "\n") + "\n"
 
-	case "system", "note":
+	case "note":
+		if !m.verbose {
+			// clean mode: one clipped dim line (the full text still goes to
+			// the model; /debug expand shows it)
+			first := msg.Content
+			if i := strings.IndexByte(first, '\n'); i >= 0 {
+				first = first[:i]
+			}
+			return dimStyle.Render("  "+truncate(first, max(w-4, 20))) + "\n"
+		}
+		lines := strings.Split(wordWrap(msg.Content, w-4), "\n")
+		for i, l := range lines {
+			lines[i] = dimStyle.Render("  " + l)
+		}
+		return strings.Join(lines, "\n") + "\n"
+
+	case "system":
 		lines := strings.Split(wordWrap(msg.Content, w-4), "\n")
 		for i, l := range lines {
 			lines[i] = dimStyle.Render("  " + l)
