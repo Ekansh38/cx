@@ -222,6 +222,12 @@ local function render()
             vim.list_extend(virt, wrap_virt(h.replace[k], width, "DiffAdd"))
           end
         end
+        if above then
+          -- virt_lines above line 1 don't render reliably: show the block
+          -- below line 1 with a marker instead
+          above = false
+          table.insert(virt, 1, { { "^ inserts above this line", "Comment" } })
+        end
         table.insert(virt, {
           {
             string.format("cx %d/%d · y apply  n skip  N reject+note  a all  u undo  q quit", i, S.total),

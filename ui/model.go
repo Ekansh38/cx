@@ -352,7 +352,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var reviewCmd tea.Cmd
 		if len(m.docs) > 0 && content != "" {
 			m.reloadDocs() // match edits against the latest on-disk content
-			edits := explodeEdits(deChainEdits(resolveEditFiles(parseDocEdits(content), m.docs), m.docs), m.docs)
+			edits := parseDocEdits(content)
+			edits = resolveEditFiles(edits, m.docs)
+			edits = deChainEdits(edits, m.docs)
+			edits = normalizeEdits(edits, m.docs)
+			edits = explodeEdits(edits, m.docs)
 			if len(edits) > 0 && len(m.extGroups) > 0 {
 				// A review is already on screen in neovim: queue these after it
 				m.extGroups = append(m.extGroups, groupEditsByFile(edits)...)

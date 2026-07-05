@@ -90,3 +90,31 @@ func TestExplodeEditsDropsNoops(t *testing.T) {
 		t.Fatalf("got %d edits; want 2", len(out))
 	}
 }
+
+func TestNormalizeEditsPhantomBlanks(t *testing.T) {
+	doc := "# Title\n\nbody text\n\nlast line"
+	docs := []*attachedDoc{{path: "/d.md", content: doc}}
+
+	edits := []docEdit{
+		// bottom anchor with phantom trailing blank (from the file's newline)
+		{file: "/d.md", search: "last line\n", replace: "last line\n\ntest\ntest"},
+		// top anchor with phantom leading blank
+		{file: "/d.md", search: "\n# Title", replace: "test\n\n# Title"},
+	}
+	out := normalizeEdits(edits, docs)
+	if out[0].search != "last line" {
+		t.Errorf("trailing blank not trimmed: %q", out[0].search)
+	}
+	if out[1].search != "# Title" {
+		t.Errorf("leading blank not trimmed: %q", out[1].search)
+	}
+	// replace text stays intact so the intended blank lines still land
+	if out[0].replace != "last line\n\ntest\ntest" {
+		t.Errorf("replace mutated: %q", out[0].replace)
+	}
+	// matching searches are left alone
+	same := normalizeEdits([]docEdit{{file: "/d.md", search: "body text", replace: "x"}}, docs)
+	if same[0].search != "body text" {
+		t.Errorf("matching search mutated: %q", same[0].search)
+	}
+}

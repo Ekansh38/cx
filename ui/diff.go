@@ -159,6 +159,41 @@ func splitEditHunks(search, replace, docContent string) [][2]string {
 	return out
 }
 
+// normalizeEdits trims phantom leading/trailing empty lines from a SEARCH
+// that doesn't match its document. Models anchoring on the start or end of a
+// file often include a blank line that only exists as the trailing newline,
+// which would otherwise fail to locate. The replace text is left intact, so
+// intended blank lines still land.
+func normalizeEdits(edits []docEdit, docs []*attachedDoc) []docEdit {
+	content := map[string]string{}
+	for _, d := range docs {
+		content[d.path] = d.content
+	}
+	for i := range edits {
+		doc, ok := content[edits[i].file]
+		if !ok || strings.Contains(doc, edits[i].search) {
+			continue
+		}
+		lines := strings.Split(edits[i].search, "\n")
+		for len(lines) > 1 && lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+			if strings.Contains(doc, strings.Join(lines, "\n")) {
+				break
+			}
+		}
+		for len(lines) > 1 && lines[0] == "" {
+			lines = lines[1:]
+			if strings.Contains(doc, strings.Join(lines, "\n")) {
+				break
+			}
+		}
+		if cand := strings.Join(lines, "\n"); strings.Contains(doc, cand) {
+			edits[i].search = cand
+		}
+	}
+	return edits
+}
+
 // deChainEdits re-anchors edits whose SEARCH assumes earlier edits were
 // already applied (models chain edits like that). Substituting prior
 // replacements back out lets every hunk match the real document and be
