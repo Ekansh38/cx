@@ -159,6 +159,34 @@ func splitEditHunks(search, replace, docContent string) [][2]string {
 	return out
 }
 
+// deChainEdits re-anchors edits whose SEARCH assumes earlier edits were
+// already applied (models chain edits like that). Substituting prior
+// replacements back out lets every hunk match the real document and be
+// reviewed independently.
+func deChainEdits(edits []docEdit, docs []*attachedDoc) []docEdit {
+	content := map[string]string{}
+	for _, d := range docs {
+		content[d.path] = d.content
+	}
+	for i := range edits {
+		doc, ok := content[edits[i].file]
+		if !ok || strings.Contains(doc, edits[i].search) {
+			continue
+		}
+		candidate := edits[i].search
+		for j := 0; j < i; j++ {
+			if edits[j].file != edits[i].file || edits[j].replace == "" {
+				continue
+			}
+			candidate = strings.ReplaceAll(candidate, edits[j].replace, edits[j].search)
+		}
+		if candidate != edits[i].search && strings.Contains(doc, candidate) {
+			edits[i].search = candidate
+		}
+	}
+	return edits
+}
+
 // explodeEdits splits every edit into minimal hunks against its target doc.
 // Edits that can't be split (unknown doc, no-op, oversized) pass through,
 // except pure no-ops which are dropped.

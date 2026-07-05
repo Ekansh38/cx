@@ -340,24 +340,36 @@ type editResult struct {
 	Reported bool   `json:"reported"` // already sent to the model via reject-now
 }
 
-// consumeRejectNow returns rejection reasons neovim flagged for an immediate
+// rejectEvent is one N-with-note decision flagged for an immediate revision.
+type rejectEvent struct {
+	Reason  string `json:"reason"`
+	Search  string `json:"search"`
+	Replace string `json:"replace"`
+}
+
+// consumeRejectNow returns rejections neovim flagged for an immediate
 // revision (written the moment the user presses N, mid-review).
-func consumeRejectNow() []string {
+func consumeRejectNow() []rejectEvent {
 	data, err := os.ReadFile(rejectNowPath())
 	if err != nil {
 		return nil
 	}
 	os.Remove(rejectNowPath())
-	var reasons []string
+	var events []rejectEvent
 	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
-		var ev struct {
-			Reason string `json:"reason"`
-		}
+		var ev rejectEvent
 		if json.Unmarshal([]byte(line), &ev) == nil && ev.Reason != "" {
-			reasons = append(reasons, ev.Reason)
+			events = append(events, ev)
 		}
 	}
-	return reasons
+	return events
+}
+
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // startExternalReview hands the edits to neovim. Returns false (caller falls

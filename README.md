@@ -64,7 +64,7 @@ cx doc notes.md   # same, with the file given directly
 | Command | Action |
 |---------|--------|
 | `/help` | Show all keybinds + commands |
-| `/q` | Quit |
+| `/quit` (or `:q`) | Quit |
 | `/new` | New conversation |
 | `/list` | Conversation picker |
 | `/edit` | Edit your last message |
@@ -105,7 +105,7 @@ Connect markdown/text files with `/doc` (fuzzy picker over the current directory
 
 Reference passages as `@L12`, `@L12-30`, or `@## Heading`. Disconnect with `/disconnect doc` — instant with one doc, a fuzzy picker (including an ALL option) with several.
 
-- When the model proposes changes, the review happens **in neovim**. cx line-diffs whatever the model sends and splits it into minimal hunks — even if the model rewrites the whole document, you review a handful of small diffs, not one giant one. Every hunk renders at once (old text red, proposed text green, word-level highlighting for single-line changes) and fills the quickfix list, so `]q` / `[q` jump between edits. With the cursor on a hunk: `y` apply, `n` skip, `N` reject with a note, `a` apply all, `u` undo your last decision, `q` quit. The file saves when the review ends. Pressing `N` fires the revision request **immediately** — the model starts reworking that edit while you keep reviewing the rest, and its new proposal queues up behind the current review.
+- When the model proposes changes, the review happens **in neovim**. cx line-diffs whatever the model sends and splits it into minimal hunks — even if the model rewrites the whole document, you review a handful of small diffs, not one giant one. Every hunk renders at once (old text red, proposed text green, word-level highlighting for single-line changes) and fills the quickfix list, so `]q` / `[q` jump between edits. With the cursor on a hunk: `y` apply, `n` skip, `N` reject with a note, `a` apply all, `u` undo your last decision (brings the diff back), `q` quit. The file saves when the review ends; applied hunks sit in the normal undo tree, so plain `u` after the review undoes them like any other edit. Pressing `N` fires the revision request **immediately** — the model starts reworking that edit while you keep reviewing the rest, and its new proposal queues up behind the current review.
 - cx spawns neovim with an RPC socket (`--listen`), which also powers hot reload: when cx writes the file, your buffer refreshes instantly.
 - Without the neovim bridge (different `$EDITOR`, no socket), the y/n review falls back to cx's chat pane.
 - Connections persist with the conversation; reopening a chat reconnects its docs

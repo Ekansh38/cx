@@ -72,7 +72,7 @@ var commands = []string{
 	"/delete", "/disconnect doc", "/doc", "/editor",
 	"/edit", "/forget ", "/grep", "/help", "/img ",
 	"/list", "/memory", "/model ", "/models", "/new",
-	"/paste", "/q", "/quit", "/r", "/remember ",
+	"/paste", "/quit", "/r", "/remember ",
 	"/rename ", "/retry", "/sel", "/stop", "/wipe",
 }
 
@@ -227,10 +227,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// N fired mid-review: send the revision request right away, while the
 		// user keeps reviewing the remaining hunks.
 		if !m.streaming && m.provider != nil {
-			if reasons := consumeRejectNow(); len(reasons) > 0 {
+			if events := consumeRejectNow(); len(events) > 0 {
 				var sb strings.Builder
-				for _, r := range reasons {
-					fmt.Fprintf(&sb, "I rejected a proposed edit: %q. ", r)
+				for _, ev := range events {
+					fmt.Fprintf(&sb, "I rejected the proposed edit changing %q to %q. Reason: %q. ",
+						clip(ev.Search, 300), clip(ev.Replace, 300), ev.Reason)
 				}
 				sb.WriteString("Revise it now and propose an updated <edit> block. The other proposed edits are still under review; do not resend them.")
 				note := sb.String()
@@ -351,7 +352,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var reviewCmd tea.Cmd
 		if len(m.docs) > 0 && content != "" {
 			m.reloadDocs() // match edits against the latest on-disk content
-			edits := explodeEdits(resolveEditFiles(parseDocEdits(content), m.docs), m.docs)
+			edits := explodeEdits(deChainEdits(resolveEditFiles(parseDocEdits(content), m.docs), m.docs), m.docs)
 			if len(edits) > 0 && len(m.extGroups) > 0 {
 				// A review is already on screen in neovim: queue these after it
 				m.extGroups = append(m.extGroups, groupEditsByFile(edits)...)
@@ -369,6 +370,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.injectSystemLine(fmt.Sprintf("proposed %d %s in neovim", len(edits), word))
 					reviewCmd = extReviewTick(0)
 				} else {
+					m.injectSystemLine("neovim bridge unavailable, review here")
 					m.docEdits = edits
 					m.docEditIdx = 0
 					m.docReview = true
@@ -611,6 +613,14 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 // ── Input handling ────────────────────────────────────────────────────────────
 
 func (m Model) handleInput(input string) (Model, tea.Cmd) {
+	// vim muscle memory
+	if input == ":q" {
+		if m.streaming {
+			m.cancelStream()
+		}
+		return m, tea.Quit
+	}
+
 	if strings.HasPrefix(input, "/") {
 		if isKnownCommand(input) {
 			return m.handleCommand(input)
@@ -765,7 +775,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		return m, nil
 
-	case "/q", "/quit":
+	case "/quit":
 		if m.streaming {
 			m.cancelStream()
 		}
@@ -1161,7 +1171,7 @@ const helpText = `keybindings
 
 commands  (type / to see completions)
   /help                 this help
-  /q / /quit            quit
+  /quit (or :q)         quit
   /new                  new conversation
   /list                 conversation picker
   /grep                 search messages
