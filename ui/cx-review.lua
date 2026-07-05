@@ -414,6 +414,28 @@ function CxChecktime()
   return 1
 end
 
+-- CxSyncDocs: cx calls this before every prompt so unsaved buffer changes in
+-- connected docs reach disk (and therefore the model). Paths in docs.txt.
+function CxSyncDocs()
+  local ok, paths = pcall(vim.fn.readfile, datadir .. "/docs.txt")
+  if not ok then
+    return 0
+  end
+  local n = 0
+  for _, path in ipairs(paths) do
+    if path ~= "" then
+      local buf = vim.fn.bufnr(path)
+      if buf ~= -1 and vim.bo[buf].modified then
+        pcall(vim.api.nvim_buf_call, buf, function()
+          vim.cmd("silent! write")
+        end)
+        n = n + 1
+      end
+    end
+  end
+  return n
+end
+
 function CxReview()
   local ok, raw = pcall(vim.fn.readfile, datadir .. "/edits.json")
   if not ok or #raw == 0 then
@@ -437,6 +459,11 @@ function CxReview()
     end
   end
   vim.cmd("silent! checktime")
+  if vim.bo[buf].modified then
+    pcall(vim.api.nvim_buf_call, buf, function()
+      vim.cmd("silent! write")
+    end)
+  end
 
   S.buf = buf
   S.total = #req.edits

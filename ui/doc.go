@@ -318,6 +318,18 @@ func nvimAlive(sock string) bool {
 	return exec.Command("nvim", "--server", sock, "--remote-expr", "1").Run() == nil
 }
 
+// syncDocs asks the bridged neovim to save any unsaved changes in connected
+// docs, so the disk (what the model sees) always matches the buffer (what the
+// user sees). Undoing past a review's save no longer desyncs the two.
+func syncDocs(paths []string) {
+	sock := nvimSockPath()
+	if _, err := os.Stat(sock); err != nil || len(paths) == 0 {
+		return
+	}
+	os.WriteFile(filepath.Join(config.DataDir(), "docs.txt"), []byte(strings.Join(paths, "\n")+"\n"), 0o644)
+	exec.Command("nvim", "--server", sock, "--remote-expr", "v:lua.CxSyncDocs()").Run()
+}
+
 // pokeChecktime asks the bridged neovim to re-read changed files from disk.
 func pokeChecktime() {
 	sock := nvimSockPath()
