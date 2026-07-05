@@ -753,8 +753,11 @@ var docSkipDirs = map[string]bool{
 	"dist": true, "build": true, ".git": true,
 }
 
-// listDocFiles finds markdown/text files under the current directory.
-func listDocFiles() []string {
+var docExts = map[string]bool{".md": true, ".markdown": true, ".txt": true}
+
+// listFilesByExt finds files with the given extensions under the current
+// directory (capped, skipping hidden/vendor dirs).
+func listFilesByExt(exts map[string]bool) []string {
 	root, err := os.Getwd()
 	if err != nil {
 		return nil
@@ -771,8 +774,7 @@ func listDocFiles() []string {
 			}
 			return nil
 		}
-		switch strings.ToLower(filepath.Ext(p)) {
-		case ".md", ".markdown", ".txt":
+		if exts[strings.ToLower(filepath.Ext(p))] {
 			if rel, err := filepath.Rel(root, p); err == nil {
 				out = append(out, rel)
 			}
@@ -784,6 +786,39 @@ func listDocFiles() []string {
 	})
 	sort.Strings(out)
 	return out
+}
+
+// listDocFiles finds markdown/text files under the current directory.
+func listDocFiles() []string {
+	return listFilesByExt(docExts)
+}
+
+// mentionCandidates fuzzy-matches an @mention query against connectable
+// files under the current directory (docs and images).
+func mentionCandidates(query string) []string {
+	exts := make(map[string]bool, len(docExts)+len(imageExts))
+	for e := range docExts {
+		exts[e] = true
+	}
+	for e := range imageExts {
+		exts[e] = true
+	}
+	files := listFilesByExt(exts)
+	if query == "" {
+		return files
+	}
+	q := strings.ToLower(query)
+	var exact, fuzzy []string
+	for _, f := range files {
+		lf := strings.ToLower(f)
+		switch {
+		case strings.Contains(lf, q):
+			exact = append(exact, f)
+		case fuzzyMatch(q, lf):
+			fuzzy = append(fuzzy, f)
+		}
+	}
+	return append(exact, fuzzy...)
 }
 
 func (m Model) enterDocPicker() (Model, tea.Cmd) {

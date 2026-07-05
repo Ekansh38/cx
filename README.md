@@ -57,7 +57,7 @@ cx doc notes.md   # same, with the file given directly
 | `ctrl+t` | Model switcher |
 | `ctrl+e` | Open `$EDITOR` for long input |
 | `ctrl+u/d` | Scroll half page |
-| `tab` | Autocomplete `/command` |
+| `tab` | Autocomplete `/command` or `@file` |
 
 ### Commands
 
@@ -89,6 +89,15 @@ cx doc notes.md   # same, with the file given directly
 | `/memory` | Show current memory file |
 | `/debug` | Show full API payload |
 | `/wipe` | Delete all data (asks confirm) |
+
+### @file mentions
+
+Mention a file anywhere in a message with `@` — tab fuzzy-completes against md/txt/image files under the current directory, with candidates shown live as you type. On send, text files **connect as docs** and images **attach to the message**. `@` that doesn't resolve to a file (emails, handles) passes through as plain text.
+
+```
+fix the intro of @notes.md and make it match the tone of @draft.md
+what's wrong in @screenshot.png
+```
 
 ### Doc chat
 

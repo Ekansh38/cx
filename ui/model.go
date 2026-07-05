@@ -93,12 +93,12 @@ type Model struct {
 	ready  bool
 
 	// chat view
-	viewport     viewport.Model
-	input        textarea.Model
-	pendingImage string // base64 data URL for next message
-	atBottom     bool
-	autoTitled   bool   // prevent re-triggering auto-title
-	errMsg       string // shown on separator row, cleared on next input
+	viewport      viewport.Model
+	input         textarea.Model
+	pendingImages []string // base64 data URLs for the next message
+	atBottom      bool
+	autoTitled    bool   // prevent re-triggering auto-title
+	errMsg        string // shown on separator row, cleared on next input
 
 	// streaming
 	streaming    bool
@@ -540,7 +540,15 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyTab:
-		matches := completionsFor(m.input.Value())
+		val := m.input.Value()
+		if head, tok, ok := lastMentionToken(val); ok {
+			if cands := mentionCandidates(tok); len(cands) > 0 {
+				m.input.SetValue(head + "@" + cands[0] + " ")
+				m.input.CursorEnd()
+			}
+			return m, nil
+		}
+		matches := completionsFor(val)
 		if len(matches) == 1 {
 			m.input.SetValue(matches[0])
 			m.input.CursorEnd()
@@ -643,6 +651,36 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 			display += fmt.Sprintf("\n[highlighted L%d-%d in %s]", sel.start, sel.end, filepath.Base(sel.file))
 		}
 	}
+	// Resolve @file mentions: text files connect as docs, images attach
+	for _, tok := range strings.Fields(input) {
+		if !strings.HasPrefix(tok, "@") || len(tok) < 2 {
+			continue
+		}
+		path := tok[1:]
+		if strings.HasPrefix(path, "~") {
+			if home, err := os.UserHomeDir(); err == nil {
+				path = home + path[1:]
+			}
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			continue
+		}
+		if fi, err := os.Stat(abs); err != nil || fi.IsDir() {
+			continue // not a file: leave the token as plain text
+		}
+		if _, ok := imageExts[strings.ToLower(filepath.Ext(abs))]; ok {
+			if dataURL, err := encodeImageToDataURL(abs); err == nil {
+				m.pendingImages = append(m.pendingImages, dataURL)
+				m.injectSystemLine("attached " + filepath.Base(abs))
+			}
+			continue
+		}
+		if m.findDoc(abs) == nil {
+			m, _ = m.connectDoc(abs)
+		}
+	}
+
 	// Re-read the docs so the payload reflects external editor saves
 	m.reloadDocs()
 
@@ -948,7 +986,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			m.messages = append(m.messages, &store.Message{Role: "user", Content: display, ImagePath: absPath})
 		}
 		// Stash the data URL for the next buildLLMMessages call
-		m.pendingImage = dataURL
+		m.pendingImages = append(m.pendingImages, dataURL)
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		m.atBottom = true
@@ -1119,7 +1157,7 @@ const helpText = `keybindings
   alt+enter    newline (multiline input)
   esc          clear the input field
   ↑ ↓          scroll one line
-  tab          autocomplete /command
+  tab          autocomplete /command or @file
 
 commands  (type / to see completions)
   /help                 this help
@@ -1135,6 +1173,8 @@ commands  (type / to see completions)
   /img <path> [text]    send an image (png/jpg/gif/webp)
                         (or just paste/drop an image path, auto-detected)
   /paste [text]         send the image on your clipboard
+  @file                 mention a file anywhere in a message: text files
+                        connect as docs, images attach (tab completes)
   /doc [path]           connect a document and open it in your editor
                         (no path = fuzzy picker over the current directory)
   /doc edit             reopen a connected doc in your editor
@@ -1205,8 +1245,8 @@ func (m Model) startStream() (Model, tea.Cmd) {
 	m.streamBuf.Reset()
 
 	msgs := m.buildLLMMessages()
-	m.pendingImage = "" // consumed
-	m.pendingSel = nil  // consumed
+	m.pendingImages = nil // consumed
+	m.pendingSel = nil    // consumed
 	return m, tea.Batch(
 		runStream(ctx, m.provider, m.model, msgs, ch),
 		listenToken(ch),
@@ -1299,8 +1339,8 @@ func (m Model) buildLLMMessages() []llm.Message {
 			}
 		}
 		// Attach pending image to the last user message
-		if m.pendingImage != "" && i == len(m.messages)-1 && msg.Role == "user" {
-			lm.Images = append(lm.Images, m.pendingImage)
+		if len(m.pendingImages) > 0 && i == len(m.messages)-1 && msg.Role == "user" {
+			lm.Images = append(lm.Images, m.pendingImages...)
 		}
 		out = append(out, lm)
 	}
@@ -2097,6 +2137,14 @@ func (m Model) chatView() string {
 
 func (m Model) sepView() string {
 	val := strings.TrimSpace(m.input.Value())
+	if _, tok, ok := lastMentionToken(m.input.Value()); ok {
+		if cands := mentionCandidates(tok); len(cands) > 0 {
+			if len(cands) > 6 {
+				cands = append(cands[:6], "…")
+			}
+			return completionStyle.Render("  @" + strings.Join(cands, "  @"))
+		}
+	}
 	if strings.HasPrefix(val, "/") {
 		matches := completionsFor(val)
 		if len(matches) > 0 {
@@ -2469,6 +2517,20 @@ func wrapParagraph(text string, width int) string {
 		lines = append(lines, cur.String())
 	}
 	return strings.Join(lines, "\n")
+}
+
+// lastMentionToken splits input at an in-progress trailing @mention.
+// Returns everything before the token, the query after @, and ok.
+func lastMentionToken(input string) (string, string, bool) {
+	if input == "" || strings.HasSuffix(input, " ") {
+		return "", "", false
+	}
+	i := strings.LastIndexAny(input, " \n")
+	tok := input[i+1:]
+	if !strings.HasPrefix(tok, "@") {
+		return "", "", false
+	}
+	return input[:i+1], tok[1:], true
 }
 
 // isKnownCommand reports whether input starts with a known /command verb.
