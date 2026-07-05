@@ -71,6 +71,21 @@ type compactionDoneMsg struct {
 	summary string
 }
 
+// pasteRef is a collapsed paste: the input shows a short placeholder, the
+// full text is substituted back in when the message is sent.
+type pasteRef struct {
+	placeholder string
+	text        string
+}
+
+// expandPastes substitutes collapsed paste placeholders with their full text.
+func expandPastes(input string, pastes []pasteRef) string {
+	for _, p := range pastes {
+		input = strings.Replace(input, p.placeholder, p.text, 1)
+	}
+	return input
+}
+
 // ── search result ─────────────────────────────────────────────────────────────
 
 type searchResult struct {
@@ -148,6 +163,7 @@ type Model struct {
 	lastApplied []docEdit     // applied edits of the last finished review, for /undo
 	pendingSel  *docSelection // editor highlight riding along the next message
 	curating    bool          // a memory-curation request is in flight
+	pastes      []pasteRef    // collapsed multi-line pastes awaiting send
 
 	// doc picker state (/doc with no path)
 	docFiles       []string
@@ -180,7 +196,7 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 	ta.Placeholder = "message..."
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
-	ta.MaxHeight = 10
+	ta.MaxHeight = 12
 	ta.SetHeight(1)
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.FocusedStyle.Base = lipgloss.NewStyle()
@@ -576,6 +592,20 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.errMsg = ""
 	}
 
+	// Large pastes collapse to a placeholder (expanded again on send) so the
+	// input stays readable instead of flooding with pasted text
+	if msg.Type == tea.KeyRunes && msg.Paste {
+		text := string(msg.Runes)
+		lines := strings.Count(text, "\n") + 1
+		if lines >= 3 || len(text) > 200 {
+			ph := fmt.Sprintf("[paste #%d, %d lines]", len(m.pastes)+1, lines)
+			m.pastes = append(m.pastes, pasteRef{placeholder: ph, text: text})
+			m.input.InsertString(ph)
+			m.syncInputHeight()
+			return m, nil
+		}
+	}
+
 	switch msg.Type {
 
 	case tea.KeyCtrlC:
@@ -606,12 +636,15 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if m.streaming && !strings.HasPrefix(input, "/") {
 			return m, nil
 		}
+		input = strings.TrimSpace(expandPastes(input, m.pastes))
+		m.pastes = nil
 		m.input.Reset()
 		m.syncInputHeight()
 		m.errMsg = ""
 		return m.handleInput(input)
 
 	case tea.KeyEsc:
+		m.pastes = nil
 		m.input.Reset()
 		m.syncInputHeight()
 		m.errMsg = ""
@@ -658,13 +691,20 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.atBottom = m.viewport.AtBottom()
 		return m, nil
 
-	case tea.KeyUp:
-		m.viewport.LineUp(1)
-		m.atBottom = m.viewport.AtBottom()
-		return m, nil
-
-	case tea.KeyDown:
-		m.viewport.LineDown(1)
+	case tea.KeyUp, tea.KeyDown:
+		// With text in the prompt, arrows move the cursor through it (like
+		// any editor); with an empty prompt they scroll the conversation
+		if m.input.Value() != "" {
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			m.syncInputHeight()
+			return m, cmd
+		}
+		if msg.Type == tea.KeyUp {
+			m.viewport.LineUp(1)
+		} else {
+			m.viewport.LineDown(1)
+		}
 		m.atBottom = m.viewport.AtBottom()
 		return m, nil
 
@@ -1331,7 +1371,9 @@ const helpText = `keybindings
   ctrl+e       open $EDITOR for long input
   ctrl+u / d   scroll half page
   alt+enter    newline (multiline input)
+               big pastes collapse to [paste #N] and expand on send
   esc          clear the input field
+  up/down      move through your prompt (scroll chat when empty)
   ↑ ↓          scroll one line
   tab          autocomplete /command or @file
 
@@ -2390,7 +2432,15 @@ func (m *Model) syncInputHeight() {
 }
 
 func (m Model) inputHeight() int {
-	return min(max(m.input.LineCount(), 1), 10)
+	w := m.input.Width()
+	if w <= 0 {
+		return 1
+	}
+	rows := 0
+	for line := range strings.SplitSeq(m.input.Value(), "\n") {
+		rows += max(1, (lipgloss.Width(line)+w-1)/w)
+	}
+	return min(max(rows, 1), 12)
 }
 
 func (m Model) statusView() string {

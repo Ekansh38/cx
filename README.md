@@ -48,8 +48,9 @@ cx doc notes.md   # same, with the file given directly
 | Key | Action |
 |-----|--------|
 | `enter` | Send message |
-| `alt+enter` | Newline (multiline input) |
+| `alt+enter` | Newline (multiline input; the box grows as you type, and big pastes collapse to `[paste #N, X lines]`) |
 | `esc` | Clear input line |
+| `up/down` | Move through your prompt (scrolls chat when empty) |
 | `ctrl+c` | Cancel stream / quit |
 | `ctrl+l` | Conversation picker |
 | `ctrl+n` | New conversation |
