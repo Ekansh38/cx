@@ -22,3 +22,22 @@ func TestLastMentionToken(t *testing.T) {
 		}
 	}
 }
+
+func TestExpandPastes(t *testing.T) {
+	pastes := []pasteRef{
+		{placeholder: "[paste #1, 3 lines]", text: "a\nb\nc"},
+		{placeholder: "[paste #2, 2 lines]", text: "x\ny"},
+	}
+	in := "look at [paste #1, 3 lines] and [paste #2, 2 lines] please"
+	got := expandPastes(in, pastes)
+	want := "look at a\nb\nc and x\ny please"
+	if got != want {
+		t.Errorf("expandPastes = %q; want %q", got, want)
+	}
+
+	// user deleted part of a placeholder: leave it as literal text
+	got = expandPastes("mangled [paste #1, 3 li", pastes[:1])
+	if got != "mangled [paste #1, 3 li" {
+		t.Errorf("mangled placeholder mutated: %q", got)
+	}
+}
