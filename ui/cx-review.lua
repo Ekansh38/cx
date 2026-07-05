@@ -242,6 +242,8 @@ local function render()
   end
   vim.fn.setqflist({}, " ", { title = "cx edits", items = qf })
   if pending() == 0 then
+    -- applied hunks live in the native undo tree: after finish, plain u
+    -- undoes them like any other edit
     finish()
     return
   end
@@ -330,7 +332,7 @@ local function decide(action)
         h.result = { applied = false }
       end
     end
-    render()
+    finish()
     return
   end
 
@@ -357,7 +359,11 @@ local function decide(action)
         h.result.reported = true
         local f = io.open(datadir .. "/reject-now.jsonl", "a")
         if f then
-          f:write(vim.json.encode({ reason = reason }) .. "\n")
+          f:write(vim.json.encode({
+            reason = reason,
+            search = table.concat(h.search, "\n"),
+            replace = table.concat(h.replace, "\n"),
+          }) .. "\n")
           f:close()
         end
       end
@@ -415,7 +421,8 @@ function CxReview()
 
   render()
   if S.hunks then
-    vim.notify(string.format("cx: %d edits · y/n/N/a/q · ]q next", S.total))
+    local word = S.total == 1 and "edit" or "edits"
+    vim.notify(string.format("cx: %d %s · y/n/N/a/q · ]q next", S.total, word))
   end
   return 1
 end
