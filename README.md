@@ -176,5 +176,6 @@ Switch mid-conversation with `/model <name>` or use the picker with `ctrl+t`.
 ### Data
 
 - Config: `~/.config/cx/config.toml`
+- System prompt: `~/.config/cx/system-prompt.md` (edit freely; delete to reset to the default)
 - Memory: `~/.config/cx/memory.md`
 - Database: `~/.local/share/cx/cx.db` (SQLite)

@@ -100,7 +100,7 @@ func main() {
 	}
 
 	// Build system prompt (default + memory.md)
-	sysPrompt := buildSystemPrompt(config.LoadMemory())
+	sysPrompt := ui.BuildSystemPrompt(config.LoadMemory())
 
 	// Launch TUI
 	m := ui.New(cfg, st, conv, msgs, prov, model, sysPrompt)
@@ -162,12 +162,4 @@ func launchDocSplit(path string) string {
 	args := append([]string{"split-window", "-h", "-b", "-l", "60%"}, ui.EditorArgs(abs)...)
 	exec.Command("tmux", args...).Run()
 	return abs
-}
-
-func buildSystemPrompt(memory string) string {
-	base := "You are a helpful, direct, and thoughtful buddy. No need to sugar-coat, be BLUNT. No need to agree for no reason."
-	if strings.TrimSpace(memory) == "" {
-		return base
-	}
-	return base + "\n\n## Things you know about the user\n" + memory
 }

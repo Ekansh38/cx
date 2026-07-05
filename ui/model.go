@@ -1506,13 +1506,7 @@ func (m Model) contextTokens() int {
 
 // reloadSystemPrompt rebuilds the system prompt from memory.md on disk.
 func (m *Model) reloadSystemPrompt() {
-	mem := config.LoadMemory()
-	base := "You are a helpful, direct, and thoughtful assistant. Be concise unless detail is needed."
-	if strings.TrimSpace(mem) == "" {
-		m.systemPrompt = base
-	} else {
-		m.systemPrompt = base + "\n\n## Things you know about the user\n" + mem
-	}
+	m.systemPrompt = BuildSystemPrompt(config.LoadMemory())
 }
 
 // ── Auto-title ────────────────────────────────────────────────────────────────
