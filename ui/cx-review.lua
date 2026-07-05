@@ -1,10 +1,16 @@
 -- cx-review.lua — in-neovim review UI for cx doc edits.
 -- Written by cx to ~/.local/share/cx/cx-review.lua on editor launch; do not edit.
 --
--- All proposed hunks render at once as inline diffs (old text red, proposed
--- text green virtual lines) and land in the quickfix list. With the cursor on
--- a hunk: y apply, n skip, N reject with a note, a apply all, q quit.
--- Decisions are written to edits-done.json for cx to pick up.
+-- Proposed text is inserted as REAL buffer lines (green) below the lines it
+-- replaces (red), so it scrolls, searches, and edits like normal text. Every
+-- hunk lands in the quickfix list (]q / [q to jump). With the cursor on a
+-- hunk: y keeps the green (applies), n keeps the red (skips), N also asks
+-- why and tells cx immediately, a applies all, u undoes the last decision,
+-- q finishes. Decisions land in edits-done.json for cx.
+--
+-- The buffer temporarily holds both versions during review; the file on disk
+-- is only written when the review finishes. Extmarks track the blocks, so
+-- your own edits during the review don't break anything.
 
 local ns = vim.api.nvim_create_namespace("cx_review")
 local datadir = vim.fn.expand("~/.local/share/cx")
@@ -15,8 +21,6 @@ local function lines_of(s)
   return vim.split(s, "\n", { plain = true })
 end
 
--- locate returns the 0-based start line where lines match, or nil.
--- Falls back to comparing with trailing whitespace stripped.
 local function locate(buf, search_lines)
   local total = vim.api.nvim_buf_line_count(buf)
   local n = #search_lines
@@ -43,8 +47,21 @@ local function locate(buf, search_lines)
   return try(false) or try(true)
 end
 
--- split_diff finds the changed byte span between two single lines.
--- Returns prefix_len, old_end, new_end (bytes). Only safe for pure ASCII.
+local function common_affixes(a, b)
+  local p = 0
+  local maxp = math.min(#a, #b)
+  while p < maxp and a[p + 1] == b[p + 1] do
+    p = p + 1
+  end
+  local sfx = 0
+  while sfx < math.min(#a, #b) - p and a[#a - sfx] == b[#b - sfx] do
+    sfx = sfx + 1
+  end
+  return p, sfx
+end
+
+-- split_diff finds the changed byte span between two single ASCII lines,
+-- snapped to word boundaries.
 local function split_diff(old, new)
   local p = 0
   local maxp = math.min(#old, #new)
@@ -56,6 +73,13 @@ local function split_diff(old, new)
     oe = oe - 1
     ne = ne - 1
   end
+  while p > 0 and old:sub(p, p) ~= " " do
+    p = p - 1
+  end
+  while oe < #old and ne < #new and old:sub(oe + 1, oe + 1) ~= " " do
+    oe = oe + 1
+    ne = ne + 1
+  end
   return p, oe, ne
 end
 
@@ -63,28 +87,29 @@ local function is_ascii(s)
   return not s:find("[\128-\255]")
 end
 
-local function win_width(buf)
-  local win = vim.fn.bufwinid(buf)
-  local w = 80
-  if win ~= -1 then
-    w = vim.api.nvim_win_get_width(win)
+-- mark_range returns the current {startRow, endRowExclusive} of an extmark.
+local function mark_range(id)
+  if not id then
+    return nil
   end
-  return math.max(w - 6, 20)
+  local m = vim.api.nvim_buf_get_extmark_by_id(S.buf, ns, id, { details = true })
+  if not m or #m == 0 then
+    return nil
+  end
+  local endRow = (m[3] and m[3].end_row) or m[1]
+  if endRow <= m[1] then
+    endRow = m[1] + 1 -- single-line (word-diff) marks
+  end
+  return { m[1], endRow }
 end
 
--- wrap_virt breaks one logical line into width-sized virt_lines chunks.
-local function wrap_virt(line, width, hl)
-  local out = {}
-  if line == "" then
-    return { { { " ", hl } } }
+local function del_marks(h)
+  for _, k in ipairs({ "oldMark", "newMark", "footMark", "anchorMark" }) do
+    if h[k] then
+      pcall(vim.api.nvim_buf_del_extmark, S.buf, ns, h[k])
+      h[k] = nil
+    end
   end
-  local i = 1
-  while i <= vim.fn.strchars(line) do
-    local chunk = vim.fn.strcharpart(line, i - 1, width)
-    table.insert(out, { { chunk, hl } })
-    i = i + width
-  end
-  return out
 end
 
 local function pending()
@@ -97,14 +122,28 @@ local function pending()
   return n
 end
 
-local function clear_marks()
-  if S.buf and vim.api.nvim_buf_is_valid(S.buf) then
-    vim.api.nvim_buf_clear_namespace(S.buf, ns, 0, -1)
+local function refresh_qf()
+  local qf = {}
+  for i, h in ipairs(S.hunks) do
+    if not h.done then
+      local r = mark_range(h.oldMark) or mark_range(h.newMark)
+      if r then
+        table.insert(qf, {
+          bufnr = S.buf,
+          lnum = r[1] + 1,
+          text = string.format("cx edit %d/%d", i, S.total),
+        })
+      end
+    end
   end
+  vim.fn.setqflist({}, " ", { title = "cx edits", items = qf })
 end
 
 local function finish()
-  clear_marks()
+  for _, h in ipairs(S.hunks) do
+    del_marks(h)
+  end
+  vim.api.nvim_buf_clear_namespace(S.buf, ns, 0, -1)
   for _, lhs in ipairs({ "y", "n", "N", "a", "u", "q" }) do
     pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
   end
@@ -125,153 +164,80 @@ local function finish()
   S.hunks = nil
 end
 
--- hunk_at returns the undecided hunk covering a 1-based line, or nil.
+-- decorate paints one hunk: red over the old block, green over the (real)
+-- new block, and a control footer.
+local function decorate(h, idx, oldStart, insStart)
+  if h.word then
+    local p, oe, ne = split_diff(h.old[1], h.new[1])
+    if oe > p then
+      h.oldMark = vim.api.nvim_buf_set_extmark(S.buf, ns, oldStart, p, {
+        end_col = oe,
+        hl_group = "DiffDelete",
+      })
+    else
+      h.oldMark = vim.api.nvim_buf_set_extmark(S.buf, ns, oldStart, 0, {
+        end_row = oldStart + 1,
+        hl_group = "DiffDelete",
+        hl_eol = true,
+      })
+    end
+    if ne > p then
+      h.newMark = vim.api.nvim_buf_set_extmark(S.buf, ns, insStart, p, {
+        end_col = ne,
+        hl_group = "DiffAdd",
+      })
+    else
+      h.newMark = vim.api.nvim_buf_set_extmark(S.buf, ns, insStart, 0, {
+        end_row = insStart + 1,
+        hl_group = "DiffAdd",
+        hl_eol = true,
+      })
+    end
+  else
+    if h.delN > 0 then
+      h.oldMark = vim.api.nvim_buf_set_extmark(S.buf, ns, oldStart, 0, {
+        end_row = oldStart + h.delN,
+        hl_group = "DiffDelete",
+        hl_eol = true,
+      })
+    end
+    if h.insN > 0 then
+      h.newMark = vim.api.nvim_buf_set_extmark(S.buf, ns, insStart, 0, {
+        end_row = insStart + h.insN,
+        hl_group = "DiffAdd",
+        hl_eol = true,
+      })
+    end
+  end
+  local footRow = h.insN > 0 and (insStart + h.insN - 1) or (oldStart + h.delN - 1)
+  h.footMark = vim.api.nvim_buf_set_extmark(S.buf, ns, footRow, 0, {
+    virt_lines = {
+      {
+        {
+          string.format("cx %d/%d · y apply  n skip  N reject+note  a all  u undo  q finish", idx, S.total),
+          "Comment",
+        },
+      },
+    },
+  })
+end
+
+-- covers reports whether an extmark's block contains a 1-based line.
+local function covers(id, line)
+  local r = mark_range(id)
+  return r ~= nil and line >= r[1] + 1 and line <= r[2]
+end
+
+-- hunk_at returns the undecided hunk whose red or green block covers a
+-- 1-based line, or nil. (Never ipairs over {oldMark, newMark}: either can
+-- be nil for pure inserts/deletes, which truncates the table.)
 local function hunk_at(line)
   for _, h in ipairs(S.hunks or {}) do
-    if not h.done and h.start and line >= h.start + 1 and line <= h.start + #h.search then
+    if not h.done and (covers(h.oldMark, line) or covers(h.newMark, line)) then
       return h
     end
   end
   return nil
-end
-
--- common_affixes counts identical leading/trailing lines between two lists.
-local function common_affixes(a, b)
-  local p = 0
-  local maxp = math.min(#a, #b)
-  while p < maxp and a[p + 1] == b[p + 1] do
-    p = p + 1
-  end
-  local sfx = 0
-  while sfx < math.min(#a, #b) - p and a[#a - sfx] == b[#b - sfx] do
-    sfx = sfx + 1
-  end
-  return p, sfx
-end
-
--- render draws every undecided hunk, refreshes the quickfix list, and
--- finishes when nothing is left. Context lines stay unpainted (GitHub-style):
--- only truly deleted lines go red, only inserted lines show green.
-local function render()
-  clear_marks()
-  local qf = {}
-  local width = win_width(S.buf)
-  for i, h in ipairs(S.hunks) do
-    if not h.done then
-      local start = locate(S.buf, h.search)
-      if not start then
-        h.done = true
-        h.result = { applied = false, reason = "not found in buffer" }
-      else
-        h.start = start
-        local p, sfx = common_affixes(h.search, h.replace)
-        local delN = #h.search - p - sfx
-        local insN = #h.replace - p - sfx
-        local delStart = start + p -- 0-based first deleted row
-        local virt = {}
-        local anchor, above = delStart + delN - 1, false
-        if delN == 0 then
-          if delStart > 0 then
-            anchor = delStart - 1
-          else
-            anchor, above = 0, true
-          end
-        end
-
-        if delN == 1 and insN == 1
-          and is_ascii(h.search[p + 1]) and is_ascii(h.replace[p + 1]) then
-          -- word-level diff, snapped to word boundaries
-          local oldl, newl = h.search[p + 1], h.replace[p + 1]
-          local wp, oe, ne = split_diff(oldl, newl)
-          while wp > 0 and oldl:sub(wp, wp) ~= " " do
-            wp = wp - 1
-          end
-          while oe < #oldl and ne < #newl and oldl:sub(oe + 1, oe + 1) ~= " " do
-            oe = oe + 1
-            ne = ne + 1
-          end
-          if oe > wp then
-            vim.api.nvim_buf_set_extmark(S.buf, ns, delStart, wp, {
-              end_col = oe,
-              hl_group = "DiffDelete",
-            })
-          end
-          local chunks = {}
-          if wp > 0 then
-            table.insert(chunks, { newl:sub(1, wp), "Comment" })
-          end
-          if ne > wp then
-            table.insert(chunks, { newl:sub(wp + 1, ne), "DiffAdd" })
-          end
-          if ne < #newl then
-            table.insert(chunks, { newl:sub(ne + 1), "Comment" })
-          end
-          if #chunks == 0 then
-            chunks = { { newl, "DiffAdd" } }
-          end
-          virt = { chunks }
-        else
-          if delN > 0 then
-            vim.api.nvim_buf_set_extmark(S.buf, ns, delStart, 0, {
-              end_row = delStart + delN,
-              hl_group = "DiffDelete",
-              hl_eol = true,
-            })
-          end
-          for k = p + 1, #h.replace - sfx do
-            vim.list_extend(virt, wrap_virt(h.replace[k], width, "DiffAdd"))
-          end
-        end
-        if above then
-          -- virt_lines above line 1 don't render reliably: show the block
-          -- below line 1 with a marker instead
-          above = false
-          table.insert(virt, 1, { { "^ inserts above this line", "Comment" } })
-        end
-        table.insert(virt, {
-          {
-            string.format("cx %d/%d · y apply  n skip  N reject+note  a all  u undo  q quit", i, S.total),
-            "Comment",
-          },
-        })
-        vim.api.nvim_buf_set_extmark(S.buf, ns, anchor, 0, {
-          virt_lines = virt,
-          virt_lines_above = above,
-        })
-        table.insert(qf, {
-          bufnr = S.buf,
-          lnum = delStart + 1,
-          text = string.format("cx edit %d/%d", i, S.total),
-        })
-      end
-    end
-  end
-  vim.fn.setqflist({}, " ", { title = "cx edits", items = qf })
-  if pending() == 0 then
-    -- applied hunks live in the native undo tree: after finish, plain u
-    -- undoes them like any other edit
-    finish()
-    return
-  end
-  -- keep the cursor on a hunk so y/n/N always have a target
-  local win = vim.fn.bufwinid(S.buf)
-  if win ~= -1 then
-    local line = vim.api.nvim_win_get_cursor(win)[1]
-    if not hunk_at(line) then
-      for _, h in ipairs(S.hunks) do
-        if not h.done and h.start then
-          vim.api.nvim_win_set_cursor(win, { h.start + 1, 0 })
-          break
-        end
-      end
-    end
-  end
-end
-
-local function apply(h)
-  vim.api.nvim_buf_set_lines(S.buf, h.start, h.start + #h.search, false, h.replace)
-  h.done = true
-  h.result = { applied = true }
 end
 
 local function current_hunk()
@@ -282,27 +248,101 @@ local function current_hunk()
   return hunk_at(vim.api.nvim_win_get_cursor(win)[1])
 end
 
--- undo_last reverts the most recent decision: applied hunks are restored in
--- the buffer, skips/rejects simply become pending again.
+local function goto_next_pending()
+  local win = vim.fn.bufwinid(S.buf)
+  if win == -1 then
+    return
+  end
+  if hunk_at(vim.api.nvim_win_get_cursor(win)[1]) then
+    return
+  end
+  for _, h in ipairs(S.hunks) do
+    if not h.done then
+      local r = mark_range(h.oldMark) or mark_range(h.newMark)
+      if r then
+        vim.api.nvim_win_set_cursor(win, { r[1] + 1, 0 })
+        return
+      end
+    end
+  end
+end
+
+-- settle removes one side of a hunk. keepNew=true keeps the green block
+-- (apply); false keeps the red block (skip/reject).
+local function settle(h, keepNew)
+  local dropRange = keepNew and mark_range(h.oldMark) or mark_range(h.newMark)
+  local keepRange = keepNew and mark_range(h.newMark) or mark_range(h.oldMark)
+  if keepNew and h.delN == 0 then
+    dropRange = nil -- pure insertion: nothing to drop
+  end
+  if not keepNew and h.insN == 0 then
+    dropRange = nil -- pure deletion skipped: nothing to drop
+  end
+  h.removed = nil
+  if dropRange then
+    h.removed = vim.api.nvim_buf_get_lines(S.buf, dropRange[1], dropRange[2], false)
+    vim.api.nvim_buf_set_lines(S.buf, dropRange[1], dropRange[2], false, {})
+  end
+  del_marks(h)
+  -- invisible anchor over (or at) the surviving block, for undo positioning
+  local start, rows = 0, 0
+  if keepRange then
+    start = keepRange[1]
+    rows = keepRange[2] - keepRange[1]
+    if dropRange and dropRange[1] < keepRange[1] then
+      start = start - (dropRange[2] - dropRange[1])
+    end
+  elseif dropRange then
+    start = dropRange[1]
+  end
+  local opts = {}
+  if rows > 0 then
+    opts.end_row = start + rows
+  end
+  h.anchorMark = vim.api.nvim_buf_set_extmark(S.buf, ns, start, 0, opts)
+  h.keptRows = rows
+  h.keepNew = keepNew
+  h.done = true
+end
+
 local function undo_last()
   local h = table.remove(S.hist)
   if not h then
     vim.notify("cx: nothing to undo")
     return
   end
-  if h.result and h.result.applied then
-    local start = locate(S.buf, h.replace)
-    if start then
-      vim.api.nvim_buf_set_lines(S.buf, start, start + #h.replace, false, h.search)
-    end
+  local r = mark_range(h.anchorMark)
+  local base = r and r[1] or 0
+  local at = base
+  if not h.keepNew and h.keptRows > 0 then
+    at = base + h.keptRows -- green reinserts below the kept red block
   end
+  if h.removed then
+    vim.api.nvim_buf_set_lines(S.buf, at, at, false, h.removed)
+  end
+  del_marks(h)
   h.done = false
   h.result = nil
-  render()
-  -- put the cursor back on the undone hunk so y/n/N target it directly
+  local idx = 1
+  for i, hh in ipairs(S.hunks) do
+    if hh == h then
+      idx = i
+    end
+  end
+  decorate(h, idx, base, base + h.delN)
+  refresh_qf()
   local win = vim.fn.bufwinid(S.buf)
-  if win ~= -1 and h.start then
-    vim.api.nvim_win_set_cursor(win, { h.start + 1, 0 })
+  if win ~= -1 then
+    vim.api.nvim_win_set_cursor(win, { base + 1, 0 })
+  end
+end
+
+local function after_decision()
+  refresh_qf()
+  if pending() == 0 then
+    finish()
+  else
+    goto_next_pending()
   end
 end
 
@@ -317,24 +357,18 @@ local function decide(action)
   if action == "all" then
     for _, h in ipairs(S.hunks) do
       if not h.done then
-        local start = locate(S.buf, h.search)
-        if start then
-          h.start = start
-          apply(h)
-        else
-          h.done = true
-          h.result = { applied = false, reason = "not found in buffer" }
-        end
+        settle(h, true)
+        h.result = { applied = true }
         table.insert(S.hist, h)
       end
     end
-    render()
+    finish()
     return
   end
   if action == "quit" then
     for _, h in ipairs(S.hunks) do
       if not h.done then
-        h.done = true
+        settle(h, false)
         h.result = { applied = false }
       end
     end
@@ -348,20 +382,20 @@ local function decide(action)
     return
   end
   if action == "apply" then
-    apply(h)
+    settle(h, true)
+    h.result = { applied = true }
     table.insert(S.hist, h)
-    render()
+    after_decision()
   elseif action == "skip" then
-    h.done = true
+    settle(h, false)
     h.result = { applied = false }
     table.insert(S.hist, h)
-    render()
+    after_decision()
   elseif action == "reject" then
     vim.ui.input({ prompt = "why? " }, function(reason)
-      h.done = true
+      settle(h, false)
       h.result = { applied = false, reason = reason or "" }
       if reason and reason ~= "" then
-        -- tell cx immediately so the revision fires while review continues
         h.result.reported = true
         local f = io.open(datadir .. "/reject-now.jsonl", "a")
         if f then
@@ -374,7 +408,7 @@ local function decide(action)
         end
       end
       table.insert(S.hist, h)
-      render()
+      after_decision()
     end)
   end
 end
@@ -396,7 +430,6 @@ function CxReview()
     return 0
   end
 
-  -- Focus (or open) the target file
   local buf = vim.fn.bufnr(req.file)
   if buf == -1 then
     vim.cmd("edit " .. vim.fn.fnameescape(req.file))
@@ -415,9 +448,59 @@ function CxReview()
   S.total = #req.edits
   S.hunks = {}
   S.hist = {}
+
+  -- locate every hunk against the pristine buffer first
   for _, e in ipairs(req.edits) do
-    table.insert(S.hunks, { search = lines_of(e.search), replace = lines_of(e.replace) })
+    local h = { search = lines_of(e.search), replace = lines_of(e.replace) }
+    h.start = locate(buf, h.search)
+    if not h.start then
+      h.done = true
+      h.result = { applied = false, reason = "not found in buffer" }
+    else
+      local p, sfx = common_affixes(h.search, h.replace)
+      h.p = p
+      h.delN = #h.search - p - sfx
+      h.insN = #h.replace - p - sfx
+      h.old = {}
+      for k = p + 1, #h.search - sfx do
+        table.insert(h.old, h.search[k])
+      end
+      h.new = {}
+      for k = p + 1, #h.replace - sfx do
+        table.insert(h.new, h.replace[k])
+      end
+      h.word = h.delN == 1 and h.insN == 1
+        and is_ascii(h.old[1] or "") and is_ascii(h.new[1] or "")
+    end
+    table.insert(S.hunks, h)
   end
+
+  -- insert the green blocks bottom-up so earlier positions stay valid
+  local order = {}
+  for i, h in ipairs(S.hunks) do
+    if not h.done then
+      table.insert(order, i)
+    end
+  end
+  table.sort(order, function(a, b)
+    return S.hunks[a].start > S.hunks[b].start
+  end)
+  for _, i in ipairs(order) do
+    local h = S.hunks[i]
+    local oldStart = h.start + h.p
+    local insStart = oldStart + h.delN
+    if #h.new > 0 then
+      vim.api.nvim_buf_set_lines(buf, insStart, insStart, false, h.new)
+    end
+    decorate(h, i, oldStart, insStart)
+  end
+
+  refresh_qf()
+  if pending() == 0 then
+    finish()
+    return 1
+  end
+  goto_next_pending()
 
   for lhs, action in pairs({ y = "apply", n = "skip", N = "reject", a = "all", u = "undo", q = "quit" }) do
     vim.keymap.set("n", lhs, function()
@@ -425,10 +508,7 @@ function CxReview()
     end, { buffer = buf, nowait = true })
   end
 
-  render()
-  if S.hunks then
-    local word = S.total == 1 and "edit" or "edits"
-    vim.notify(string.format("cx: %d %s · y/n/N/a/q · ]q next", S.total, word))
-  end
+  local word = S.total == 1 and "edit" or "edits"
+  vim.notify(string.format("cx: %d %s · y/n/N/a/q · ]q next", S.total, word))
   return 1
 end
