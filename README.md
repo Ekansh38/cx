@@ -85,6 +85,7 @@ cx doc notes.md   # same, with the file given directly
 | `/doc edit` | Reopen a connected doc in your editor |
 | `/doc off` | Disconnect (same as `/disconnect doc`) |
 | `/undo` | Revert the edits applied by the last review |
+| `/web [on|off]` | Toggle live web search (OpenRouter models) |
 | `/connect doc [path]` | Connect a doc without opening the editor (no path = last doc) |
 | `/disconnect doc` | Disconnect a doc (picker with ALL when several) |
 | `/memory` | Show current memory file |
@@ -136,6 +137,10 @@ xnoremap <silent> <leader>cs :<C-u>call writefile(
 Workflow: highlight lines in neovim → `<leader>cs` → switch panes → just type your question. cx attaches the highlighted passage to that message (auto-attaching the file with `/doc` if you hadn't). The status bar shows `sel L12-30` while a selection is waiting; `/sel` previews it, `/sel clear` drops it.
 
 Tip: if cx applies edits while the file is open in neovim, set `:set autoread` so neovim picks them up.
+
+### Web search
+
+`/web` toggles live web search: cx routes requests through OpenRouter's web plugin (`model:online`), so answers are grounded in current web results with no extra API keys or setup. The status bar shows `web` while it's on. OpenRouter bills ~$4 per 1k search results on top of normal token costs.
 
 ### Memory
 

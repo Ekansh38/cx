@@ -73,7 +73,7 @@ var commands = []string{
 	"/edit", "/forget ", "/grep", "/help", "/img ",
 	"/list", "/memory", "/model ", "/models", "/new",
 	"/paste", "/quit", "/r", "/remember ",
-	"/rename ", "/retry", "/sel", "/stop", "/undo", "/wipe",
+	"/rename ", "/retry", "/sel", "/stop", "/undo", "/web", "/wipe",
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -149,6 +149,7 @@ type Model struct {
 	// system
 	systemPrompt string
 	verbose      bool // /debug expand: show full notes, memory + context events
+	webSearch    bool // /web: ask OpenRouter to ground responses in web results
 
 	// markdown rendering (cached — glamour is expensive)
 	mdRenderer *glamour.TermRenderer
@@ -262,10 +263,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.reloadDocs() // neovim wrote the file
 
-		// A rejection with a note means "try again, differently": retry once
-		// all groups are reviewed, unless it already fired via reject-now.
+		// Retry once all groups are reviewed when a rejection carried a note
+		// (unless it already fired via reject-now) or an edit failed to
+		// locate, which means the model anchored on stale text.
 		for _, r := range results {
-			if !r.Applied && !r.Reported && r.Reason != "" && r.Reason != "not found in buffer" {
+			if !r.Applied && !r.Reported && r.Reason != "" {
 				m.extRetry = true
 			}
 		}
@@ -292,7 +294,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.extNotes = nil
 		m.extRetry = false
 		if retry {
-			note += ". Revise the rejected edits to address the notes and propose updated <edit> blocks."
+			note += ". Revise the rejected or unlocated edits: re-read the current document content above, anchor on text that exists NOW, and propose updated <edit> blocks."
 		}
 		if saved, err := m.store.AddMessage(m.conv.ID, "note", note); err == nil {
 			m.messages = append(m.messages, saved)
@@ -358,7 +360,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// sequence), or fall back to the in-cx y/n flow without the bridge.
 		var reviewCmd tea.Cmd
 		if len(m.docs) > 0 && content != "" {
-			m.reloadDocs() // match edits against the latest on-disk content
+			syncDocs(m.docPaths())
+			m.reloadDocs() // match edits against the latest buffer content
 			edits := parseDocEdits(content)
 			edits = resolveEditFiles(edits, m.docs)
 			edits = deChainEdits(edits, m.docs)
@@ -710,7 +713,9 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 		}
 	}
 
-	// Re-read the docs so the payload reflects external editor saves
+	// Pull unsaved buffer changes to disk, then re-read: the editor buffer
+	// is the source of truth for what the model sees
+	syncDocs(m.docPaths())
 	m.reloadDocs()
 
 	if saved, err := m.store.AddMessage(m.conv.ID, "user", display); err == nil {
@@ -882,6 +887,30 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.store.UpdateModel(m.conv.ID, newModel)
 		config.SaveLastModel(newModel)
 		m.injectSystemLine("switched to " + newModel)
+		return m, nil
+
+	case "/web":
+		if !strings.Contains(m.model, "/") {
+			m.errMsg = "web search needs an OpenRouter model (e.g. anthropic/claude-sonnet-4-5)"
+			return m, nil
+		}
+		arg := ""
+		if len(parts) > 1 {
+			arg = strings.TrimSpace(parts[1])
+		}
+		switch arg {
+		case "on":
+			m.webSearch = true
+		case "off":
+			m.webSearch = false
+		default:
+			m.webSearch = !m.webSearch
+		}
+		if m.webSearch {
+			m.injectSystemLine("web search on: responses are grounded in live web results")
+		} else {
+			m.injectSystemLine("web search off")
+		}
 		return m, nil
 
 	case "/undo":
@@ -1257,6 +1286,7 @@ commands  (type / to see completions)
   /edit                 edit your last message (loads into input, re-send)
   /editor               open $EDITOR for long input (same as ctrl+e)
   /undo                 revert the edits applied by the last review
+  /web [on|off]         toggle live web search (OpenRouter models)
   /retry / /r           re-send last message (gets a new response)
   /img <path> [text]    send an image (png/jpg/gif/webp)
                         (or just paste/drop an image path, auto-detected)
@@ -1337,8 +1367,12 @@ func (m Model) startStream() (Model, tea.Cmd) {
 	msgs := m.buildLLMMessages()
 	m.pendingImages = nil // consumed
 	m.pendingSel = nil    // consumed
+	model := m.model
+	if m.webSearch && strings.Contains(model, "/") {
+		model += ":online" // OpenRouter web plugin
+	}
 	return m, tea.Batch(
-		runStream(ctx, m.provider, m.model, msgs, ch),
+		runStream(ctx, m.provider, model, msgs, ch),
 		listenToken(ch),
 		streamTick(),
 	)
@@ -2286,6 +2320,9 @@ func (m Model) statusView() string {
 	}
 	if sel := readSelection(); sel != nil && (len(m.docs) == 0 || m.findDoc(sel.file) != nil) {
 		left += fmt.Sprintf("  ·  sel L%d-%d", sel.start, sel.end)
+	}
+	if m.webSearch {
+		left += "  ·  web"
 	}
 
 	tok := m.contextTokens()
