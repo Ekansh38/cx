@@ -73,7 +73,7 @@ var commands = []string{
 	"/edit", "/forget ", "/grep", "/help", "/img ",
 	"/list", "/memory", "/model ", "/models", "/new",
 	"/paste", "/quit", "/r", "/remember ",
-	"/rename ", "/retry", "/sel", "/stop", "/wipe",
+	"/rename ", "/retry", "/sel", "/stop", "/undo", "/wipe",
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -124,14 +124,15 @@ type Model struct {
 	modelLoading bool
 
 	// doc chat state (docs render in the user's editor, not in cx)
-	docs       []*attachedDoc
-	docReview  bool
-	docEdits   []docEdit
-	docEditIdx int
-	extGroups  []editGroup   // per-file edit batches queued for in-editor review
-	extNotes   []string      // per-file review summaries accumulated across groups
-	extRetry   bool          // a rejection carried a note: auto-retry when done
-	pendingSel *docSelection // editor highlight riding along the next message
+	docs        []*attachedDoc
+	docReview   bool
+	docEdits    []docEdit
+	docEditIdx  int
+	extGroups   []editGroup   // per-file edit batches queued for in-editor review
+	extNotes    []string      // per-file review summaries accumulated across groups
+	extRetry    bool          // a rejection carried a note: auto-retry when done
+	lastApplied []docEdit     // applied edits of the last finished review, for /undo
+	pendingSel  *docSelection // editor highlight riding along the next message
 
 	// doc picker state (/doc with no path)
 	docFiles       []string
@@ -270,6 +271,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		g := m.extGroups[0]
 		m.extGroups = m.extGroups[1:]
+		for i, r := range results {
+			if r.Applied && i < len(g.edits) {
+				m.lastApplied = append(m.lastApplied, g.edits[i])
+			}
+		}
 		m.extNotes = append(m.extNotes, summarizeReview(results, filepath.Base(g.file)))
 
 		// More files to review: hand the next group to neovim
@@ -368,6 +374,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.extGroups = groups
 					m.extNotes = nil
 					m.extRetry = false
+					m.lastApplied = nil
 					word := "edits"
 					if len(edits) == 1 {
 						word = "edit"
@@ -379,6 +386,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.docEdits = edits
 					m.docEditIdx = 0
 					m.docReview = true
+					m.lastApplied = nil
 					m.showDocEdit()
 				}
 			}
@@ -876,6 +884,48 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.injectSystemLine("switched to " + newModel)
 		return m, nil
 
+	case "/undo":
+		if len(m.lastApplied) == 0 {
+			m.errMsg = "no applied review edits to undo"
+			return m, nil
+		}
+		m.reloadDocs()
+		reverted, failed := 0, 0
+		for i := len(m.lastApplied) - 1; i >= 0; i-- {
+			e := m.lastApplied[i]
+			doc := m.findDoc(e.file)
+			if doc == nil {
+				failed++
+				continue
+			}
+			newContent, ok := applyEditTo(doc.content, e.replace, e.search)
+			if !ok {
+				failed++
+				continue
+			}
+			if err := os.WriteFile(doc.path, []byte(newContent), 0o644); err != nil {
+				failed++
+				continue
+			}
+			doc.content = newContent
+			reverted++
+		}
+		pokeChecktime()
+		m.lastApplied = nil
+		note := fmt.Sprintf("I reverted %d previously applied edit(s).", reverted)
+		if failed > 0 {
+			note += fmt.Sprintf(" %d could not be reverted (the text changed since).", failed)
+		}
+		if saved, err := m.store.AddMessage(m.conv.ID, "note", note); err == nil {
+			m.messages = append(m.messages, saved)
+		} else {
+			m.messages = append(m.messages, &store.Message{Role: "note", Content: note})
+		}
+		m.refreshContent()
+		m.viewport.GotoBottom()
+		m.atBottom = true
+		return m, nil
+
 	case "/editor":
 		return m.openEditor()
 
@@ -1206,6 +1256,7 @@ commands  (type / to see completions)
   /copy prompt          copy your last message to clipboard
   /edit                 edit your last message (loads into input, re-send)
   /editor               open $EDITOR for long input (same as ctrl+e)
+  /undo                 revert the edits applied by the last review
   /retry / /r           re-send last message (gets a new response)
   /img <path> [text]    send an image (png/jpg/gif/webp)
                         (or just paste/drop an image path, auto-detected)
