@@ -8,6 +8,7 @@ package ui
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -246,6 +247,7 @@ func (m *Model) loadConvDocs() {
 	m.extGroups = nil
 	m.extNotes = nil
 	m.extRetry = false
+	m.lastApplied = nil
 	m.docs = nil
 	paths, err := m.store.GetDocs(m.conv.ID)
 	if err != nil {
@@ -310,12 +312,20 @@ func EditorArgs(docPath string) []string {
 	return []string{editor, docPath}
 }
 
+// rpc runs an nvim remote command with a hard timeout so a busy editor
+// (e.g. one sitting in an input prompt) can never freeze the cx UI.
+func rpc(timeout time.Duration, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "nvim", args...).Run()
+}
+
 // nvimAlive reports whether a cx-spawned neovim is listening on the socket.
 func nvimAlive(sock string) bool {
 	if _, err := os.Stat(sock); err != nil {
 		return false
 	}
-	return exec.Command("nvim", "--server", sock, "--remote-expr", "1").Run() == nil
+	return rpc(time.Second, "--server", sock, "--remote-expr", "1") == nil
 }
 
 // syncDocs asks the bridged neovim to save any unsaved changes in connected
@@ -327,7 +337,7 @@ func syncDocs(paths []string) {
 		return
 	}
 	os.WriteFile(filepath.Join(config.DataDir(), "docs.txt"), []byte(strings.Join(paths, "\n")+"\n"), 0o644)
-	exec.Command("nvim", "--server", sock, "--remote-expr", "v:lua.CxSyncDocs()").Run()
+	rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxSyncDocs()")
 }
 
 // pokeChecktime asks the bridged neovim to re-read changed files from disk.
@@ -336,7 +346,7 @@ func pokeChecktime() {
 	if _, err := os.Stat(sock); err != nil {
 		return
 	}
-	exec.Command("nvim", "--server", sock, "--remote-expr", "v:lua.CxChecktime()").Run()
+	rpc(2*time.Second, "--server", sock, "--remote-expr", "v:lua.CxChecktime()")
 }
 
 // openDocEditor opens a connected document in the editor. Inside tmux it
@@ -391,11 +401,17 @@ type rejectEvent struct {
 // consumeRejectNow returns rejections neovim flagged for an immediate
 // revision (written the moment the user presses N, mid-review).
 func consumeRejectNow() []rejectEvent {
-	data, err := os.ReadFile(rejectNowPath())
+	// Rename before reading: a lua append racing this lands in a fresh file
+	// for the next tick instead of vanishing into an unlinked inode.
+	tmp := rejectNowPath() + ".consuming"
+	if err := os.Rename(rejectNowPath(), tmp); err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(tmp)
+	os.Remove(tmp)
 	if err != nil {
 		return nil
 	}
-	os.Remove(rejectNowPath())
 	var events []rejectEvent
 	for line := range strings.SplitSeq(strings.TrimSpace(string(data)), "\n") {
 		var ev rejectEvent
@@ -411,6 +427,16 @@ func clip(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// abortExternalReview tells a live in-editor review to discard its pending
+// proposal text (used when cx gives up on it or a conversation goes away).
+func abortExternalReview() {
+	sock := nvimSockPath()
+	if _, err := os.Stat(sock); err != nil {
+		return
+	}
+	rpc(2*time.Second, "--server", sock, "--remote-expr", "v:lua.CxAbort()")
 }
 
 // startExternalReview hands the edits to neovim. Returns false (caller falls
@@ -436,11 +462,10 @@ func startExternalReview(docPath string, edits []docEdit) bool {
 		return false
 	}
 	os.Remove(editsDonePath())
-	os.Remove(rejectNowPath())
 	if err := os.WriteFile(editsReqPath(), buf, 0o644); err != nil {
 		return false
 	}
-	return exec.Command("nvim", "--server", sock, "--remote-expr", "v:lua.CxReview()").Run() == nil
+	return rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxReview()") == nil
 }
 
 // readExternalReviewResults returns the decisions once neovim wrote them.
@@ -787,6 +812,22 @@ func parseSelectionText(raw string) *docSelection {
 	return &docSelection{file: file, start: start, end: end, text: strings.Join(lines[2:], "\n")}
 }
 
+// selCache throttles the per-render selection stat for the status bar.
+var selCache struct {
+	sel *docSelection
+	at  time.Time
+}
+
+// cachedSelection is readSelection with a short TTL, for render paths.
+func cachedSelection() *docSelection {
+	if time.Since(selCache.at) < time.Second {
+		return selCache.sel
+	}
+	selCache.sel = readSelection()
+	selCache.at = time.Now()
+	return selCache.sel
+}
+
 // consumeSelection removes the handoff file after the selection has been used.
 func consumeSelection() {
 	os.Remove(selectionPath())
@@ -817,9 +858,14 @@ func listFilesByExt(exts map[string]bool) []string {
 		return nil
 	}
 	var out []string
+	visited := 0
 	filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
+		}
+		visited++
+		if visited > 20000 {
+			return fs.SkipAll // huge tree (launched from $HOME etc): stop walking
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -847,9 +893,17 @@ func listDocFiles() []string {
 	return listFilesByExt(docExts)
 }
 
-// mentionCandidates fuzzy-matches an @mention query against connectable
-// files under the current directory (docs and images).
-func mentionCandidates(query string) []string {
+// mentionFileCache avoids re-walking the filesystem on every render frame
+// while an @mention is being typed. Single-threaded (bubbletea Update/View).
+var mentionFileCache struct {
+	files []string
+	at    time.Time
+}
+
+func mentionFiles() []string {
+	if time.Since(mentionFileCache.at) < 10*time.Second {
+		return mentionFileCache.files
+	}
 	exts := make(map[string]bool, len(docExts)+len(imageExts))
 	for e := range docExts {
 		exts[e] = true
@@ -857,7 +911,15 @@ func mentionCandidates(query string) []string {
 	for e := range imageExts {
 		exts[e] = true
 	}
-	files := listFilesByExt(exts)
+	mentionFileCache.files = listFilesByExt(exts)
+	mentionFileCache.at = time.Now()
+	return mentionFileCache.files
+}
+
+// mentionCandidates fuzzy-matches an @mention query against connectable
+// files under the current directory (docs and images).
+func mentionCandidates(query string) []string {
+	files := mentionFiles()
 	if query == "" {
 		return files
 	}

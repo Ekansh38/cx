@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -186,9 +187,11 @@ func (s *Store) ClearDocs(convID int64) error {
 	return err
 }
 
-// UpdateTitle sets the title of a conversation.
+// UpdateTitle sets the title of a conversation. It deliberately does NOT
+// bump updated_at: auto-titling completes asynchronously and must not make
+// an old conversation the most recent one.
 func (s *Store) UpdateTitle(id int64, title string) error {
-	_, err := s.db.Exec(`UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?`, title, time.Now().Unix(), id)
+	_, err := s.db.Exec(`UPDATE conversations SET title = ? WHERE id = ?`, title, id)
 	return err
 }
 
@@ -248,9 +251,10 @@ func (s *Store) AddMessageWithImage(convID int64, role, content, imagePath strin
 
 // SearchMessages returns messages containing query across all conversations.
 func (s *Store) SearchMessages(query string) ([]*Message, error) {
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(query)
 	rows, err := s.db.Query(
-		`SELECT id, conversation_id, role, content, image_path, created_at FROM messages WHERE content LIKE ? ORDER BY created_at DESC LIMIT 2000`,
-		"%"+query+"%",
+		`SELECT id, conversation_id, role, content, image_path, created_at FROM messages WHERE content LIKE ? ESCAPE '\' ORDER BY created_at DESC LIMIT 2000`,
+		"%"+escaped+"%",
 	)
 	if err != nil {
 		return nil, err

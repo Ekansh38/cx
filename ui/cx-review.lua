@@ -163,12 +163,12 @@ local function paint_hunk(h, idx)
   if h.word and red and green then
     local wp, oe, ne = split_diff(h.old[1], h.new[1])
     if oe > wp then
-      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], wp, { end_col = oe, hl_group = "DiffDelete" })
+      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], wp, { end_col = oe, hl_group = "DiffDelete", strict = false })
     else
       vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], 0, { end_row = red[2], hl_group = "DiffDelete", hl_eol = true })
     end
     if ne > wp then
-      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], wp, { end_col = ne, hl_group = "DiffAdd" })
+      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], wp, { end_col = ne, hl_group = "DiffAdd", strict = false })
     else
       vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], 0, { end_row = green[2], hl_group = "DiffAdd", hl_eol = true })
     end
@@ -289,6 +289,18 @@ local function finish()
   pcall(vim.api.nvim_buf_call, S.buf, function()
     vim.cmd("silent! write")
   end)
+  if vim.bo[S.buf].modified then
+    -- write failed (readonly, permissions): the file does NOT contain the
+    -- accepted edits, so don't tell cx (and the model) that it does
+    for _, r in ipairs(results) do
+      if r.applied then
+        r.applied = false
+        r.reason = "buffer write failed"
+      end
+    end
+    applied = 0
+    vim.notify("cx: buffer write failed, edits not applied to disk")
+  end
   pcall(vim.fn.setqflist, {}, "r")
   vim.fn.writefile({ vim.json.encode({ results = results }) }, datadir .. "/edits-done.json")
   vim.notify(string.format("cx: %d/%d applied", applied, #results))
@@ -401,6 +413,35 @@ local function decorate(h, oldStart, insStart)
   end
 end
 
+-- CxAbort discards a live review: pending proposal (green) blocks are
+-- removed, decorations and keymaps cleaned up, no results written. Called
+-- by cx when it abandons a review, and by CxReview before starting a new
+-- one over a stale session.
+function CxAbort()
+  if not S.hunks or not vim.api.nvim_buf_is_valid(S.buf or -1) then
+    S.hunks = nil
+    return 0
+  end
+  for _, h in ipairs(S.hunks) do
+    if state(h) == "pending" and h.insN and h.insN > 0 then
+      local r = mark_info(h.greenMark)
+      if r then
+        pcall(vim.api.nvim_buf_set_lines, S.buf, r[1], r[2], false, {})
+      end
+    end
+  end
+  vim.api.nvim_buf_clear_namespace(S.buf, ns, 0, -1)
+  vim.api.nvim_buf_clear_namespace(S.buf, paint, 0, -1)
+  pcall(vim.api.nvim_clear_autocmds, { group = aug, buffer = S.buf })
+  for _, lhs in ipairs({ "y", "n", "N", "a", "q" }) do
+    pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
+  end
+  pcall(vim.fn.setqflist, {}, "r")
+  S.hunks = nil
+  vim.notify("cx: review discarded")
+  return 1
+end
+
 function CxChecktime()
   vim.cmd("silent! checktime")
   return 1
@@ -457,6 +498,10 @@ function CxReview()
     end)
   end
 
+  if S.hunks then
+    CxAbort() -- a previous review is still open (abandoned session): discard it
+  end
+
   S.buf = buf
   S.total = #req.edits
   S.hunks = {}
@@ -485,24 +530,32 @@ function CxReview()
     table.insert(S.hunks, h)
   end
 
-  -- insert green blocks bottom-up so earlier positions stay valid
-  local order = {}
-  for i, h in ipairs(S.hunks) do
-    if not h.notfound then
-      table.insert(order, i)
+  -- Insert green blocks bottom-up so earlier positions stay valid. Any
+  -- error mid-mutation would leave orphan proposal text in the buffer, so
+  -- the whole phase is atomic: on failure, discard and report cleanly.
+  local ok = pcall(function()
+    local order = {}
+    for i, h in ipairs(S.hunks) do
+      if not h.notfound then
+        table.insert(order, i)
+      end
     end
-  end
-  table.sort(order, function(a, b)
-    return S.hunks[a].start > S.hunks[b].start
+    table.sort(order, function(a, b)
+      return S.hunks[a].start > S.hunks[b].start
+    end)
+    for _, i in ipairs(order) do
+      local h = S.hunks[i]
+      local oldStart = h.start + h.p
+      local insStart = oldStart + h.delN
+      if #h.new > 0 then
+        vim.api.nvim_buf_set_lines(buf, insStart, insStart, false, h.new)
+      end
+      decorate(h, oldStart, insStart)
+    end
   end)
-  for _, i in ipairs(order) do
-    local h = S.hunks[i]
-    local oldStart = h.start + h.p
-    local insStart = oldStart + h.delN
-    if #h.new > 0 then
-      vim.api.nvim_buf_set_lines(buf, insStart, insStart, false, h.new)
-    end
-    decorate(h, oldStart, insStart)
+  if not ok then
+    pcall(CxAbort)
+    return 0
   end
 
   repaint()

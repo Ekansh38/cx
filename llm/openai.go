@@ -153,6 +153,9 @@ func (p *openAIProvider) Stream(ctx context.Context, model string, msgs []Messag
 
 	var full strings.Builder
 	scanner := bufio.NewScanner(resp.Body)
+	// SSE lines can far exceed the 64KB default (large final chunks, long
+	// error payloads); ErrTooLong would kill the stream mid-response.
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {

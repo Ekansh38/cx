@@ -40,9 +40,18 @@ const (
 
 // ── tea.Msg types ─────────────────────────────────────────────────────────────
 
-type tokenMsg string
-type streamEndMsg struct{ content string }
-type streamErrMsg string
+type tokenMsg struct {
+	gen  int
+	text string
+}
+type streamEndMsg struct {
+	gen     int
+	content string
+}
+type streamErrMsg struct {
+	gen int
+	err string
+}
 type titleUpdatedMsg struct {
 	convID int64
 	title  string
@@ -56,7 +65,11 @@ type memoryUpdatedMsg struct {
 	note    string // display-only confirmation; blank for silent auto-curation
 }
 type memoryErrorMsg string
-type compactionDoneMsg struct{ summary string }
+type compactionDoneMsg struct {
+	gen     int
+	convID  int64
+	summary string
+}
 
 // ── search result ─────────────────────────────────────────────────────────────
 
@@ -102,6 +115,7 @@ type Model struct {
 
 	// streaming
 	streaming    bool
+	streamGen    int // increments on every start/stop: stale async msgs are dropped
 	streamCh     <-chan string
 	cancelStream context.CancelFunc
 	streamBuf    *strings.Builder
@@ -133,6 +147,7 @@ type Model struct {
 	extRetry    bool          // a rejection carried a note: auto-retry when done
 	lastApplied []docEdit     // applied edits of the last finished review, for /undo
 	pendingSel  *docSelection // editor highlight riding along the next message
+	curating    bool          // a memory-curation request is in flight
 
 	// doc picker state (/doc with no path)
 	docFiles       []string
@@ -257,6 +272,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.extGroups = nil
 				m.extNotes = nil
 				m.extRetry = false
+				m.lastApplied = nil
+				abortExternalReview()
 				return m, nil
 			}
 			return m, extReviewTick(msg.n + 1)
@@ -289,6 +306,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.extGroups = nil
 		}
 
+		// Sweep any reject events that raced the final results
+		for _, ev := range consumeRejectNow() {
+			m.extNotes = append(m.extNotes, fmt.Sprintf("edit rejected: %q", ev.Reason))
+			m.extRetry = true
+		}
 		note := strings.Join(m.extNotes, "; ")
 		retry := m.extRetry
 		m.extNotes = nil
@@ -321,22 +343,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tokenMsg:
+		if msg.gen != m.streamGen || !m.streaming {
+			return m, nil // token from a cancelled/superseded stream
+		}
 		// Just accumulate — the 150ms streamTick refreshes the view.
-		m.streamBuf.WriteString(string(msg))
-		return m, listenToken(m.streamCh)
+		m.streamBuf.WriteString(msg.text)
+		return m, listenToken(m.streamCh, msg.gen)
 
 	case streamErrMsg:
-		m.streaming = false
-		m.cancelStream = nil
-		m.streamCh = nil
+		if msg.gen != m.streamGen {
+			return m, nil // error from a cancelled/superseded stream
+		}
+		m.stopStream()
 		m.streamBuf.Reset()
-		m.errMsg = string(msg)
+		m.errMsg = msg.err
 		return m, nil
 
 	case streamEndMsg:
-		// If the stream was cancelled (ctrl+c / /stop), the partial response
-		// was already saved — drop this late completion to avoid duplicates.
-		if !m.streaming {
+		// Cancelled or superseded streams (ctrl+c, /stop, conversation switch,
+		// a newer stream) must not save their content.
+		if msg.gen != m.streamGen || !m.streaming {
 			return m, nil
 		}
 		content := msg.content
@@ -411,8 +437,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.autoTitled = true
 			cmds = append(cmds, m.autoTitleCmd())
 		}
-		if cmd := m.curateMemoryCmd(); cmd != nil {
-			cmds = append(cmds, cmd)
+		if !m.curating {
+			if cmd := m.curateMemoryCmd(); cmd != nil {
+				m.curating = true
+				cmds = append(cmds, cmd)
+			}
 		}
 		if len(cmds) > 0 {
 			return m, tea.Batch(cmds...)
@@ -446,9 +475,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case memoryUpdatedMsg:
+		m.curating = false
 		if msg.content != "" {
-			memory.SaveRaw(config.MemoryPath(), msg.content)
-			m.reloadSystemPrompt()
+			existing, _ := memory.Raw(config.MemoryPath())
+			oldLines := strings.Count(existing, "\n") + 1
+			newLines := strings.Count(msg.content, "\n") + 1
+			// Auto-curation returning a drastically smaller file is almost
+			// always a truncated or garbage reply, not real pruning: one bad
+			// response must not wipe the memory. Explicit /remember//forget
+			// (note set) may shrink freely.
+			if msg.note == "" && oldLines >= 20 && newLines*3 < oldLines {
+				if m.verbose {
+					m.injectSystemLine(fmt.Sprintf("memory update rejected: suspicious shrink (%d lines -> %d)", oldLines, newLines))
+				}
+			} else if err := memory.SaveRaw(config.MemoryPath(), msg.content); err != nil {
+				m.injectSystemLine("memory write failed: " + err.Error())
+			} else {
+				m.reloadSystemPrompt()
+			}
 		}
 		if msg.note != "" {
 			m.injectSystemLine(msg.note)
@@ -462,12 +506,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case memoryErrorMsg:
+		m.curating = false
 		if string(msg) != "" {
 			m.injectSystemLine("memory error: " + string(msg))
 		}
 		return m, nil
 
 	case compactionDoneMsg:
+		// Cancelled, superseded, or for a conversation we've left: drop it.
+		if msg.gen != m.streamGen || msg.convID != m.conv.ID {
+			return m, nil
+		}
 		// Drop transient display-only notes (system lines, diff previews)
 		var persisted []*store.Message
 		for _, pm := range m.messages {
@@ -531,12 +580,9 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 
 	case tea.KeyCtrlC:
 		if m.streaming {
-			m.cancelStream()
-			m.streaming = false
-			m.streamCh = nil
-			m.cancelStream = nil
 			// Keep whatever was streamed so far
 			partial := m.streamBuf.String()
+			m.stopStream()
 			m.streamBuf.Reset()
 			if partial != "" {
 				if saved, err := m.store.AddMessage(m.conv.ID, "assistant", partial+" [cancelled]"); err == nil {
@@ -645,9 +691,7 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	// vim muscle memory
 	if input == ":q" {
-		if m.streaming {
-			m.cancelStream()
-		}
+		m.stopStream()
 		return m, tea.Quit
 	}
 
@@ -691,7 +735,10 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 			display += fmt.Sprintf("\n[highlighted L%d-%d in %s]", sel.start, sel.end, filepath.Base(sel.file))
 		}
 	}
-	// Resolve @file mentions: text files connect as docs, images attach
+	// Resolve @file mentions: text files connect as docs, images attach.
+	// The first image persists on the message (image_path) so it survives
+	// reload; extras ride along for this request only.
+	mentionImage := ""
 	for _, tok := range strings.Fields(input) {
 		if !strings.HasPrefix(tok, "@") || len(tok) < 2 {
 			continue
@@ -711,7 +758,11 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 		}
 		if _, ok := imageExts[strings.ToLower(filepath.Ext(abs))]; ok {
 			if dataURL, err := encodeImageToDataURL(abs); err == nil {
-				m.pendingImages = append(m.pendingImages, dataURL)
+				if mentionImage == "" {
+					mentionImage = abs
+				} else {
+					m.pendingImages = append(m.pendingImages, dataURL)
+				}
 				m.injectSystemLine("attached " + filepath.Base(abs))
 			}
 			continue
@@ -726,10 +777,10 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	syncDocs(m.docPaths())
 	m.reloadDocs()
 
-	if saved, err := m.store.AddMessage(m.conv.ID, "user", display); err == nil {
+	if saved, err := m.store.AddMessageWithImage(m.conv.ID, "user", display, mentionImage); err == nil {
 		m.messages = append(m.messages, saved)
 	} else {
-		m.messages = append(m.messages, &store.Message{Role: "user", Content: display})
+		m.messages = append(m.messages, &store.Message{Role: "user", Content: display, ImagePath: mentionImage})
 	}
 	m.refreshContent()
 	m.viewport.GotoBottom()
@@ -770,9 +821,9 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			m.errMsg = err.Error()
 			return m, nil
 		}
+		m.stopStream()
 		m.conv = conv
 		m.messages = nil
-		m.streaming = false
 		m.streamBuf.Reset()
 		m.autoTitled = false
 		m.state = stateChat
@@ -790,11 +841,8 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			m.errMsg = "not currently streaming"
 			return m, nil
 		}
-		m.cancelStream()
-		m.streaming = false
-		m.streamCh = nil
-		m.cancelStream = nil
 		partial := m.streamBuf.String()
+		m.stopStream()
 		m.streamBuf.Reset()
 		if partial != "" {
 			if saved, err := m.store.AddMessage(m.conv.ID, "assistant", partial+" [stopped]"); err == nil {
@@ -808,9 +856,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m, nil
 
 	case "/quit":
-		if m.streaming {
-			m.cancelStream()
-		}
+		m.stopStream()
 		return m, tea.Quit
 
 	case "/new":
@@ -1065,7 +1111,14 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			m.errMsg = "no message to retry"
 			return m, nil
 		}
-		// Remove any assistant reply after it (keep the user message)
+		// Remove the superseded reply (and anything after) from the DB too,
+		// or it comes back on reload and doubles up in the payload
+		for _, old := range m.messages[lastUserIdx+1:] {
+			if old.ID > 0 {
+				m.store.DeleteMessagesFrom(m.conv.ID, old.ID)
+				break
+			}
+		}
 		m.messages = m.messages[:lastUserIdx+1]
 		m.refreshContent()
 		m.viewport.GotoBottom()
@@ -1096,8 +1149,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			m.errMsg = "invalid path: " + err.Error()
 			return m, nil
 		}
-		dataURL, err := encodeImageToDataURL(absPath)
-		if err != nil {
+		if _, err := encodeImageToDataURL(absPath); err != nil {
 			m.errMsg = "image: " + err.Error()
 			return m, nil
 		}
@@ -1109,8 +1161,8 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		} else {
 			m.messages = append(m.messages, &store.Message{Role: "user", Content: display, ImagePath: absPath})
 		}
-		// Stash the data URL for the next buildLLMMessages call
-		m.pendingImages = append(m.pendingImages, dataURL)
+		// The saved ImagePath is attached by buildLLMMessages; adding the
+		// data URL to pendingImages too would send the image twice.
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		m.atBottom = true
@@ -1365,11 +1417,26 @@ memory
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
 
+// stopStream cancels any in-flight stream or compaction and bumps the
+// generation so late async messages from it are dropped. Safe to call when
+// nothing is running.
+func (m *Model) stopStream() {
+	if m.cancelStream != nil {
+		m.cancelStream()
+	}
+	m.streaming = false
+	m.streamCh = nil
+	m.cancelStream = nil
+	m.streamGen++
+}
+
 func (m Model) startStream() (Model, tea.Cmd) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := make(chan string, 128)
 
 	m.streaming = true
+	m.streamGen++
+	gen := m.streamGen
 	m.cancelStream = cancel
 	m.streamCh = ch
 	m.streamBuf.Reset()
@@ -1382,13 +1449,13 @@ func (m Model) startStream() (Model, tea.Cmd) {
 		model += ":online" // OpenRouter web plugin
 	}
 	return m, tea.Batch(
-		runStream(ctx, m.provider, model, msgs, ch),
-		listenToken(ch),
+		runStream(ctx, m.provider, model, msgs, ch, gen),
+		listenToken(ch, gen),
 		streamTick(),
 	)
 }
 
-func runStream(ctx context.Context, prov llm.Provider, model string, msgs []llm.Message, ch chan<- string) tea.Cmd {
+func runStream(ctx context.Context, prov llm.Provider, model string, msgs []llm.Message, ch chan<- string, gen int) tea.Cmd {
 	return func() tea.Msg {
 		content, err := prov.Stream(ctx, model, msgs, func(token string) {
 			select {
@@ -1398,9 +1465,9 @@ func runStream(ctx context.Context, prov llm.Provider, model string, msgs []llm.
 		})
 		close(ch)
 		if err != nil && ctx.Err() == nil {
-			return streamErrMsg(err.Error())
+			return streamErrMsg{gen: gen, err: err.Error()}
 		}
-		return streamEndMsg{content: content}
+		return streamEndMsg{gen: gen, content: content}
 	}
 }
 
@@ -1410,13 +1477,13 @@ func streamTick() tea.Cmd {
 	})
 }
 
-func listenToken(ch <-chan string) tea.Cmd {
+func listenToken(ch <-chan string, gen int) tea.Cmd {
 	return func() tea.Msg {
 		t, ok := <-ch
 		if !ok {
 			return nil
 		}
-		return tokenMsg(t)
+		return tokenMsg{gen: gen, text: t}
 	}
 }
 
@@ -1629,6 +1696,7 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 	cfg := m.cfg
 	convTitle := m.conv.Title
 	today := time.Now().Format("2006-01-02")
+	mainProv, mainModel := m.provider, m.model
 
 	return func() tea.Msg {
 		memModel := cfg.MemoryModel
@@ -1637,7 +1705,12 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 		}
 		prov, err := llm.ForModel(memModel, cfg)
 		if err != nil {
-			return memoryErrorMsg(err.Error())
+			// No OpenRouter key etc: fall back to the main provider rather
+			// than erroring after every exchange
+			prov, memModel = mainProv, mainModel
+		}
+		if prov == nil {
+			return memoryErrorMsg("no provider for memory curation")
 		}
 
 		existing, _ := memory.Raw(memPath)
@@ -1660,6 +1733,7 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 		result = strings.TrimSpace(result)
 		// Strip code fences if the model wrapped its output anyway
 		result = strings.TrimPrefix(result, "```markdown")
+		result = strings.TrimPrefix(result, "```md")
 		result = strings.TrimPrefix(result, "```")
 		result = strings.TrimSuffix(result, "```")
 		result = strings.TrimSpace(result)
@@ -1706,6 +1780,7 @@ If the instruction has literally no effect (e.g. forget something that isn't the
 func (m Model) editMemoryCmd(instruction, successNote string) tea.Cmd {
 	memPath := config.MemoryPath()
 	cfg := m.cfg
+	mainProv, mainModel := m.provider, m.model
 
 	return func() tea.Msg {
 		memModel := cfg.MemoryModel
@@ -1714,7 +1789,10 @@ func (m Model) editMemoryCmd(instruction, successNote string) tea.Cmd {
 		}
 		prov, err := llm.ForModel(memModel, cfg)
 		if err != nil {
-			return memoryErrorMsg(err.Error())
+			prov, memModel = mainProv, mainModel
+		}
+		if prov == nil {
+			return memoryErrorMsg("no provider for memory edits")
 		}
 
 		existing, _ := memory.Raw(memPath)
@@ -1736,6 +1814,7 @@ func (m Model) editMemoryCmd(instruction, successNote string) tea.Cmd {
 
 		result = strings.TrimSpace(result)
 		result = strings.TrimPrefix(result, "```markdown")
+		result = strings.TrimPrefix(result, "```md")
 		result = strings.TrimPrefix(result, "```")
 		result = strings.TrimSuffix(result, "```")
 		result = strings.TrimSpace(result)
@@ -1788,20 +1867,27 @@ func (m Model) startCompaction() (Model, tea.Cmd) {
 	// Use the MAIN model for compaction (quality matters)
 	prov := m.provider
 	model := m.model
+	convID := m.conv.ID
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	m.cancelStream = cancel // ctrl+c / /stop / switching aborts compaction too
+	m.streamGen++
+	gen := m.streamGen
 
 	return m, tea.Batch(
 		func() tea.Msg {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-
 			prompt := []llm.Message{
 				{Role: "user", Content: fmt.Sprintf(compactionPrompt, oldText)},
 			}
 			result, err := prov.Complete(ctx, model, prompt)
 			if err != nil {
-				return streamErrMsg("compaction failed: " + err.Error())
+				return streamErrMsg{gen: gen, err: "compaction failed: " + err.Error()}
 			}
-			return compactionDoneMsg{summary: "Previous conversation summary:\n" + strings.TrimSpace(result)}
+			return compactionDoneMsg{
+				gen:     gen,
+				convID:  convID,
+				summary: "Previous conversation summary:\n" + strings.TrimSpace(result),
+			}
 		},
 		streamTick(), // animate the spinner while compacting
 	)
@@ -1907,9 +1993,9 @@ func (m Model) switchConversation(id int64) (Model, tea.Cmd) {
 	// The model is globally sticky: switching conversations must NOT flip
 	// back to whatever model that conversation used long ago. The user's
 	// last selection stays until they pick another.
+	m.stopStream()
 	m.conv = conv
 	m.messages = msgs
-	m.streaming = false
 	m.streamBuf.Reset()
 	m.autoTitled = conv.Title != "Untitled"
 	m.state = stateChat
@@ -1929,9 +2015,9 @@ func (m Model) newConversation() (Model, tea.Cmd) {
 		m.state = stateChat
 		return m, nil
 	}
+	m.stopStream()
 	m.conv = conv
 	m.messages = nil
-	m.streaming = false
 	m.streamBuf.Reset()
 	m.autoTitled = false
 	m.state = stateChat
@@ -2322,7 +2408,7 @@ func (m Model) statusView() string {
 	default:
 		left += fmt.Sprintf("  ·  docs: %d", len(m.docs))
 	}
-	if sel := readSelection(); sel != nil && (len(m.docs) == 0 || m.findDoc(sel.file) != nil) {
+	if sel := cachedSelection(); sel != nil && (len(m.docs) == 0 || m.findDoc(sel.file) != nil) {
 		left += fmt.Sprintf("  ·  sel L%d-%d", sel.start, sel.end)
 	}
 	if m.webSearch {
