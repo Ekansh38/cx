@@ -696,6 +696,7 @@ func (m *Model) advanceDocReview() {
 	for _, e := range m.docEdits {
 		if e.applied {
 			applied++
+			m.lastApplied = append(m.lastApplied, e)
 		}
 		if e.failed {
 			failed++

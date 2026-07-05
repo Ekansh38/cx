@@ -84,6 +84,7 @@ cx doc notes.md   # same, with the file given directly
 | `/doc [path]` | Connect a doc and open it in your editor (no path = fuzzy picker) |
 | `/doc edit` | Reopen a connected doc in your editor |
 | `/doc off` | Disconnect (same as `/disconnect doc`) |
+| `/undo` | Revert the edits applied by the last review |
 | `/connect doc [path]` | Connect a doc without opening the editor (no path = last doc) |
 | `/disconnect doc` | Disconnect a doc (picker with ALL when several) |
 | `/memory` | Show current memory file |
@@ -107,7 +108,7 @@ Connect markdown/text files with `/doc` (fuzzy picker over the current directory
 
 Reference passages as `@L12`, `@L12-30`, or `@## Heading`. Disconnect with `/disconnect doc` — instant with one doc, a fuzzy picker (including an ALL option) with several.
 
-- When the model proposes changes, the review happens **in neovim**. cx line-diffs whatever the model sends and splits it into minimal hunks — even if the model rewrites the whole document, you review a handful of small diffs, not one giant one. The proposed text is inserted as **real buffer lines** (green) below the lines it replaces (red) — scroll it, search it, even tweak it before deciding. Every hunk fills the quickfix list, so `]q` / `[q` jump between edits. With the cursor on a hunk: `y` apply, `n` skip, `N` reject with a note, `a` apply all, `u` undo your last decision (brings the diff back), `q` quit. The file saves when the review ends; applied hunks sit in the normal undo tree, so plain `u` after the review undoes them like any other edit. Pressing `N` fires the revision request **immediately** — the model starts reworking that edit while you keep reviewing the rest, and its new proposal queues up behind the current review.
+- When the model proposes changes, the review happens **in neovim**. cx line-diffs whatever the model sends and splits it into minimal hunks — even if the model rewrites the whole document, you review a handful of small diffs, not one giant one. The proposed text is inserted as **real buffer lines** (green) below the lines it replaces (red) — scroll it, search it, even tweak it before deciding. Every hunk fills the quickfix list, so `]q` / `[q` jump between edits. With the cursor on a hunk: `y` apply, `n` skip, `N` reject with a note, `a` apply all, `q` finish. Undo is just **vim's `u`** — decisions are ordinary buffer edits, and undoing one brings the full diff (highlights, footer, quickfix entry) right back. After a review is finished, `/undo` in cx reverts everything it applied. The file saves when the review ends; applied hunks sit in the normal undo tree, so plain `u` after the review undoes them like any other edit. Pressing `N` fires the revision request **immediately** — the model starts reworking that edit while you keep reviewing the rest, and its new proposal queues up behind the current review.
 - cx spawns neovim with an RPC socket (`--listen`), which also powers hot reload: when cx writes the file, your buffer refreshes instantly.
 - Without the neovim bridge (different `$EDITOR`, no socket), the y/n review falls back to cx's chat pane.
 - Connections persist with the conversation; reopening a chat reconnects its docs
