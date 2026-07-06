@@ -161,16 +161,16 @@ local function paint_hunk(h, idx)
   local red = mark_info(h.redMark)
   local green = mark_info(h.greenMark)
   if h.word and red and green then
+    -- GitHub-style: whole lines carry the diff background so it reads as a
+    -- standard line diff, and the changed span gets a stronger overlay
+    vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], 0, { end_row = red[2], hl_group = "DiffDelete", hl_eol = true })
+    vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], 0, { end_row = green[2], hl_group = "DiffAdd", hl_eol = true })
     local wp, oe, ne = split_diff(h.old[1], h.new[1])
     if oe > wp then
-      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], wp, { end_col = oe, hl_group = "DiffDelete", strict = false })
-    else
-      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], 0, { end_row = red[2], hl_group = "DiffDelete", hl_eol = true })
+      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], wp, { end_col = oe, hl_group = "DiffText", priority = 5000, strict = false })
     end
     if ne > wp then
-      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], wp, { end_col = ne, hl_group = "DiffAdd", strict = false })
-    else
-      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], 0, { end_row = green[2], hl_group = "DiffAdd", hl_eol = true })
+      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], wp, { end_col = ne, hl_group = "DiffText", priority = 5000, strict = false })
     end
   else
     if red then

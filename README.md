@@ -70,7 +70,7 @@ cx doc notes.md   # same, with the file given directly
 | `/list` | Conversation picker |
 | `/edit` | Edit your last message |
 | `/stop` | Stop streaming response |
-| `/delete` | Delete current conversation (confirms) |
+| `/delete` | Delete the current conversation |
 | `/grep` | Search all messages |
 | `/copy [n]` | Copy the last n responses (default 1) |
 | `/copy prompt [n]` | Copy your last n messages |
