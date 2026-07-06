@@ -131,3 +131,22 @@ func TestNormalizeEditsPhantomBlanks(t *testing.T) {
 		t.Errorf("matching search mutated: %q", same[0].search)
 	}
 }
+
+func TestPatienceSplitsAroundAnchors(t *testing.T) {
+	// Whole-section rewrite between two stable heading lines: patience runs
+	// tightly bound the change to the actual body (no headings swallowed).
+	before := "# Title\n\n## Section A\n\nalpha\nbeta\ngamma\n\n## Section B\n\nmore stuff\n"
+	after := "# Title\n\n## Section A\n\nALPHA\nBETA\nGAMMA\nDELTA\n\n## Section B\n\nmore stuff\n"
+
+	runs := patienceRuns(strings.Split(before, "\n"), strings.Split(after, "\n"))
+	if len(runs) != 1 {
+		t.Fatalf("got %d runs; want 1", len(runs))
+	}
+	r := runs[0]
+	// The run spans the body only, not the surrounding headings
+	body := strings.Split(before, "\n")[r.aFrom:r.aTo]
+	joined := strings.Join(body, "\n")
+	if strings.Contains(joined, "Section") {
+		t.Errorf("patience run swallowed a heading: %q", joined)
+	}
+}

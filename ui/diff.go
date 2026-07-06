@@ -7,7 +7,10 @@ package ui
 // one small hunk per contiguous change, each with just enough context to be
 // located unambiguously in the document.
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 const (
 	hunkCtx      = 2         // context lines around each change
@@ -113,6 +116,117 @@ func changeRuns(ops []lineOp) []changeRun {
 	return runs
 }
 
+// patiencePair is one anchor line (a[ai] == b[bi]) used to split the diff.
+type patiencePair struct{ ai, bi int }
+
+// patienceRuns returns change runs computed patience-style: lines that appear
+// exactly once on each side act as anchors, and each between-anchor segment
+// becomes one change run. Falls back to LCS when there are no anchors (rare
+// for structured content, common for hashes/generated text).
+func patienceRuns(a, b []string) []changeRun {
+	// Only "interesting" lines are viable anchors: blank/whitespace-only
+	// lines match too often to split anything useful.
+	interesting := func(s string) bool {
+		return strings.TrimSpace(s) != ""
+	}
+	countA := map[string]int{}
+	countB := map[string]int{}
+	for _, s := range a {
+		if interesting(s) {
+			countA[s]++
+		}
+	}
+	for _, s := range b {
+		if interesting(s) {
+			countB[s]++
+		}
+	}
+	posB := map[string]int{}
+	for i, s := range b {
+		if countB[s] == 1 && countA[s] == 1 {
+			posB[s] = i
+		}
+	}
+	var pairs []patiencePair
+	for i, s := range a {
+		if bi, ok := posB[s]; ok {
+			pairs = append(pairs, patiencePair{ai: i, bi: bi})
+		}
+	}
+	if len(pairs) == 0 {
+		return changeRuns(lineDiff(a, b))
+	}
+	// LIS by bi (pairs already sorted by ai)
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].ai < pairs[j].ai })
+	tail := []int{}
+	from := make([]int, len(pairs))
+	for i, p := range pairs {
+		lo, hi := 0, len(tail)
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if pairs[tail[mid]].bi < p.bi {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		if lo == len(tail) {
+			tail = append(tail, i)
+		} else {
+			tail[lo] = i
+		}
+		if lo > 0 {
+			from[i] = tail[lo-1]
+		} else {
+			from[i] = -1
+		}
+	}
+	// reconstruct
+	lis := make([]patiencePair, 0, len(tail))
+	for i := tail[len(tail)-1]; i >= 0; i = from[i] {
+		lis = append([]patiencePair{pairs[i]}, lis...)
+		if from[i] < 0 {
+			break
+		}
+	}
+	// build runs from segments between anchors, then recurse into each
+	// (recursion catches nested patterns like "same header, list changed")
+	var runs []changeRun
+	prevA, prevB := 0, 0
+	emit := func(aFrom, aTo, bFrom, bTo int) {
+		if aFrom >= aTo && bFrom >= bTo {
+			return
+		}
+		if aTo-aFrom > 4 && bTo-bFrom > 4 { // worth recursing
+			for _, r := range patienceRuns(a[aFrom:aTo], b[bFrom:bTo]) {
+				runs = append(runs, changeRun{
+					aFrom: r.aFrom + aFrom, aTo: r.aTo + aFrom,
+					bFrom: r.bFrom + bFrom, bTo: r.bTo + bFrom,
+				})
+			}
+			return
+		}
+		// trim equal prefix/suffix so the run only spans real changes
+		for aFrom < aTo && bFrom < bTo && a[aFrom] == b[bFrom] {
+			aFrom++
+			bFrom++
+		}
+		for aFrom < aTo && bFrom < bTo && a[aTo-1] == b[bTo-1] {
+			aTo--
+			bTo--
+		}
+		if aFrom < aTo || bFrom < bTo {
+			runs = append(runs, changeRun{aFrom: aFrom, aTo: aTo, bFrom: bFrom, bTo: bTo})
+		}
+	}
+	for _, p := range lis {
+		emit(prevA, p.ai, prevB, p.bi)
+		prevA, prevB = p.ai+1, p.bi+1
+	}
+	emit(prevA, len(a), prevB, len(b))
+	return runs
+}
+
 // splitEditHunks explodes one search/replace pair into minimal (search,
 // replace) hunks. docContent is used to grow context until each hunk locates
 // uniquely. Returns nil when splitting isn't possible or worthwhile.
@@ -122,7 +236,7 @@ func splitEditHunks(search, replace, docContent string) [][2]string {
 	if len(a)*len(b) > maxDiffCells {
 		return nil
 	}
-	runs := changeRuns(lineDiff(a, b))
+	runs := patienceRuns(a, b)
 	if len(runs) == 0 {
 		return nil // no actual change
 	}
