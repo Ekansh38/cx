@@ -42,6 +42,11 @@ cx                # chat
 cx doc            # fuzzy-pick a doc, open it in neovim beside cx
 cx doc notes.md   # same, with the file given directly
                   # (opening does NOT connect: /connect doc attaches it)
+cx vim            # fuzzy-pick among the current chat's connected docs (or
+                  # files in the cwd) and open one in neovim with the cx
+                  # bridge — no tmux split. handy when several docs are
+                  # connected to one chat
+cx vim notes.md   # same, with the file given directly
 ```
 
 ### Keybindings
@@ -141,6 +146,12 @@ xnoremap <silent> <leader>cs :<C-u>call writefile(
 Workflow: highlight lines in neovim → `<leader>cs` → switch panes → just type your question. cx attaches the highlighted passage to that message (auto-attaching the file with `/doc` if you hadn't). The status bar shows `sel L12-30` while a selection is waiting; `/sel` previews it, `/sel clear` drops it.
 
 Tip: if cx applies edits while the file is open in neovim, set `:set autoread` so neovim picks them up.
+
+### Web search
+
+### Edit-management tools
+
+While reviewing edits in neovim, the model can also **discard** its own pending edits or **apply them all** through tool calls. If you redirect mid-review ("wait, let's discuss this instead"), the model will typically call `discard_pending_edits`, wipe its proposals from your editor, and answer in prose. Say "yes, apply everything" and it'll call `apply_all_pending_edits`. You can still `y/n/N` yourself — the tools are a hands-free alternative.
 
 ### Web search
 

@@ -7,6 +7,7 @@ package ui
 // blocks, reviewed hunk-by-hunk in neovim (fallback: in-cx y/n review).
 
 import (
+	"sync"
 	"bytes"
 	"context"
 	_ "embed"
@@ -443,6 +444,41 @@ func abortExternalReview() {
 		return
 	}
 	rpc(2*time.Second, "--server", sock, "--remote-expr", "v:lua.CxAbort()")
+}
+
+// applyAllExternalReview tells a live in-editor review to accept every
+// pending hunk (like pressing 'a'). Used by the model's tool call.
+func applyAllExternalReview() {
+	sock := nvimSockPath()
+	if _, err := os.Stat(sock); err != nil {
+		return
+	}
+	rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxApplyAll()")
+}
+
+// reviewSignal carries model-tool decisions (discard, apply-all) from the
+// tool goroutine to the extReviewTick handler in Update.
+var reviewSignal struct {
+	mu      sync.Mutex
+	discard bool
+}
+
+// RequestReviewDiscard marks the current review to be dropped on the next
+// tick and tells neovim to remove any pending proposal text right now.
+func RequestReviewDiscard() {
+	reviewSignal.mu.Lock()
+	reviewSignal.discard = true
+	reviewSignal.mu.Unlock()
+	abortExternalReview()
+}
+
+// consumeReviewDiscard clears the flag and returns whether it was set.
+func consumeReviewDiscard() bool {
+	reviewSignal.mu.Lock()
+	defer reviewSignal.mu.Unlock()
+	d := reviewSignal.discard
+	reviewSignal.discard = false
+	return d
 }
 
 // isKnownEditSearch reports whether the given SEARCH text belongs to any
