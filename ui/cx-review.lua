@@ -19,6 +19,35 @@ local datadir = vim.fn.expand("~/.local/share/cx")
 
 local S = { hunks = nil, buf = nil, total = 0 }
 
+-- blend an 0xRRGGBB color toward a target by factor f (0..1)
+local function blend(c, target, f)
+  local r = math.floor(c / 65536) % 256
+  local g = math.floor(c / 256) % 256
+  local b = c % 256
+  local tr = math.floor(target / 65536) % 256
+  local tg = math.floor(target / 256) % 256
+  local tb = target % 256
+  r = math.floor(r + (tr - r) * f)
+  g = math.floor(g + (tg - g) * f)
+  b = math.floor(b + (tb - b) * f)
+  return r * 65536 + g * 256 + b
+end
+
+-- setup_word_hl derives word-emphasis groups from the colorscheme's own
+-- diff colors: the changed span is a stronger shade of the SAME hue
+-- (git-delta / GitHub convention), never a different color like DiffText.
+local function setup_word_hl()
+  local target = vim.o.background == "dark" and 0xFFFFFF or 0x000000
+  for base, name in pairs({ DiffDelete = "CxWordDel", DiffAdd = "CxWordAdd" }) do
+    local h = vim.api.nvim_get_hl(0, { name = base, link = false })
+    if h.bg then
+      vim.api.nvim_set_hl(0, name, { bg = blend(h.bg, target, 0.22), fg = h.fg, bold = true })
+    else
+      vim.api.nvim_set_hl(0, name, { underline = true, bold = true })
+    end
+  end
+end
+
 local function lines_of(s)
   return vim.split(s, "\n", { plain = true })
 end
@@ -167,10 +196,10 @@ local function paint_hunk(h, idx)
     vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], 0, { end_row = green[2], hl_group = "DiffAdd", hl_eol = true })
     local wp, oe, ne = split_diff(h.old[1], h.new[1])
     if oe > wp then
-      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], wp, { end_col = oe, hl_group = "DiffText", priority = 5000, strict = false })
+      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], wp, { end_col = oe, hl_group = "CxWordDel", priority = 5000, strict = false })
     end
     if ne > wp then
-      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], wp, { end_col = ne, hl_group = "DiffText", priority = 5000, strict = false })
+      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], wp, { end_col = ne, hl_group = "CxWordAdd", priority = 5000, strict = false })
     end
   else
     if red then
@@ -464,6 +493,11 @@ function CxSyncDocs()
   for _, path in ipairs(paths) do
     if path ~= "" then
       local buf = vim.fn.bufnr(path)
+      -- never save the buffer under active review: it holds BOTH the old
+      -- and proposed lines, which must not leak to disk
+      if S.hunks and buf == S.buf then
+        buf = -1
+      end
       if buf ~= -1 and vim.bo[buf].modified then
         pcall(vim.api.nvim_buf_call, buf, function()
           vim.cmd("silent! write")
@@ -507,6 +541,8 @@ function CxReview()
   if S.hunks then
     CxAbort() -- a previous review is still open (abandoned session): discard it
   end
+
+  setup_word_hl()
 
   S.buf = buf
   S.total = #req.edits
