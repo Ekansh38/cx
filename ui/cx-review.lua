@@ -224,19 +224,41 @@ local function paint_hunk(h, idx)
   end
 end
 
--- repaint redraws all decorations and the quickfix list from derived state.
--- Runs after decisions AND on TextChanged, so vim-native undo brings the
--- full review UX back; decided hunks lose their coloring instantly.
+-- repaint highlights ONLY the hunk under the cursor (10+ concurrent diffs
+-- painted at once was overwhelming). Every pending hunk still shows a
+-- tiny sign-column marker (▸) and lives in the quickfix list, so ]q/[q
+-- navigation and progress remain visible; the full red/green paint plus
+-- footer only appear on the current one.
 local function repaint()
   if not S.hunks then
     return
   end
   vim.api.nvim_buf_clear_namespace(S.buf, paint, 0, -1)
   local qf = {}
+  local win = vim.fn.bufwinid(S.buf)
+  local cursorLine = -1
+  if win ~= -1 then
+    cursorLine = vim.api.nvim_win_get_cursor(win)[1]
+  end
   for i, h in ipairs(S.hunks) do
     if state(h) == "pending" then
-      paint_hunk(h, i)
       local row = hunk_row(h)
+      local within = false
+      for _, id in ipairs({ h.redMark, h.greenMark }) do
+        local r = mark_info(id)
+        if r and cursorLine >= r[1] + 1 and cursorLine <= r[2] then
+          within = true
+        end
+      end
+      if within then
+        paint_hunk(h, i)
+      elseif row then
+        -- subtle marker so the user still knows a hunk is here
+        vim.api.nvim_buf_set_extmark(S.buf, paint, row, 0, {
+          sign_text = "▸",
+          sign_hl_group = "Comment",
+        })
+      end
       if row then
         table.insert(qf, {
           bufnr = S.buf,
@@ -718,6 +740,17 @@ function CxReview()
 
   -- vim-native undo/redo (or any edit) repaints the review state
   vim.api.nvim_clear_autocmds({ group = aug, buffer = buf })
+  -- Cursor movement repaints so only the hunk under the cursor is
+  -- highlighted; the rest carry a subtle ▸ marker only.
+  vim.api.nvim_create_autocmd({ "CursorMoved" }, {
+    group = aug,
+    buffer = buf,
+    callback = function()
+      if S.hunks then
+        repaint()
+      end
+    end,
+  })
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
     group = aug,
     buffer = buf,
