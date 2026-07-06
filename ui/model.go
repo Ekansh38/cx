@@ -1830,7 +1830,8 @@ Rules:
 
 The "## Recent conversations" section is an episodic log so future sessions know what was already discussed:
 - Exactly one bullet per conversation: "- {date} · {title}: {one sentence: what was discussed, decided, or concluded}"
-- The current conversation is "%s" (today: %s). If it already has a bullet, UPDATE that bullet to reflect the conversation so far; otherwise add one at the top of the section. If the title is "Untitled", write a short descriptive title yourself — and if the newest bullet from today clearly describes this same discussion, update it rather than adding a duplicate.
+- The current conversation is "%s" (today: %s). If it already has a bullet, UPDATE that bullet to reflect the conversation so far; otherwise add one at the top of the section. If the title is "Untitled", write a short descriptive title yourself.
+- NEVER keep two bullets describing the same discussion: conversations get forked and renamed, so if an existing bullet clearly covers this same topic and decisions, merge into ONE updated bullet regardless of title.
 - Newest first. Keep at most 15 bullets; drop the oldest beyond that.
 - Before dropping an old bullet, promote anything still durable into the appropriate section above.
 
