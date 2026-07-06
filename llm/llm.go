@@ -62,15 +62,35 @@ func FetchOpenRouterModels(apiKey string) ([]ModelInfo, error) {
 
 // Message is a single chat message.
 type Message struct {
-	Role    string
-	Content string
-	Images  []string // base64 data URLs (e.g. "data:image/png;base64,...")
+	Role       string
+	Content    string
+	Images     []string   // image data URLs or remote https URLs
+	Files      []string   // document data URLs (e.g. "data:application/pdf;base64,...")
+	ToolCalls  []ToolCall // set on assistant messages that requested tools
+	ToolCallID string     // set on role "tool" result messages
+}
+
+// ToolCall is a function invocation requested by the model.
+type ToolCall struct {
+	ID   string
+	Name string
+	Args string // raw JSON arguments
+}
+
+// Tool describes a function the model may call.
+type Tool struct {
+	Name        string
+	Description string
+	Parameters  any // JSON schema
 }
 
 // Provider streams responses from an LLM.
 type Provider interface {
 	// Stream calls onToken for each token and returns the full content when done.
 	Stream(ctx context.Context, model string, msgs []Message, onToken func(string)) (string, error)
+	// StreamTools is Stream with function-calling: it additionally returns any
+	// tool calls the model requested instead of (or alongside) content.
+	StreamTools(ctx context.Context, model string, msgs []Message, tools []Tool, onToken func(string)) (string, []ToolCall, error)
 	// Complete is a non-streaming one-shot call. Used for background tasks (memory, compaction).
 	Complete(ctx context.Context, model string, msgs []Message) (string, error)
 }

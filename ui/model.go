@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -96,7 +97,7 @@ type searchResult struct {
 // ── available /commands ───────────────────────────────────────────────────────
 
 var commands = []string{
-	"/clear", "/connect doc", "/copy", "/copy prompt", "/debug", "/debug expand", "/debug collapse",
+	"/clear", "/connect doc", "/copy", "/copy response ", "/copy prompt ", "/copy all ", "/debug", "/debug expand", "/debug collapse",
 	"/delete", "/disconnect doc", "/doc", "/editor",
 	"/edit", "/forget ", "/grep", "/help", "/img ",
 	"/list", "/memory", "/model ", "/models", "/new",
@@ -123,7 +124,8 @@ type Model struct {
 	// chat view
 	viewport      viewport.Model
 	input         textarea.Model
-	pendingImages []string // base64 data URLs for the next message
+	pendingImages []string // image data URLs / remote URLs for the next message
+	pendingFiles  []string // pdf data URLs for the next message
 	atBottom      bool
 	autoTitled    bool   // prevent re-triggering auto-title
 	errMsg        string // shown on separator row, cleared on next input
@@ -180,7 +182,7 @@ type Model struct {
 	// system
 	systemPrompt string
 	verbose      bool // /debug expand: show full notes, memory + context events
-	webSearch    bool // /web: ask OpenRouter to ground responses in web results
+	webSearch    bool // web tools offered to the model (default on; /web toggles)
 
 	// markdown rendering (cached — glamour is expensive)
 	mdRenderer *glamour.TermRenderer
@@ -218,6 +220,7 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 		state:        stateChat,
 		streamBuf:    &strings.Builder{},
 		mdCache:      make(map[*store.Message]string),
+		webSearch:    true,
 	}
 	// Restore connected docs from a previous session
 	m.loadConvDocs()
@@ -628,7 +631,14 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case tea.KeyEnter:
-		// Alt+Enter / Shift+Enter handled by textarea (inserts newline)
+		if msg.Alt {
+			// alt+enter inserts a newline: the textarea's own binding handles
+			// it, but only if this case doesn't swallow the key first
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			m.syncInputHeight()
+			return m, cmd
+		}
 		input := strings.TrimSpace(m.input.Value())
 		if input == "" {
 			return m, nil
@@ -775,15 +785,23 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 			display += fmt.Sprintf("\n[highlighted L%d-%d in %s]", sel.start, sel.end, filepath.Base(sel.file))
 		}
 	}
-	// Resolve @file mentions: text files connect as docs, images attach.
-	// The first image persists on the message (image_path) so it survives
-	// reload; extras ride along for this request only.
+	// Resolve @file mentions: text files connect as docs, images and PDFs
+	// attach (the first local one persists on the message via image_path;
+	// extras and remote URLs ride along for this request only).
 	mentionImage := ""
 	for _, tok := range strings.Fields(input) {
 		if !strings.HasPrefix(tok, "@") || len(tok) < 2 {
 			continue
 		}
 		path := tok[1:]
+		// Linked image: pass the URL straight through; providers fetch it
+		if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+			if _, ok := imageExts[strings.ToLower(filepath.Ext(path))]; ok {
+				m.pendingImages = append(m.pendingImages, path)
+				m.injectSystemLine("attached " + path)
+			}
+			continue
+		}
 		if strings.HasPrefix(path, "~") {
 			if home, err := os.UserHomeDir(); err == nil {
 				path = home + path[1:]
@@ -796,15 +814,23 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 		if fi, err := os.Stat(abs); err != nil || fi.IsDir() {
 			continue // not a file: leave the token as plain text
 		}
-		if _, ok := imageExts[strings.ToLower(filepath.Ext(abs))]; ok {
-			if dataURL, err := encodeImageToDataURL(abs); err == nil {
-				if mentionImage == "" {
-					mentionImage = abs
-				} else {
-					m.pendingImages = append(m.pendingImages, dataURL)
-				}
-				m.injectSystemLine("attached " + filepath.Base(abs))
+		ext := strings.ToLower(filepath.Ext(abs))
+		_, isImage := imageExts[ext]
+		if isImage || ext == ".pdf" {
+			if _, err := encodeAttachment(abs); err != nil {
+				m.errMsg = "attach: " + err.Error()
+				continue
 			}
+			if mentionImage == "" {
+				mentionImage = abs // persisted on the message
+			} else if dataURL, err := encodeAttachment(abs); err == nil {
+				if isImage {
+					m.pendingImages = append(m.pendingImages, dataURL)
+				} else {
+					m.pendingFiles = append(m.pendingFiles, dataURL)
+				}
+			}
+			m.injectSystemLine("attached " + filepath.Base(abs))
 			continue
 		}
 		if m.findDoc(abs) == nil {
@@ -1001,9 +1027,9 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			m.webSearch = !m.webSearch
 		}
 		if m.webSearch {
-			m.injectSystemLine("web search on: responses are grounded in live web results")
+			m.injectSystemLine("web tools on: the model can search and read pages when it needs to")
 		} else {
-			m.injectSystemLine("web search off")
+			m.injectSystemLine("web tools off")
 		}
 		return m, nil
 
@@ -1057,38 +1083,38 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m, nil
 
 	case "/copy":
-		// /copy = last assistant message, /copy prompt = your last message
-		role, what := "assistant", "response"
-		if len(parts) > 1 && strings.TrimSpace(parts[1]) == "prompt" {
-			role, what = "user", "prompt"
-		}
-		var last string
-		for i := len(m.messages) - 1; i >= 0; i-- {
-			if m.messages[i].Role == role {
-				last = m.messages[i].Content
-				break
-			}
-		}
-		if role == "user" {
-			// Strip display-only placeholder lines
-			var lines []string
-			for line := range strings.SplitSeq(last, "\n") {
-				if !strings.HasPrefix(line, "[image: ") && !strings.HasPrefix(line, "[highlighted ") {
-					lines = append(lines, line)
+		what, n := "response", 1
+		if len(parts) > 1 {
+			args := strings.Fields(parts[1])
+			if len(args) > 0 {
+				switch args[0] {
+				case "response", "prompt", "all":
+					what = args[0]
+				default:
+					m.errMsg = "usage: /copy [response|prompt|all] [n]"
+					return m, nil
 				}
 			}
-			last = strings.TrimSpace(strings.Join(lines, "\n"))
+			if len(args) > 1 {
+				if v, err := strconv.Atoi(args[1]); err == nil && v > 0 {
+					n = v
+				} else {
+					m.errMsg = "usage: /copy [response|prompt|all] [n]"
+					return m, nil
+				}
+			}
 		}
-		if last == "" {
-			m.errMsg = "no " + what + " to copy"
+		text := m.collectCopy(what, n)
+		if text == "" {
+			m.errMsg = "nothing to copy"
 			return m, nil
 		}
-		if err := copyToClipboard(last); err != nil {
+		if err := copyToClipboard(text); err != nil {
 			m.errMsg = "copy failed: " + err.Error()
 			return m, nil
 		}
 		m.errMsg = ""
-		m.injectSystemLine("copied " + what + " to clipboard")
+		m.injectSystemLine(fmt.Sprintf("copied %s (%d) to clipboard", what, n))
 		return m, nil
 
 	case "/delete":
@@ -1353,6 +1379,65 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 	}
 }
 
+// stripPlaceholders removes display-only [image:]/[highlighted] lines.
+func stripPlaceholders(content string) string {
+	var lines []string
+	for line := range strings.SplitSeq(content, "\n") {
+		if !strings.HasPrefix(line, "[image: ") && !strings.HasPrefix(line, "[highlighted ") {
+			lines = append(lines, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+// collectCopy gathers the last n responses, prompts, or prompt/response
+// pairs, oldest first. Returns fewer when the conversation is shorter.
+func (m Model) collectCopy(what string, n int) string {
+	var out []string
+	take := func(role string, format func(string) string) {
+		count := 0
+		for i := len(m.messages) - 1; i >= 0 && count < n; i-- {
+			if m.messages[i].Role != role {
+				continue
+			}
+			text := m.messages[i].Content
+			if role == "user" {
+				text = stripPlaceholders(text)
+			}
+			if role == "assistant" {
+				text = stripEditBlocks(text)
+			}
+			out = append([]string{format(text)}, out...)
+			count++
+		}
+	}
+	switch what {
+	case "response":
+		take("assistant", func(t string) string { return t })
+	case "prompt":
+		take("user", func(t string) string { return t })
+	case "all":
+		// walk backwards collecting assistant+user pairs
+		pairs := 0
+		var chunk []string
+		for i := len(m.messages) - 1; i >= 0 && pairs < n; i-- {
+			switch m.messages[i].Role {
+			case "assistant":
+				chunk = append([]string{"cx: " + stripEditBlocks(m.messages[i].Content)}, chunk...)
+			case "user":
+				chunk = append([]string{"you: " + stripPlaceholders(m.messages[i].Content)}, chunk...)
+				out = append(chunk, out...)
+				chunk = nil
+				pairs++
+			}
+		}
+		if len(chunk) > 0 && pairs < n {
+			out = append(chunk, out...)
+		}
+	}
+	return strings.Join(out, "\n\n")
+}
+
 // injectSystemLine adds a display-only note into the viewport (not persisted).
 func (m *Model) injectSystemLine(text string) {
 	// ID=0 marks display-only messages
@@ -1383,20 +1468,23 @@ commands  (type / to see completions)
   /new                  new conversation
   /list                 conversation picker
   /grep                 search messages
-  /copy                 copy last assistant message to clipboard
-  /copy prompt          copy your last message to clipboard
+  /copy [n]             copy the last n responses (default 1)
+  /copy prompt [n]      copy your last n messages
+  /copy all [n]         copy the last n prompt/response pairs
+                        (returns what exists if the chat is shorter)
   /edit                 edit your last message (loads into input, re-send)
   /editor               open $EDITOR for long input (same as ctrl+e)
   /undo                 revert the edits applied by the last review
-  /web [on|off]         force live web search on or off for every message
-                        (phrases like "search for", "latest", "news", or a
-                        URL trigger it automatically per message)
+  /web [on|off]         web tools (on by default): the model searches the
+                        live web and reads pages whenever it decides to,
+                        showing "searching the web: ..." as it works
   /retry / /r           re-send last message (gets a new response)
   /img <path> [text]    send an image (png/jpg/gif/webp)
                         (or just paste/drop an image path, auto-detected)
   /paste [text]         send the image on your clipboard
   @file                 mention a file anywhere in a message: text files
-                        connect as docs, images attach (tab completes)
+                        connect as docs, images and PDFs attach, and image
+                        URLs (@https://...png) attach too (tab completes)
   /doc [path]           connect a document and open it in your editor
                         (no path = fuzzy picker over the current directory)
   /doc edit             reopen a connected doc in your editor
@@ -1485,31 +1573,52 @@ func (m Model) startStream() (Model, tea.Cmd) {
 
 	msgs := m.buildLLMMessages()
 	m.pendingImages = nil // consumed
+	m.pendingFiles = nil  // consumed
 	m.pendingSel = nil    // consumed
-	model := m.model
-	if strings.Contains(model, "/") && (m.webSearch || wantsWeb(m.messages)) {
-		model += ":online" // OpenRouter web plugin
+	var tools []llm.Tool
+	if m.webSearch && strings.Contains(m.model, "/") {
+		tools = webTools()
 	}
 	return m, tea.Batch(
-		runStream(ctx, m.provider, model, msgs, ch, gen),
+		runAgent(ctx, m.provider, m.model, msgs, tools, m.cfg, ch, gen),
 		listenToken(ch, gen),
 		streamTick(),
 	)
 }
 
-func runStream(ctx context.Context, prov llm.Provider, model string, msgs []llm.Message, ch chan<- string, gen int) tea.Cmd {
+// runAgent streams the response, executing any tool calls (web search, page
+// fetch) the model requests and looping until it answers with plain content.
+// Tool activity is streamed inline as italic status lines, so it is visible
+// live and preserved in the saved message for follow-up context.
+func runAgent(ctx context.Context, prov llm.Provider, model string, msgs []llm.Message, tools []llm.Tool, cfg *config.Config, ch chan<- string, gen int) tea.Cmd {
 	return func() tea.Msg {
-		content, err := prov.Stream(ctx, model, msgs, func(token string) {
+		emit := func(t string) {
 			select {
-			case ch <- token:
+			case ch <- t:
 			case <-ctx.Done():
 			}
-		})
-		close(ch)
-		if err != nil && ctx.Err() == nil {
-			return streamErrMsg{gen: gen, err: err.Error()}
 		}
-		return streamEndMsg{gen: gen, content: content}
+		defer close(ch)
+		var full strings.Builder
+		for round := 0; round < maxToolRounds; round++ {
+			content, calls, err := prov.StreamTools(ctx, model, msgs, tools, emit)
+			if err != nil && ctx.Err() == nil {
+				return streamErrMsg{gen: gen, err: err.Error()}
+			}
+			full.WriteString(content)
+			if len(calls) == 0 || ctx.Err() != nil {
+				break
+			}
+			msgs = append(msgs, llm.Message{Role: "assistant", Content: content, ToolCalls: calls})
+			for _, call := range calls {
+				status, result := execWebTool(ctx, cfg, call)
+				line := "\n\n*" + status + "*\n\n"
+				emit(line)
+				full.WriteString(line)
+				msgs = append(msgs, llm.Message{Role: "tool", ToolCallID: call.ID, Content: result})
+			}
+		}
+		return streamEndMsg{gen: gen, content: strings.TrimSpace(full.String())}
 	}
 }
 
@@ -1574,16 +1683,20 @@ func (m Model) buildLLMMessages() []llm.Message {
 			continue // system notes, diff previews — display only
 		}
 		lm := llm.Message{Role: msg.Role, Content: msg.Content}
-		// Attach image if this message has one
+		// Attach this message's persisted image or PDF
 		if msg.ImagePath != "" {
-			dataURL, err := encodeImageToDataURL(msg.ImagePath)
-			if err == nil {
-				lm.Images = append(lm.Images, dataURL)
+			if dataURL, err := encodeAttachment(msg.ImagePath); err == nil {
+				if strings.ToLower(filepath.Ext(msg.ImagePath)) == ".pdf" {
+					lm.Files = append(lm.Files, dataURL)
+				} else {
+					lm.Images = append(lm.Images, dataURL)
+				}
 			}
 		}
-		// Attach pending image to the last user message
-		if len(m.pendingImages) > 0 && i == len(m.messages)-1 && msg.Role == "user" {
+		// Attach session-only pendings to the last user message
+		if i == len(m.messages)-1 && msg.Role == "user" {
 			lm.Images = append(lm.Images, m.pendingImages...)
+			lm.Files = append(lm.Files, m.pendingFiles...)
 		}
 		out = append(out, lm)
 	}
@@ -2432,7 +2545,11 @@ func (m *Model) syncInputHeight() {
 }
 
 func (m Model) inputHeight() int {
-	return min(wrappedRows(m.input.Value(), m.input.Width()), 12)
+	// One spare row beyond the content: the keystroke that wraps onto a new
+	// row lands in the spare instead of forcing the textarea's internal
+	// viewport to scroll (its offset never heals and hides the first rows).
+	// The spare doubles as breathing room, Claude Code style.
+	return min(wrappedRows(m.input.Value(), m.input.Width())+1, 12)
 }
 
 func (m Model) statusView() string {
@@ -2453,8 +2570,8 @@ func (m Model) statusView() string {
 	if sel := cachedSelection(); sel != nil && (len(m.docs) == 0 || m.findDoc(sel.file) != nil) {
 		left += fmt.Sprintf("  ·  sel L%d-%d", sel.start, sel.end)
 	}
-	if m.webSearch {
-		left += "  ·  web"
+	if !m.webSearch {
+		left += "  ·  no-web"
 	}
 
 	tok := m.contextTokens()
@@ -2811,30 +2928,6 @@ func lastMentionToken(input string) (string, string, bool) {
 	return input[:i+1], tok[1:], true
 }
 
-// webCues are phrases that make a single message use live web search even
-// when /web is off, so "search for X" just works in natural language.
-var webCues = []string{
-	"search", "look up", "lookup", "google", "browse the web", "on the web",
-	"latest", "news", "currently", "as of today", "right now", "http://", "https://",
-}
-
-// wantsWeb reports whether the newest user message asks for live information.
-func wantsWeb(msgs []*store.Message) bool {
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role != "user" {
-			continue
-		}
-		lower := strings.ToLower(msgs[i].Content)
-		for _, cue := range webCues {
-			if strings.Contains(lower, cue) {
-				return true
-			}
-		}
-		return false
-	}
-	return false
-}
-
 // isKnownCommand reports whether input starts with a known /command verb.
 func isKnownCommand(input string) bool {
 	verb := strings.SplitN(strings.TrimSpace(input), " ", 2)[0]
@@ -2929,6 +3022,21 @@ func (m Model) detectImagePath(input string) (string, string, bool) {
 var imageExts = map[string]string{
 	".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
 	".gif": "image/gif", ".webp": "image/webp",
+}
+
+// encodeAttachment turns a local image or PDF into a data URL.
+func encodeAttachment(path string) (string, error) {
+	if strings.ToLower(filepath.Ext(path)) == ".pdf" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		if len(data) > 32*1024*1024 {
+			return "", fmt.Errorf("pdf too large (>32MB)")
+		}
+		return "data:application/pdf;base64," + base64.StdEncoding.EncodeToString(data), nil
+	}
+	return encodeImageToDataURL(path)
 }
 
 func encodeImageToDataURL(path string) (string, error) {

@@ -904,13 +904,14 @@ func mentionFiles() []string {
 	if time.Since(mentionFileCache.at) < 10*time.Second {
 		return mentionFileCache.files
 	}
-	exts := make(map[string]bool, len(docExts)+len(imageExts))
+	exts := make(map[string]bool, len(docExts)+len(imageExts)+1)
 	for e := range docExts {
 		exts[e] = true
 	}
 	for e := range imageExts {
 		exts[e] = true
 	}
+	exts[".pdf"] = true
 	mentionFileCache.files = listFilesByExt(exts)
 	mentionFileCache.at = time.Now()
 	return mentionFileCache.files
