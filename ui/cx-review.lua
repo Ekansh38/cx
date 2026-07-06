@@ -500,6 +500,24 @@ local function decorate(h, oldStart, insStart)
   end
 end
 
+-- CxApplyAll accepts every pending hunk from the outside (cx tool call).
+-- Silent no-op when there's no active review.
+function CxApplyAll()
+  if not S.hunks then
+    return 0
+  end
+  for _, h in ipairs(S.hunks) do
+    if state(h) == "pending" then
+      do_apply(h)
+    end
+  end
+  repaint()
+  if pending() == 0 then
+    finish()
+  end
+  return 1
+end
+
 -- CxAbort discards a live review: pending proposal (green) blocks are
 -- removed, decorations and keymaps cleaned up, no results written. Called
 -- by cx when it abandons a review, and by CxReview before starting a new

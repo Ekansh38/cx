@@ -272,6 +272,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case extReviewTickMsg:
+		if consumeReviewDiscard() {
+			m.extGroups = nil
+			m.extNotes = nil
+			m.extRetry = false
+			m.lastApplied = nil
+			m.injectSystemLine("discarded pending edits (via cx)")
+			return m, nil
+		}
 		if len(m.extGroups) == 0 {
 			return m, nil
 		}

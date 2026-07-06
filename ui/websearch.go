@@ -22,6 +22,22 @@ const maxToolRounds = 6
 func webTools() []llm.Tool {
 	return []llm.Tool{
 		{
+			Name:        "discard_pending_edits",
+			Description: "Discard EVERY edit currently under review (in the user's editor) and any queued behind it. Use when the user redirects the conversation instead of reviewing — 'let's discuss this instead', 'wait, before you change anything', a question about the doc, or any message that isn't approval — so your obsolete proposals don't clutter their editor. After discarding, respond in prose only; do NOT propose new edits in the same response.",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			Name:        "apply_all_pending_edits",
+			Description: "Apply every edit currently under review at once. Use only when the user has clearly approved everything ('apply all', 'looks good, do it', 'yes to all').",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
 			Name:        "web_search",
 			Description: "Search the live web. Use for anything current: news, prices, rankings, recent releases, or facts you are not certain about. Craft a specific search query; do not pass the user's message verbatim. Returns findings with source URLs.",
 			Parameters: map[string]any{
@@ -56,6 +72,14 @@ func webTools() []llm.Tool {
 // transcript) and the result text handed back to the model.
 func execWebTool(ctx context.Context, cfg *config.Config, call llm.ToolCall) (status, result string) {
 	switch call.Name {
+	case "discard_pending_edits":
+		RequestReviewDiscard()
+		return "discarding pending edits", "OK, discarded every pending edit. The user's editor is clean."
+
+	case "apply_all_pending_edits":
+		applyAllExternalReview()
+		return "applying all pending edits", "OK, applied every pending edit."
+
 	case "web_search":
 		var args struct {
 			Query string `json:"query"`
