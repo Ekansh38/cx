@@ -278,7 +278,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// N fired mid-review: send the revision request right away, while the
 		// user keeps reviewing the remaining hunks.
 		if !m.streaming && m.provider != nil {
-			if events := consumeRejectNow(); len(events) > 0 {
+			raw := consumeRejectNow()
+			var events []rejectEvent
+			for _, ev := range raw {
+				if isKnownEditSearch(m.extGroups, ev.Search) {
+					events = append(events, ev)
+				}
+			}
+			if len(events) > 0 {
 				var sb strings.Builder
 				for _, ev := range events {
 					fmt.Fprintf(&sb, "I rejected the proposed edit changing %q to %q. Reason: %q. ",
@@ -341,6 +348,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Sweep any reject events that raced the final results
 		for _, ev := range consumeRejectNow() {
+			if !isKnownEditSearch(m.extGroups, ev.Search) {
+				continue // stale event from a previous session
+			}
 			m.extNotes = append(m.extNotes, fmt.Sprintf("edit rejected: %q", ev.Reason))
 			m.extRetry = true
 		}
