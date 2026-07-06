@@ -79,18 +79,10 @@ func main() {
 		}
 	}
 
-	// Doc mode: reuse the conversation already connected to this file, or start one
+	// Doc mode opens the editor beside cx and remembers the file, but does
+	// NOT connect it to any conversation: that stays explicit (/connect doc)
 	if docPath != "" {
-		dc, _ := st.FindConversationByDoc(docPath)
-		if dc == nil {
-			dc, err = st.CreateConversation(model)
-			if err != nil {
-				log.Fatal(err)
-			}
-			st.AddDoc(dc.ID, docPath)
-		}
 		ui.SaveLastDoc(docPath)
-		conv = dc
 	}
 
 	// Load messages

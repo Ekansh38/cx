@@ -86,3 +86,33 @@ func TestDocsCascadeDelete(t *testing.T) {
 		t.Fatalf("docs survived conversation delete: %v", docs)
 	}
 }
+
+func TestForkConversation(t *testing.T) {
+	st := testStore(t)
+	src, _ := st.CreateConversation("m")
+	m1, _ := st.AddMessage(src.ID, "user", "first question")
+	st.AddMessage(src.ID, "assistant", "first answer")
+	m3, _ := st.AddMessage(src.ID, "user", "second question")
+	st.AddMessage(src.ID, "assistant", "second answer")
+	st.AddDoc(src.ID, "/notes.md")
+
+	fork, err := st.ForkConversation(src.ID, "m", m3.CreatedAt, m3.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := st.GetMessages(fork.ID)
+	if len(msgs) != 2 {
+		t.Fatalf("fork has %d messages; want 2 (before the fork point)", len(msgs))
+	}
+	if msgs[0].Content != "first question" || msgs[1].Content != "first answer" {
+		t.Errorf("fork content wrong: %q, %q", msgs[0].Content, msgs[1].Content)
+	}
+	if docs, _ := st.GetDocs(fork.ID); len(docs) != 1 || docs[0] != "/notes.md" {
+		t.Errorf("fork docs = %v", docs)
+	}
+	// source untouched
+	if srcMsgs, _ := st.GetMessages(src.ID); len(srcMsgs) != 4 {
+		t.Errorf("source mutated: %d messages", len(srcMsgs))
+	}
+	_ = m1
+}
