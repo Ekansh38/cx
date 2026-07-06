@@ -65,8 +65,10 @@ type modelsErrorMsg string
 type memoryUpdatedMsg struct {
 	content string // new memory file (blank = NO_CHANGES / no update)
 	note    string // display-only confirmation; blank for silent auto-curation
+	convID  int64  // conversation the curation ran against (0 = legacy)
 }
 type memoryErrorMsg string
+type memoryIdleTickMsg struct{ gen int } // fires when the user pauses; trips a curation if memPending non-empty
 type compactionDoneMsg struct {
 	gen     int
 	convID  int64
@@ -166,6 +168,9 @@ type Model struct {
 	lastApplied []docEdit     // applied edits of the last finished review, for /undo
 	pendingSel  *docSelection // editor highlight riding along the next message
 	curating    bool          // a memory-curation request is in flight
+	memPending  []int64       // IDs of assistant turns awaiting memory curation
+	lastCurated int64         // newest assistant msg ID the memory model has seen (per conv)
+	memIdleGen  int           // streamGen of the armed idle tick (0 = none armed)
 	pastes      []pasteRef    // collapsed multi-line pastes awaiting send
 
 	// doc picker state (/doc with no path)
@@ -230,6 +235,9 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 	}
 	// Restore connected docs from a previous session
 	m.loadConvDocs()
+	// Restore the memory-curation cursor so we don't re-curate the whole
+	// chat on startup, and rebuild the pending-turn list from the store.
+	m.loadMemoryCursor()
 	return m
 }
 
@@ -462,11 +470,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.autoTitled = true
 			cmds = append(cmds, m.autoTitleCmd())
 		}
-		if !m.curating {
+		// Memory curation is batched + hybrid-triggered: we accumulate finished
+		// assistant turns in memPending and fire only when N have piled up OR
+		// the user goes idle for a while, whichever comes first. The armed
+		// idle tick carries the current streamGen so a tick from a previous
+		// conversation is ignored after a switch.
+		if last := lastAssistantID(m.messages); last != 0 && (len(m.memPending) == 0 || m.memPending[len(m.memPending)-1] != last) {
+			m.memPending = append(m.memPending, last)
+		}
+		interval := m.cfg.MemoryInterval
+		if interval <= 0 {
+			interval = 6
+		}
+		if !m.curating && len(m.memPending) >= interval {
 			if cmd := m.curateMemoryCmd(); cmd != nil {
 				m.curating = true
+				m.memPending = nil
+				m.memIdleGen = 0
 				cmds = append(cmds, cmd)
 			}
+		} else if !m.curating && len(m.memPending) > 0 {
+			idle := m.cfg.MemoryIdleSeconds
+			if idle <= 0 {
+				idle = 120
+			}
+			gen := m.streamGen + 1 // a tick landing after a streamGen bump is stale
+			m.memIdleGen = gen
+			cmds = append(cmds, tea.Tick(time.Duration(idle)*time.Second, func(time.Time) tea.Msg {
+				return memoryIdleTickMsg{gen: gen}
+			}))
 		}
 		if len(cmds) > 0 {
 			return m, tea.Batch(cmds...)
@@ -506,6 +538,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.errMsg = string(msg)
 		m.state = stateChat
 		m.modelLoading = false
+		return m, nil
+
+	case memoryIdleTickMsg:
+		// The user paused long enough to consider the conversation "at rest".
+		// Fire a curation now if there are pending turns and no curation is
+		// already in flight; ignore ticks armed for a prior streamGen (the
+		// conversation has since moved on).
+		if msg.gen != m.memIdleGen || m.curating || len(m.memPending) == 0 {
+			return m, nil
+		}
+		if cmd := m.curateMemoryCmd(); cmd != nil {
+			m.curating = true
+			m.memPending = nil
+			m.memIdleGen = 0
+			return m, cmd
+		}
 		return m, nil
 
 	case memoryUpdatedMsg:
@@ -759,6 +807,12 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	// vim muscle memory
 	if input == ":q" {
 		m.stopStream()
+		// Flush pending memory curation in the background so quit feels
+		// instant while still writing the final memory update. main.go waits
+		// briefly for this to settle before the process exits.
+		if cmd := m.flushMemoryAndSave(); cmd != nil {
+			return m, tea.Batch(tea.Quit, cmd)
+		}
 		return m, tea.Quit
 	}
 
@@ -928,6 +982,9 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 
 	case "/quit":
 		m.stopStream()
+		if cmd := m.flushMemoryAndSave(); cmd != nil {
+			return m, tea.Batch(tea.Quit, cmd)
+		}
 		return m, tea.Quit
 
 	case "/new":
@@ -1831,11 +1888,10 @@ Rules:
 The "## Recent conversations" section is an episodic log so future sessions know what was already discussed:
 - Exactly one bullet per conversation: "- {date} · {title}: {one sentence: what was discussed, decided, or concluded}"
 - The current conversation is "%s" (today: %s). If it already has a bullet, UPDATE that bullet to reflect the conversation so far; otherwise add one at the top of the section. If the title is "Untitled", write a short descriptive title yourself.
-- NEVER keep two bullets describing the same discussion: conversations get forked and renamed, so if an existing bullet clearly covers this same topic and decisions, merge into ONE updated bullet regardless of title.
 - Newest first. Keep at most 15 bullets; drop the oldest beyond that.
 - Before dropping an old bullet, promote anything still durable into the appropriate section above.
 
-Below is the current memory file and the latest exchange. Rewrite the memory to incorporate anything genuinely worth remembering.
+You are given the current memory file, the full transcript of the current conversation (split into what you've ALREADY curated and what is NEW since then), and short recaps of the user's other recent conversations for cross-conversation consolidation. The new turns are where you should focus — most exchanges teach you nothing durable, and the expected outcome is NO_CHANGES. Only rewrite when you've genuinely learned something worth remembering long-term: a new durable fact, a corrected understanding, a decision that shifts a project, or a meaningful update to the current conversation's bullet. When you do rewrite, you may also consolidate across conversations (merge duplicates, generalize a pattern visible in the recaps) — but never invent.
 
 If nothing should change, reply with exactly: NO_CHANGES
 Otherwise reply with ONLY the complete new memory file content — no code fences, no commentary.
@@ -1845,33 +1901,167 @@ Current memory file:
 %s
 </memory>
 
-Latest exchange:
-User: %s
+Other recent conversations (for cross-conversation consolidation; the current conversation is the one titled "%s"):
+%s
 
-Assistant: %s`
+Current conversation transcript:
+<already_curated>
+%s
+</already_curated>
+<new_messages>
+%s
+</new_messages>`
 
-func (m Model) curateMemoryCmd() tea.Cmd {
-	var userMsg, assistantMsg string
-	for i := len(m.messages) - 1; i >= 0; i-- {
-		if m.messages[i].Role == "assistant" && assistantMsg == "" {
-			assistantMsg = m.messages[i].Content
+// otherConvTokenCap caps the cross-conversation recaps so they never dominate
+// the prompt — the focus is the current conversation's new turns.
+const otherConvTokenCap = 1500
+
+// lastAssistantID returns the message ID of the most recent assistant turn,
+// or 0 if there is none. Used to track which turns the memory model has seen.
+func lastAssistantID(msgs []*store.Message) int64 {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" && msgs[i].ID != 0 {
+			return msgs[i].ID
 		}
-		if m.messages[i].Role == "user" && userMsg == "" {
-			userMsg = m.messages[i].Content
+	}
+	return 0
+}
+
+// buildMemoryTranscript renders the current conversation as a text transcript
+// split into two labeled spans: turns the memory model has already seen
+// (already_curated) and turns added since (new_messages). lastCuratedID is the
+// message ID of the newest turn the model last processed; turns strictly
+// after it are "new". Memory/system messages are dropped (the memory file is
+// passed separately above, so including it here would be circular). Returns
+// the two spans in order.
+func (m Model) buildMemoryTranscript(lastCuratedID int64) (already, fresh string) {
+	start := 0
+	for i, msg := range m.messages {
+		if msg.Role == "summary" {
+			start = i
 		}
-		if userMsg != "" && assistantMsg != "" {
+	}
+	var a, f strings.Builder
+	writeTurn := func(w *strings.Builder, role, content string) {
+		// Trim runaway messages so a huge paste can't blow the prompt.
+		if len(content) > 6000 {
+			content = content[:6000] + " …[truncated]"
+		}
+		fmt.Fprintf(w, "%s: %s\n\n", role, content)
+	}
+	for i, msg := range m.messages {
+		if i < start {
+			continue
+		}
+		if msg.Role == "summary" {
+			fmt.Fprintf(&a, "(earlier context) %s\n\n", msg.Content)
+			continue
+		}
+		if msg.Role == "note" {
+			// Review feedback is the user's words; treat as user turns.
+			if msg.ID != 0 && msg.ID <= lastCuratedID {
+				writeTurn(&a, "user", msg.Content)
+			} else {
+				writeTurn(&f, "user", msg.Content)
+			}
+			continue
+		}
+		if msg.Role != "user" && msg.Role != "assistant" {
+			continue // system notes, diff previews — display only
+		}
+		if msg.ID != 0 && msg.ID <= lastCuratedID {
+			writeTurn(&a, msg.Role, msg.Content)
+		} else {
+			writeTurn(&f, msg.Role, msg.Content)
+		}
+	}
+	return a.String(), f.String()
+}
+
+// buildOtherConvRecaps renders the most recent other conversations as a compact
+// block, using each conversation's latest compaction summary when present and
+// falling back to its first user message otherwise. Each line is one
+// conversation: "- {title}: {summary-or-first-prompt}". Capped to keep the
+// prompt focused on the current chat.
+func (m Model) buildOtherConvRecaps() string {
+	recaps, err := m.store.RecentSummaries(m.conv.ID, 8)
+	if err != nil || len(recaps) == 0 {
+		return "(none)"
+	}
+	var sb strings.Builder
+	tokens := 0
+	for _, r := range recaps {
+		// The store helper packed title + content separated by a NUL byte.
+		parts := strings.SplitN(r.Content, "\u0000", 2)
+		title := parts[0]
+		content := ""
+		if len(parts) > 1 {
+			content = parts[1]
+		}
+		if content == "" {
+			continue
+		}
+		// Trim each recap to keep the block bounded.
+		if len(content) > 300 {
+			content = content[:300] + "…"
+		}
+		line := fmt.Sprintf("- %s: %s", title, content)
+		est := len(line) / 4 // rough token estimate
+		if tokens+est > otherConvTokenCap {
 			break
 		}
+		tokens += est
+		sb.WriteString(line)
+		sb.WriteString("\n")
 	}
-	if userMsg == "" || assistantMsg == "" {
+	if sb.Len() == 0 {
+		return "(none)"
+	}
+	return sb.String()
+}
+
+func (m Model) curateMemoryCmd() tea.Cmd {
+	// Collect the IDs of all assistant turns still pending curation. The
+	// caller appends to m.memPending after each streamEnd; here we snapshot
+	// it and clear it, so a concurrent re-entry doesn't double-count.
+	if len(m.memPending) == 0 {
 		return nil
 	}
+	pending := m.memPending
+	convID := m.conv.ID
+	convTitle := m.conv.Title
 
+	// Snapshot the transcript + state under the lock-free values we already
+	// hold. The LLM call reads memory.md fresh from disk.
+	already, fresh := m.buildMemoryTranscript(m.lastCurated)
+	if strings.TrimSpace(fresh) == "" {
+		return nil
+	}
+	other := m.buildOtherConvRecaps()
 	memPath := config.MemoryPath()
 	cfg := m.cfg
-	convTitle := m.conv.Title
 	today := time.Now().Format("2006-01-02")
 	mainProv, mainModel := m.provider, m.model
+
+	// Track the newest assistant ID we're about to curate, so on success we
+	// advance lastCurated even if the conversation has moved on by the time
+	// the call returns.
+	var newest int64
+	for _, id := range pending {
+		if id > newest {
+			newest = id
+		}
+	}
+	// newest may be 0 (e.g. synthetic, unpersisted turn): fall back to the
+	// last assistant message ID currently in view.
+	if newest == 0 {
+		for i := len(m.messages) - 1; i >= 0; i-- {
+			if m.messages[i].Role == "assistant" && m.messages[i].ID != 0 {
+				newest = m.messages[i].ID
+				break
+			}
+		}
+	}
 
 	return func() tea.Msg {
 		memModel := cfg.MemoryModel
@@ -1894,10 +2084,12 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 		}
 
 		prompt := []llm.Message{
-			{Role: "user", Content: fmt.Sprintf(curationPrompt, convTitle, today, existing, userMsg, assistantMsg)},
+			{Role: "user", Content: fmt.Sprintf(curationPrompt, convTitle, today, existing, convTitle, other, already, fresh)},
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// Bigger batch than the old per-turn call: give the model room to
+		// reason over the whole transcript.
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
 		result, err := prov.Complete(ctx, memModel, prompt)
@@ -1914,9 +2106,17 @@ func (m Model) curateMemoryCmd() tea.Cmd {
 		result = strings.TrimSpace(result)
 
 		if result == "" || result == "NO_CHANGES" || strings.HasPrefix(result, "NO_CHANGES") {
+			// Even on NO_CHANGES, advance the cursor so we don't re-send
+			// the same turns next time — the model has seen them.
+			if newest > 0 {
+				memory.MarkCurated(convID, newest)
+			}
 			return memoryUpdatedMsg{content: ""}
 		}
-		return memoryUpdatedMsg{content: result}
+		if newest > 0 {
+			memory.MarkCurated(convID, newest)
+		}
+		return memoryUpdatedMsg{content: result, convID: convID}
 	}
 }
 
@@ -2001,7 +2201,68 @@ func (m Model) editMemoryCmd(instruction, successNote string) tea.Cmd {
 	}
 }
 
-// ── Context compaction ───────────────────────────────────────────────────────
+// loadMemoryCursor restores the memory-curation cursor for the current
+// conversation and rebuilds memPending as every assistant message ID after
+// lastCurated. Called on startup and conversation switch so curation resumes
+// exactly where it left off (never re-curating the whole chat, never losing
+// pending turns).
+func (m *Model) loadMemoryCursor() {
+	m.lastCurated = memory.LastCurated(m.conv.ID)
+	m.memPending = nil
+	for _, msg := range m.messages {
+		if msg.Role == "assistant" && msg.ID != 0 && msg.ID > m.lastCurated {
+			m.memPending = append(m.memPending, msg.ID)
+		}
+	}
+	m.memIdleGen = 0
+}
+
+// maybeFlushMemory returns a curation command if there are pending turns to
+// curate for the CURRENT conversation. It snapshots the pending state, clears
+// it, and returns nil when there's nothing to do. Used as a best-effort flush
+// before leaving a conversation (switch, /new, /fork, compaction, quit).
+func (m *Model) maybeFlushMemory() tea.Cmd {
+	if len(m.memPending) == 0 || m.curating {
+		return nil
+	}
+	if cmd := m.curateMemoryCmd(); cmd != nil {
+		m.memPending = nil
+		m.memIdleGen = 0
+		return cmd
+	}
+	return nil
+}
+
+// flushMemoryAndSave: precompute the curation-prompt state and spawn a
+// detached child (cx _curate) that runs the LLM call and writes memory.md.
+// Returns nil so quit is instant.
+func (m *Model) flushMemoryAndSave() tea.Cmd {
+	if len(m.memPending) == 0 {
+		return nil
+	}
+	already, fresh := m.buildMemoryTranscript(m.lastCurated)
+	if strings.TrimSpace(fresh) == "" {
+		return nil
+	}
+	state := flushState{
+		ConvTitle: m.conv.Title,
+		Today:     time.Now().Format("2006-01-02"),
+		Other:     m.buildOtherConvRecaps(),
+		Already:   already,
+		Fresh:     fresh,
+	}
+	if spawnMemoryFlush(state) {
+		m.memPending = nil
+	}
+	return nil
+}
+
+// WaitForMemoryFlush is a no-op: curation on quit runs in a detached child
+// process now, so main.go doesn't need to wait for anything before exiting.
+// Kept for compatibility with the previous main.go call.
+func WaitForMemoryFlush(_ time.Duration) {}
+
+// ── Context compaction ──// ── Context compaction ───────────────────────────────────────────────────────
 
 const compactionPrompt = `Summarize the following conversation concisely. Preserve key facts, decisions, code snippets, and context needed to continue the conversation. Be thorough but brief.
 
@@ -2010,6 +2271,11 @@ const compactionPrompt = `Summarize the following conversation concisely. Preser
 func (m Model) startCompaction() (Model, tea.Cmd) {
 	m.streaming = true // show streaming indicator
 	m.injectSystemLine("compacting context...")
+
+	// Flush pending memory curation first so it sees the real transcript
+	// (not a compacted one) and doesn't race with compaction's message
+	// mutation.
+	flush := m.maybeFlushMemory()
 
 	recentCount := min(6, len(m.messages))
 	cutoff := len(m.messages) - recentCount
@@ -2048,7 +2314,7 @@ func (m Model) startCompaction() (Model, tea.Cmd) {
 	m.streamGen++
 	gen := m.streamGen
 
-	return m, tea.Batch(
+	cmds := []tea.Cmd{
 		func() tea.Msg {
 			defer cancel()
 			prompt := []llm.Message{
@@ -2065,7 +2331,11 @@ func (m Model) startCompaction() (Model, tea.Cmd) {
 			}
 		},
 		streamTick(), // animate the spinner while compacting
-	)
+	}
+	if flush != nil {
+		cmds = append(cmds, flush)
+	}
+	return m, tea.Batch(cmds...)
 }
 
 // ── Picker ────────────────────────────────────────────────────────────────────
@@ -2169,6 +2439,11 @@ func (m Model) switchConversation(id int64) (Model, tea.Cmd) {
 	// back to whatever model that conversation used long ago. The user's
 	// last selection stays until they pick another.
 	m.stopStream()
+	// Flush any pending memory curation for the conversation we're leaving.
+	// It runs as a background command; the result handler writes memory.md
+	// regardless of which conversation is active by then (the cursor is
+	// advanced inside the command).
+	flush := m.maybeFlushMemory()
 	m.conv = conv
 	m.messages = msgs
 	m.streamBuf.Reset()
@@ -2176,10 +2451,14 @@ func (m Model) switchConversation(id int64) (Model, tea.Cmd) {
 	m.state = stateChat
 	m.errMsg = ""
 	m.loadConvDocs()
+	m.loadMemoryCursor()
 
 	m.refreshContent()
 	m.viewport.GotoBottom()
 	m.atBottom = true
+	if flush != nil {
+		return m, flush
+	}
 	return m, nil
 }
 
@@ -2191,6 +2470,7 @@ func (m Model) newConversation() (Model, tea.Cmd) {
 		return m, nil
 	}
 	m.stopStream()
+	flush := m.maybeFlushMemory()
 	m.conv = conv
 	m.messages = nil
 	m.streamBuf.Reset()
@@ -2198,10 +2478,16 @@ func (m Model) newConversation() (Model, tea.Cmd) {
 	m.state = stateChat
 	m.errMsg = ""
 	m.loadConvDocs()
+	m.memPending = nil
+	m.lastCurated = 0
+	m.memIdleGen = 0
 
 	m.refreshContent()
 	m.viewport.GotoBottom()
 	m.atBottom = true
+	if flush != nil {
+		return m, flush
+	}
 	return m, nil
 }
 
@@ -3239,6 +3525,14 @@ func (m Model) forkFrom(sel *store.Message) (Model, tea.Cmd) {
 		m.state = stateChat
 		return m, nil
 	}
+	// Seamlessly transfer the source conversation's episodic memory bullet
+	// to the fork: the fork now carries that discussion as live history, so
+	// the bullet's title/date are updated to describe the fork instead. No
+	// fork metadata is persisted or shown to the model — it just sees a
+	// coherent memory file. (If the source had no bullet yet, no-op.)
+	srcTitle := m.conv.Title
+	today := time.Now().Format("2006-01-02")
+	memory.TransferBulletOnFork(srcTitle, conv.Title, today)
 	m2, cmd := m.switchConversation(conv.ID)
 	m2.injectSystemLine("forked: history up to the chosen prompt, edit and resend")
 	m2.input.SetValue(stripPlaceholders(sel.Content))
