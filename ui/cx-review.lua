@@ -376,9 +376,15 @@ local function decide(action)
     post_decide()
   elseif action == "reject" then
     vim.ui.input({ prompt = "why? " }, function(reason)
+      if reason == nil then
+        -- escape pressed: cancel the reject entirely, the hunk stays
+        -- pending with its diff intact
+        vim.notify("cx: reject cancelled")
+        return
+      end
       do_skip(h)
-      h.reason = reason or ""
-      if reason and reason ~= "" then
+      h.reason = reason
+      if reason ~= "" then
         h.reported = true
         local f = io.open(datadir .. "/reject-now.jsonl", "a")
         if f then
