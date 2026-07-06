@@ -369,6 +369,59 @@ local function do_skip(h)
   end
 end
 
+-- ask_reason opens a bordered floating buffer to capture a rejection note.
+-- vim.ui.input redraws its cmdline prefix on every wrapped row and produces
+-- ghost text with long input; a real buffer gets normal wrap/edit/paste.
+-- The user gets a normal insert-mode buffer:
+--   <CR> in NORMAL mode (esc first) submits    <Esc><Esc> or q  cancels
+local function ask_reason(cb)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+
+  local width = math.min(80, vim.o.columns - 4)
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    row = math.floor(vim.o.lines / 2 - 3),
+    col = math.floor((vim.o.columns - width) / 2),
+    width = width,
+    height = 6,
+    style = "minimal",
+    border = "rounded",
+    title = " why reject this edit? (esc esc to cancel, esc <CR> to submit) ",
+    title_pos = "center",
+  })
+  vim.wo[win].wrap = true
+  vim.wo[win].linebreak = true
+  vim.cmd("startinsert")
+
+  local closed = false
+  local function close(reason)
+    if closed then
+      return
+    end
+    closed = true
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+    cb(reason)
+  end
+
+  vim.keymap.set("n", "<CR>", function()
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    close(vim.trim(table.concat(lines, "\n")))
+  end, { buffer = buf })
+  vim.keymap.set("n", "<Esc>", function() close(nil) end, { buffer = buf })
+  vim.keymap.set("n", "q", function() close(nil) end, { buffer = buf })
+  -- if the window loses focus, treat it as a cancel
+  vim.api.nvim_create_autocmd("WinLeave", {
+    buffer = buf,
+    once = true,
+    callback = function() close(nil) end,
+  })
+end
+
 local function decide(action)
   if not S.hunks then
     return
@@ -404,10 +457,9 @@ local function decide(action)
     do_skip(h)
     post_decide()
   elseif action == "reject" then
-    vim.ui.input({ prompt = "why? " }, function(reason)
+    ask_reason(function(reason)
       if reason == nil then
-        -- escape pressed: cancel the reject entirely, the hunk stays
-        -- pending with its diff intact
+        -- cancel: the hunk stays pending with its diff intact
         vim.notify("cx: reject cancelled")
         return
       end

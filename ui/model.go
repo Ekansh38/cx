@@ -361,7 +361,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoBottom()
 		}
 		if retry && !m.streaming && m.provider != nil {
-			return m.startStream()
+			m2, cmd := m.startStream()
+			// The retry stream will queue any new edits into extGroups when
+			// it ends — keep the tick chain alive so those get picked up
+			// even if the queue branch's own tick races us
+			return m2, tea.Batch(cmd, extReviewTick(0))
 		}
 		return m, nil
 
@@ -431,9 +435,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.injectSystemLine(fmt.Sprintf("%d proposed edit(s) matched the document already, nothing to apply", noops))
 			}
 			if len(edits) > 0 && len(m.extGroups) > 0 {
-				// A review is already on screen in neovim: queue these after it
+				// A review is already on screen in neovim: queue these
+				// behind it and re-arm the tick — the previous chain
+				// exited when the original group's results were consumed
 				m.extGroups = append(m.extGroups, groupEditsByFile(edits)...)
 				m.injectSystemLine(fmt.Sprintf("queued %d more edits behind the current review", len(edits)))
+				reviewCmd = extReviewTick(0)
 			} else if len(edits) > 0 {
 				groups := groupEditsByFile(edits)
 				if len(groups) > 0 && startExternalReview(groups[0].file, groups[0].edits) {

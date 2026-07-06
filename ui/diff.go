@@ -197,7 +197,7 @@ func patienceRuns(a, b []string) []changeRun {
 		if aFrom >= aTo && bFrom >= bTo {
 			return
 		}
-		if aTo-aFrom > 4 && bTo-bFrom > 4 { // worth recursing
+		if aTo-aFrom > 2 && bTo-bFrom > 2 { // recurse aggressively for lists
 			for _, r := range patienceRuns(a[aFrom:aTo], b[bFrom:bTo]) {
 				runs = append(runs, changeRun{
 					aFrom: r.aFrom + aFrom, aTo: r.aTo + aFrom,
