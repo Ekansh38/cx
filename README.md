@@ -72,8 +72,9 @@ cx doc notes.md   # same, with the file given directly
 | `/stop` | Stop streaming response |
 | `/delete` | Delete current conversation (confirms) |
 | `/grep` | Search all messages |
-| `/copy` | Copy last response to clipboard |
-| `/copy prompt` | Copy your last message to clipboard |
+| `/copy [n]` | Copy the last n responses (default 1) |
+| `/copy prompt [n]` | Copy your last n messages |
+| `/copy all [n]` | Copy the last n prompt/response pairs |
 | `/retry` / `/r` | Re-send last message |
 | `/img <path> [text]` | Send an image |
 | `/rename <title>` | Rename conversation |
@@ -97,7 +98,7 @@ cx doc notes.md   # same, with the file given directly
 
 ### @file mentions
 
-Mention a file anywhere in a message with `@` — tab fuzzy-completes against md/txt/image files under the current directory, with candidates shown live as you type. On send, text files **connect as docs** and images **attach to the message**. `@` that doesn't resolve to a file (emails, handles) passes through as plain text.
+Mention a file anywhere in a message with `@` — tab fuzzy-completes against md/txt/image/pdf files under the current directory, with candidates shown live as you type. On send, text files **connect as docs**, images and **PDFs attach to the message** (sent as native document input — models read them directly), and image URLs (`@https://site.com/pic.png`) pass straight through for the provider to fetch. `@` that doesn't resolve to a file (emails, handles) passes through as plain text.
 
 ```
 fix the intro of @notes.md and make it match the tone of @draft.md
@@ -141,7 +142,7 @@ Tip: if cx applies edits while the file is open in neovim, set `:set autoread` s
 
 ### Web search
 
-Web search works in natural language: messages that ask for live information ("search for X", "look up", "latest", "news", a URL, ...) automatically route through OpenRouter's web plugin (`model:online`), grounding the answer in current web results — no extra API keys or setup. `/web on` forces it for every message (status bar shows `web`), `/web off` disables the forcing. OpenRouter bills ~$4 per 1k search results on top of normal token costs, only on messages that actually search.
+Web search is agentic and on by default: the model gets `web_search` and `fetch_url` tools, decides when to use them, crafts its own queries, and can run several rounds — you see `searching the web: "best cafes singapore 2026"` inline as it works, and the searches stay in the transcript for follow-up context. Search execution reuses your OpenRouter key (a cheap grounded model does the lookup); page reading goes through the free r.jina.ai reader. `/web off` removes the tools (status bar shows `no-web`).
 
 ### Memory
 
