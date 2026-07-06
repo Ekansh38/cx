@@ -486,15 +486,17 @@ end
 -- highlight (paint_hunk draws those); invalidate=true reports the block as
 -- gone when deleted, and undo_restore (default) revives it on vim undo.
 local function decorate(h, oldStart, insStart)
-  if h.delN > 0 then
+  local rN = h.redPaintN or h.delN
+  local gN = h.greenPaintN or h.insN
+  if rN > 0 then
     h.redMark = vim.api.nvim_buf_set_extmark(S.buf, ns, oldStart, 0, {
-      end_row = oldStart + h.delN,
+      end_row = oldStart + rN,
       invalidate = true,
     })
   end
-  if h.insN > 0 then
+  if gN > 0 then
     h.greenMark = vim.api.nvim_buf_set_extmark(S.buf, ns, insStart, 0, {
-      end_row = insStart + h.insN,
+      end_row = insStart + gN,
       invalidate = true,
     })
   end
@@ -638,6 +640,36 @@ function CxReview()
       end
       h.word = h.delN == 1 and h.insN == 1
         and is_ascii(h.old[1] or "") and is_ascii(h.new[1] or "")
+
+      -- Pivot: h.old's suffix == h.new's prefix. Model anchored on an
+      -- unchanged landmark; without this the pivot line would render as
+      -- red-then-green duplicated.
+      local pivotK = 0
+      local minLen = math.min(#h.old, #h.new)
+      for k = 1, minLen do
+        local match = true
+        for i = 1, k do
+          if h.old[#h.old - k + i] ~= h.new[i] then
+            match = false
+            break
+          end
+        end
+        if match then
+          pivotK = k
+        end
+      end
+      h.redPaintN = h.delN
+      h.greenPaintN = h.insN
+      h.newToInsert = h.new
+      if pivotK > 0 and pivotK < #h.new and pivotK < #h.old then
+        h.redPaintN = h.delN - pivotK
+        h.greenPaintN = h.insN - pivotK
+        h.newToInsert = {}
+        for k = pivotK + 1, #h.new do
+          table.insert(h.newToInsert, h.new[k])
+        end
+        h.word = false
+      end
     end
     table.insert(S.hunks, h)
   end
@@ -659,8 +691,9 @@ function CxReview()
       local h = S.hunks[i]
       local oldStart = h.start + h.p
       local insStart = oldStart + h.delN
-      if #h.new > 0 then
-        vim.api.nvim_buf_set_lines(buf, insStart, insStart, false, h.new)
+      local toInsert = h.newToInsert or h.new
+      if #toInsert > 0 then
+        vim.api.nvim_buf_set_lines(buf, insStart, insStart, false, toInsert)
       end
       decorate(h, oldStart, insStart)
     end
