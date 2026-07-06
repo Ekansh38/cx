@@ -865,18 +865,6 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 	verb := parts[0]
 
 	switch input {
-	case "/delete confirm":
-		if err := m.store.DeleteConversation(m.conv.ID); err != nil {
-			m.errMsg = "delete failed: " + err.Error()
-			return m, nil
-		}
-		// Switch to most recent remaining, or create new
-		convs, _ := m.store.ListConversations()
-		if len(convs) == 0 {
-			return m.newConversation()
-		}
-		return m.switchConversation(convs[0].ID)
-
 	case "/wipe confirm":
 		if err := m.store.WipeAll(); err != nil {
 			m.errMsg = "wipe failed: " + err.Error()
@@ -1118,8 +1106,16 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m, nil
 
 	case "/delete":
-		m.injectSystemLine("delete this conversation? type  /delete confirm  to proceed.")
-		return m, nil
+		if err := m.store.DeleteConversation(m.conv.ID); err != nil {
+			m.errMsg = "delete failed: " + err.Error()
+			return m, nil
+		}
+		// Switch to most recent remaining, or create new
+		convs, _ := m.store.ListConversations()
+		if len(convs) == 0 {
+			return m.newConversation()
+		}
+		return m.switchConversation(convs[0].ID)
 
 	case "/edit":
 		if m.streaming {
@@ -1495,7 +1491,7 @@ commands  (type / to see completions)
   /sel                  preview the editor selection waiting for your next msg
   /sel clear            drop it
   /stop                 stop the current response (same as ctrl+c)
-  /delete               delete current conversation (asks confirm)
+  /delete               delete the current conversation
   /rename <title>       rename this conversation
   /model <name>         switch model mid-conversation
   /models               model switcher (fetches from OpenRouter)
