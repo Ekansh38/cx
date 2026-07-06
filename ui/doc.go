@@ -436,6 +436,17 @@ func clip(s string, n int) string {
 	return s[:n] + "…"
 }
 
+// reloadReviewLua re-sources the review lua in the live nvim so cx binary
+// updates take effect on the very next review — no nvim restart needed.
+func reloadReviewLua() {
+	sock := nvimSockPath()
+	if _, err := os.Stat(sock); err != nil {
+		return
+	}
+	rpc(2*time.Second, "--server", sock, "--remote-expr",
+		fmt.Sprintf("execute('luafile %s')", reviewLuaPath()))
+}
+
 // abortExternalReview tells a live in-editor review to discard its pending
 // proposal text (used when cx gives up on it or a conversation goes away).
 func abortExternalReview() {
@@ -443,6 +454,7 @@ func abortExternalReview() {
 	if _, err := os.Stat(sock); err != nil {
 		return
 	}
+	reloadReviewLua()
 	rpc(2*time.Second, "--server", sock, "--remote-expr", "v:lua.CxAbort()")
 }
 
@@ -453,6 +465,7 @@ func applyAllExternalReview() {
 	if _, err := os.Stat(sock); err != nil {
 		return
 	}
+	reloadReviewLua()
 	rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxApplyAll()")
 }
 
@@ -520,6 +533,9 @@ func startExternalReview(docPath string, edits []docEdit) bool {
 	if err := os.WriteFile(editsReqPath(), buf, 0o644); err != nil {
 		return false
 	}
+	// Re-write the lua file too, in case cx was upgraded since spawn
+	os.WriteFile(reviewLuaPath(), []byte(reviewLua), 0o644)
+	reloadReviewLua()
 	return rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxReview()") == nil
 }
 
