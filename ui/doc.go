@@ -85,6 +85,12 @@ THE RULES BELOW MATTER. Violating them makes edits silently fail or become unrev
    lines when needed to make the SEARCH unambiguous. Never resend large
    unchanged regions and never the whole document. One <edit> block per
    independent change: a typo fix and a new paragraph are two blocks.
+   LISTS SPECIFICALLY: if the user asks you to restructure or renumber a
+   list, DO NOT send the whole list as one edit. Send ONE <edit> block per
+   discrete change: one to add a header, one per moved item, one per new
+   item. Renumbered items count as changes and get their own blocks. Big
+   list rewrites reviewed as a single hunk are hostile to review; small
+   independent edits are not.
 
 4. INSERTIONS anchor on an existing line:
    - append at the end: SEARCH = the current last line; REPLACE = that same
@@ -988,7 +994,10 @@ func (m Model) updateDocPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.docPickerQuits = false
 		if fromLaunch {
 			// `cx doc`: open the editor and remember the file, nothing more.
-			// Connecting stays explicit via /connect doc.
+			// Connecting stays explicit via /connect doc — but don't lie
+			// about connection state: a doc restored from a prior session is
+			// already connected, and saying "not connected" then "already
+			// connected" on /connect is a confusing contradiction.
 			abs, err := resolveDocPath(filtered[m.docCursor])
 			if err != nil {
 				m.errMsg = "doc: " + err.Error()
@@ -996,7 +1005,11 @@ func (m Model) updateDocPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 			}
 			SaveLastDoc(abs)
 			m.autoEditorSplit(abs)
-			m.injectSystemLine("opened " + filepath.Base(abs) + " (not connected), /connect doc to attach it")
+			if m.findDoc(abs) != nil {
+				m.injectSystemLine("opened " + filepath.Base(abs) + " (already connected to this chat)")
+			} else {
+				m.injectSystemLine("opened " + filepath.Base(abs) + " (not connected), /connect doc to attach it")
+			}
 			return m, nil
 		}
 		m2, cmd := m.connectDoc(filtered[m.docCursor])
