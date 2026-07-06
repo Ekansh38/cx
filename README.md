@@ -39,8 +39,9 @@ Env vars override config: `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KE
 
 ```bash
 cx                # chat
-cx doc            # fuzzy-pick a doc, then neovim + cx side by side
+cx doc            # fuzzy-pick a doc, open it in neovim beside cx
 cx doc notes.md   # same, with the file given directly
+                  # (opening does NOT connect: /connect doc attaches it)
 ```
 
 ### Keybindings
@@ -76,6 +77,7 @@ cx doc notes.md   # same, with the file given directly
 | `/copy prompt [n]` | Copy your last n messages |
 | `/copy all [n]` | Copy the last n prompt/response pairs |
 | `/retry` / `/r` | Re-send last message |
+| `/fork` | Fuzzy-pick a past prompt and branch a new conversation from it |
 | `/img <path> [text]` | Send an image |
 | `/rename <title>` | Rename conversation |
 | `/model <name>` | Switch model |
@@ -125,7 +127,7 @@ cx doc            # fuzzy-pick from md/txt files under the current directory
 cx doc notes.md   # or name the file directly
 ```
 
-That opens a tmux session with neovim on the left, cx on the right, and the doc connected (reusing tmux/the doc's previous conversation if they exist). The picker matches fuzzily — `nts` finds `notes.md`. Inside cx, `/doc` and `/doc edit` also auto-open the editor in a split when you're in tmux.
+That opens a tmux session with neovim on the left and cx on the right. The doc is remembered but NOT connected to the conversation: type `/connect doc` (no path needed) when you want it in context. The picker matches fuzzily — `nts` finds `notes.md`. Inside cx, `/doc` and `/doc edit` also auto-open the editor in a split when you're in tmux.
 
 cx re-reads the doc from disk on every message, so every `:w` in neovim is instantly visible to the model. To also send it *what you've highlighted*, add this to your neovim config:
 
@@ -180,4 +182,5 @@ Switch mid-conversation with `/model <name>` or use the picker with `ctrl+t`.
 - Config: `~/.config/cx/config.toml`
 - System prompt: `~/.config/cx/system-prompt.md` (edit freely; delete to reset to the default)
 - Memory: `~/.config/cx/memory.md`
+- Editor drafts: `~/.local/share/cx/draft.md` (persists after ctrl+e sessions, never deleted)
 - Database: `~/.local/share/cx/cx.db` (SQLite)

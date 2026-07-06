@@ -984,7 +984,21 @@ func (m Model) updateDocPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.state = stateChat
+		fromLaunch := m.docPickerQuits
 		m.docPickerQuits = false
+		if fromLaunch {
+			// `cx doc`: open the editor and remember the file, nothing more.
+			// Connecting stays explicit via /connect doc.
+			abs, err := resolveDocPath(filtered[m.docCursor])
+			if err != nil {
+				m.errMsg = "doc: " + err.Error()
+				return m, nil
+			}
+			SaveLastDoc(abs)
+			m.autoEditorSplit(abs)
+			m.injectSystemLine("opened " + filepath.Base(abs) + " (not connected), /connect doc to attach it")
+			return m, nil
+		}
 		m2, cmd := m.connectDoc(filtered[m.docCursor])
 		if len(m2.docs) > 0 {
 			m2.autoEditorSplit(m2.docs[len(m2.docs)-1].path)

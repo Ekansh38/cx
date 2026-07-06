@@ -35,3 +35,32 @@ func TestInputBoxShowsAllRowsWhileTyping(t *testing.T) {
 		}
 	}
 }
+
+// A long multi-line value must never be truncated by the textarea: MaxHeight
+// caps input lines when set, which once ate an editor draft (only the first
+// 12 lines survived). MaxHeight=0 + our own display cap prevents it.
+func TestLongValueNotTruncated(t *testing.T) {
+	ta := textarea.New()
+	ta.Prompt = ""
+	ta.ShowLineNumbers = false
+	ta.CharLimit = 0
+	ta.MaxHeight = 0
+	ta.SetWidth(60)
+	ta.SetHeight(1)
+	ta.Focus()
+
+	var lines []string
+	for i := 0; i < 80; i++ {
+		lines = append(lines, "line of a very long prompt")
+	}
+	content := strings.Join(lines, "\n")
+	ta.SetValue(content)
+	if ta.Value() != content {
+		t.Fatalf("textarea truncated: kept %d of %d lines",
+			strings.Count(ta.Value(), "\n")+1, 80)
+	}
+	// display stays capped by cx's own logic
+	if h := min(wrappedRows(ta.Value(), ta.Width())+1, 12); h != 12 {
+		t.Errorf("display cap = %d; want 12", h)
+	}
+}

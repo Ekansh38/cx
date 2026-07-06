@@ -37,6 +37,7 @@ const (
 	stateModelPicker            // model switcher
 	stateDocPicker              // filesystem document picker for /doc
 	stateDocListPicker          // connected-docs picker (/disconnect doc / /doc edit)
+	stateForkPicker             // past-prompt picker for /fork
 )
 
 // ── tea.Msg types ─────────────────────────────────────────────────────────────
@@ -98,7 +99,7 @@ type searchResult struct {
 
 var commands = []string{
 	"/clear", "/connect doc", "/copy", "/copy response ", "/copy prompt ", "/copy all ", "/debug", "/debug expand", "/debug collapse",
-	"/delete", "/disconnect doc", "/doc", "/editor",
+	"/delete", "/disconnect doc", "/doc", "/editor", "/fork",
 	"/edit", "/forget ", "/grep", "/help", "/img ",
 	"/list", "/memory", "/model ", "/models", "/new",
 	"/paste", "/quit", "/r", "/remember ",
@@ -179,6 +180,11 @@ type Model struct {
 	docListFilter string
 	docListCursor int
 
+	// fork picker state (/fork)
+	forkItems  []*store.Message // user prompts, newest first
+	forkFilter string
+	forkCursor int
+
 	// system
 	systemPrompt string
 	verbose      bool // /debug expand: show full notes, memory + context events
@@ -198,7 +204,7 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 	ta.Placeholder = "message..."
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
-	ta.MaxHeight = 12
+	ta.MaxHeight = 0 // no line cap: the widget TRUNCATES input beyond MaxHeight
 	ta.SetHeight(1)
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.FocusedStyle.Base = lipgloss.NewStyle()
@@ -477,7 +483,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case editorDoneMsg:
 		// Mirror the editor exactly into the input — including cleared-to-blank.
 		// Never sends; the user presses Enter.
-		m.input.SetValue(strings.TrimSpace(string(msg)))
+		content := strings.TrimSpace(string(msg))
+		m.input.SetValue(content)
+		if m.input.Value() != content {
+			// the widget dropped part of the text (it truncates in several
+			// edge cases): NEVER lose a draft, collapse it like a paste
+			lines := strings.Count(content, "\n") + 1
+			ph := fmt.Sprintf("[editor draft #%d, %d lines]", len(m.pastes)+1, lines)
+			m.pastes = append(m.pastes, pasteRef{placeholder: ph, text: content})
+			m.input.SetValue(ph)
+		}
 		m.input.CursorEnd()
 		m.syncInputHeight()
 		return m, nil
@@ -574,6 +589,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateDocPicker(msg)
 		case stateDocListPicker:
 			return m.updateDocListPicker(msg)
+		case stateForkPicker:
+			return m.updateForkPicker(msg)
 		default:
 			return m.updateChat(msg)
 		}
@@ -1063,6 +1080,9 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.atBottom = true
 		return m, nil
 
+	case "/fork":
+		return m.enterForkPicker()
+
 	case "/editor":
 		return m.openEditor()
 
@@ -1470,6 +1490,9 @@ commands  (type / to see completions)
                         (returns what exists if the chat is shorter)
   /edit                 edit your last message (loads into input, re-send)
   /editor               open $EDITOR for long input (same as ctrl+e)
+  /fork                 fuzzy-pick a past prompt, branch a new conversation
+                        from just before it, and edit the prompt to resend
+                        (the original conversation is untouched)
   /undo                 revert the edits applied by the last review
   /web [on|off]         web tools (on by default): the model searches the
                         live web and reads pages whenever it decides to,
@@ -2440,26 +2463,24 @@ func (m Model) modelPickerView() string {
 // ── Editor (ctrl+e) ───────────────────────────────────────────────────────────
 
 func (m Model) openEditor() (Model, tea.Cmd) {
-	tmp, err := os.CreateTemp("", "cx-*.md")
-	if err != nil {
-		m.errMsg = "could not create temp file: " + err.Error()
+	// The draft lives in the data dir and is NEVER deleted: whatever happens
+	// to cx or the textarea, the text survives at this path.
+	draft := filepath.Join(config.DataDir(), "draft.md")
+	if err := os.WriteFile(draft, []byte(m.input.Value()), 0o644); err != nil {
+		m.errMsg = "could not create draft file: " + err.Error()
 		return m, nil
 	}
-	tmpName := tmp.Name()
-	tmp.WriteString(m.input.Value())
-	tmp.Close()
 
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
 		editor = "vim"
 	}
 
-	return m, tea.ExecProcess(exec.Command(editor, tmpName), func(err error) tea.Msg {
-		defer os.Remove(tmpName)
+	return m, tea.ExecProcess(exec.Command(editor, draft), func(err error) tea.Msg {
 		if err != nil {
 			return nil
 		}
-		data, readErr := os.ReadFile(tmpName)
+		data, readErr := os.ReadFile(draft)
 		if readErr != nil {
 			return nil
 		}
@@ -2484,6 +2505,8 @@ func (m Model) View() string {
 		return m.docPickerView()
 	case stateDocListPicker:
 		return m.docListPickerView()
+	case stateForkPicker:
+		return m.forkPickerView()
 	default:
 		return m.chatView()
 	}
@@ -3118,4 +3141,151 @@ func timeAgo(unix int64) string {
 	default:
 		return time.Unix(unix, 0).Format("Jan 2")
 	}
+}
+
+// ── Fork picker (/fork) ───────────────────────────────────────────────────────
+
+// enterForkPicker lists this conversation's prompts, newest first.
+func (m Model) enterForkPicker() (Model, tea.Cmd) {
+	var items []*store.Message
+	for i := len(m.messages) - 1; i >= 0; i-- {
+		if m.messages[i].Role == "user" && m.messages[i].ID > 0 {
+			items = append(items, m.messages[i])
+		}
+	}
+	if len(items) == 0 {
+		m.errMsg = "no prompts to fork from"
+		return m, nil
+	}
+	m.state = stateForkPicker
+	m.forkItems = items
+	m.forkFilter = ""
+	m.forkCursor = 0
+	return m, nil
+}
+
+func (m Model) filteredForkItems() []*store.Message {
+	if m.forkFilter == "" {
+		return m.forkItems
+	}
+	q := strings.ToLower(m.forkFilter)
+	var exact, fuzzy []*store.Message
+	for _, msg := range m.forkItems {
+		lc := strings.ToLower(msg.Content)
+		switch {
+		case strings.Contains(lc, q):
+			exact = append(exact, msg)
+		case fuzzyMatch(q, lc):
+			fuzzy = append(fuzzy, msg)
+		}
+	}
+	return append(exact, fuzzy...)
+}
+
+func (m Model) updateForkPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.state = stateChat
+		return m, nil
+
+	case tea.KeyEnter:
+		filtered := m.filteredForkItems()
+		if len(filtered) == 0 {
+			m.state = stateChat
+			return m, nil
+		}
+		return m.forkFrom(filtered[m.forkCursor])
+
+	case tea.KeyUp:
+		if m.forkCursor > 0 {
+			m.forkCursor--
+		}
+		return m, nil
+
+	case tea.KeyDown:
+		if m.forkCursor < len(m.filteredForkItems())-1 {
+			m.forkCursor++
+		}
+		return m, nil
+
+	case tea.KeyBackspace, tea.KeyDelete:
+		if len(m.forkFilter) > 0 {
+			_, size := utf8.DecodeLastRuneInString(m.forkFilter)
+			m.forkFilter = m.forkFilter[:len(m.forkFilter)-size]
+			m.forkCursor = 0
+		}
+		return m, nil
+
+	case tea.KeySpace:
+		m.forkFilter += " "
+		m.forkCursor = 0
+		return m, nil
+
+	case tea.KeyRunes:
+		m.forkFilter += string(msg.Runes)
+		m.forkCursor = 0
+		return m, nil
+	}
+	return m, nil
+}
+
+// forkFrom branches a new conversation containing everything before the
+// chosen prompt and loads that prompt into the input for editing.
+func (m Model) forkFrom(sel *store.Message) (Model, tea.Cmd) {
+	conv, err := m.store.ForkConversation(m.conv.ID, m.model, sel.CreatedAt, sel.ID)
+	if err != nil {
+		m.errMsg = "fork failed: " + err.Error()
+		m.state = stateChat
+		return m, nil
+	}
+	m2, cmd := m.switchConversation(conv.ID)
+	m2.injectSystemLine("forked: history up to the chosen prompt, edit and resend")
+	m2.input.SetValue(stripPlaceholders(sel.Content))
+	m2.input.CursorEnd()
+	m2.syncInputHeight()
+	return m2, cmd
+}
+
+func (m Model) forkPickerView() string {
+	filtered := m.filteredForkItems()
+	maxVisible := max(m.height-10, 1)
+	start := 0
+	if m.forkCursor >= maxVisible {
+		start = m.forkCursor - maxVisible + 1
+	}
+	end := min(start+maxVisible, len(filtered))
+
+	var sb strings.Builder
+	sb.WriteString("\n\n")
+	sb.WriteString(pickerTitleStyle.Render("   Fork from prompt  ") + dimStyle.Render("(newest first)") + "\n\n")
+
+	filterText := m.forkFilter
+	if filterText == "" {
+		filterText = dimStyle.Render("type to filter...")
+	}
+	sb.WriteString(promptStyle.Render("   > ") + filterText + "\n\n")
+
+	if len(filtered) == 0 {
+		sb.WriteString(dimStyle.Render("   no matches") + "\n")
+	} else {
+		for i := start; i < end; i++ {
+			preview := stripPlaceholders(filtered[i].Content)
+			if nl := strings.IndexByte(preview, '\n'); nl >= 0 {
+				preview = preview[:nl]
+			}
+			preview = truncate(preview, max(m.width-10, 20))
+			if i == m.forkCursor {
+				sb.WriteString(pickerSelectedStyle.Render(" › "+preview) + "\n")
+			} else {
+				sb.WriteString(pickerRowStyle.Render("   "+preview) + "\n")
+			}
+		}
+		if len(filtered) > maxVisible {
+			sb.WriteString("\n" + dimStyle.Render(fmt.Sprintf("   … %d more", len(filtered)-maxVisible)) + "\n")
+		}
+	}
+
+	sb.WriteString("\n\n")
+	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter fork  esc back"))
+	return sb.String()
 }

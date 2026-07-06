@@ -301,6 +301,32 @@ func (s *Store) DeleteMessagesFrom(convID, msgID int64) error {
 	return err
 }
 
+// ForkConversation creates a new conversation containing copies of every
+// message from src that comes strictly before the given message (by time,
+// then id), plus the source's doc connections. The source is untouched.
+func (s *Store) ForkConversation(srcID int64, model string, beforeCreated, beforeID int64) (*Conversation, error) {
+	conv, err := s.CreateConversation(model)
+	if err != nil {
+		return nil, err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO messages (conversation_id, role, content, image_path, created_at)
+		 SELECT ?, role, content, image_path, created_at FROM messages
+		 WHERE conversation_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+		 ORDER BY created_at ASC, id ASC`,
+		conv.ID, srcID, beforeCreated, beforeCreated, beforeID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	_, err = s.db.Exec(
+		`INSERT OR IGNORE INTO conversation_docs (conversation_id, path)
+		 SELECT ?, path FROM conversation_docs WHERE conversation_id = ?`,
+		conv.ID, srcID,
+	)
+	return conv, err
+}
+
 // WipeAll deletes every conversation and message from the database.
 func (s *Store) WipeAll() error {
 	_, err := s.db.Exec(`DELETE FROM conversations`)
