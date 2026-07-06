@@ -445,6 +445,19 @@ func abortExternalReview() {
 	rpc(2*time.Second, "--server", sock, "--remote-expr", "v:lua.CxAbort()")
 }
 
+// isKnownEditSearch reports whether the given SEARCH text belongs to any
+// edit in the current review groups. Used to reject stale/leaked events.
+func isKnownEditSearch(groups []editGroup, search string) bool {
+	for _, g := range groups {
+		for _, e := range g.edits {
+			if e.search == search {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // startExternalReview hands the edits to neovim. Returns false (caller falls
 // back to the in-cx review) if the bridge isn't up.
 func startExternalReview(docPath string, edits []docEdit) bool {

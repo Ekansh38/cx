@@ -23,6 +23,15 @@ func main() {
 		os.Exit(ui.RunFlushChild(os.Args[2]))
 	}
 
+	// Review handoff files (edits/edits-done/reject-now) are per-session
+	// ephemera. If cx or the bridged neovim crashed last time, leftovers
+	// would be replayed against a new session, leaking test-fixture text
+	// or stale rejections into a real conversation. Clean them at startup.
+	dd := config.DataDir()
+	os.Remove(filepath.Join(dd, "edits.json"))
+	os.Remove(filepath.Join(dd, "edits-done.json"))
+	os.Remove(filepath.Join(dd, "reject-now.jsonl"))
+
 	// cx vim [file] — open a document in the user's editor with the cx bridge
 	// (RPC socket + review lua when neovim), but WITHOUT a tmux split. Use
 	// this to open any of the several docs connected to one chat. With no
