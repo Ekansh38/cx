@@ -243,7 +243,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.Width = msg.Width
 			m.viewport.Height = m.viewportHeight()
 		}
-		m.input.SetWidth(msg.Width - 4)
+		m.input.SetWidth(msg.Width - 6)
 		m.refreshContent() // re-wrap on every resize
 		if m.atBottom {
 			m.viewport.GotoBottom()
@@ -2410,15 +2410,15 @@ func (m Model) sepView() string {
 	if m.errMsg != "" {
 		return errStyle.Render("  " + m.errMsg)
 	}
-	return sepStyle.Render(strings.Repeat("─", m.width))
+	return "" // the input box border is separation enough
 }
 
 func (m Model) inputView() string {
-	prefix := promptStyle.Render(" > ")
+	border := inputBoxStyle
 	if m.streaming {
-		prefix = dimStyle.Render(" > ")
+		border = inputBoxDimStyle
 	}
-	return prefix + m.input.View()
+	return border.Width(m.width - 2).Render(m.input.View())
 }
 
 // syncInputHeight resizes the textarea and viewport after input content changes.
@@ -2432,15 +2432,7 @@ func (m *Model) syncInputHeight() {
 }
 
 func (m Model) inputHeight() int {
-	w := m.input.Width()
-	if w <= 0 {
-		return 1
-	}
-	rows := 0
-	for line := range strings.SplitSeq(m.input.Value(), "\n") {
-		rows += max(1, (lipgloss.Width(line)+w-1)/w)
-	}
-	return min(max(rows, 1), 12)
+	return min(wrappedRows(m.input.Value(), m.input.Width()), 12)
 }
 
 func (m Model) statusView() string {
@@ -2751,8 +2743,8 @@ func (m *Model) renderMarkdown(content string) string {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func (m Model) viewportHeight() int {
-	// sep(1) + input(dynamic) + blank(1) + status(1) = 3 + inputHeight
-	return max(m.height-3-m.inputHeight(), 1)
+	// sep(1) + input box borders(2) + input(dynamic) + gap(1) + status(1)
+	return max(m.height-5-m.inputHeight(), 1)
 }
 
 // wordWrap wraps text at width, preserving explicit newlines.
