@@ -184,6 +184,20 @@ local function hunk_row(h)
   return r and r[1] or nil
 end
 
+-- paint_line stamps a per-line line_hl_group extmark on every row in
+-- [startRow, endRow). That's the ONE thing treesitter/render-markdown
+-- can't override with a token-level bg — line_hl_group paints the whole
+-- line including tokens like ##, -, *, ● that syntax plugins style
+-- with their own backgrounds.
+local function paint_line_range(startRow, endRow, hl)
+  for r = startRow, endRow - 1 do
+    vim.api.nvim_buf_set_extmark(S.buf, paint, r, 0, {
+      line_hl_group = hl,
+      priority = 10000,
+    })
+  end
+end
+
 -- paint_hunk draws highlights for one pending hunk from its live tracking
 -- ranges (word-level for single-line changes).
 local function paint_hunk(h, idx)
@@ -192,8 +206,10 @@ local function paint_hunk(h, idx)
   if h.word and red and green then
     -- GitHub-style: whole lines carry the diff background so it reads as a
     -- standard line diff, and the changed span gets a stronger overlay
-    vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], 0, { end_row = red[2], hl_group = "DiffDelete", hl_eol = true, priority = 200 })
-    vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], 0, { end_row = green[2], hl_group = "DiffAdd", hl_eol = true, priority = 200 })
+    paint_line_range(red[1], red[2], "DiffDelete")
+    paint_line_range(green[1], green[2], "DiffAdd")
+    vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], 0, { end_row = red[2], hl_group = "DiffDelete", hl_eol = true, priority = 10000 })
+    vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], 0, { end_row = green[2], hl_group = "DiffAdd", hl_eol = true, priority = 10000 })
     local wp, oe, ne = split_diff(h.old[1], h.new[1])
     if oe > wp then
       vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], wp, { end_col = oe, hl_group = "CxWordDel", priority = 5000, strict = false })
@@ -203,10 +219,12 @@ local function paint_hunk(h, idx)
     end
   else
     if red then
-      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], 0, { end_row = red[2], hl_group = "DiffDelete", hl_eol = true, priority = 200 })
+      paint_line_range(red[1], red[2], "DiffDelete")
+      vim.api.nvim_buf_set_extmark(S.buf, paint, red[1], 0, { end_row = red[2], hl_group = "DiffDelete", hl_eol = true, priority = 10000 })
     end
     if green then
-      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], 0, { end_row = green[2], hl_group = "DiffAdd", hl_eol = true, priority = 200 })
+      paint_line_range(green[1], green[2], "DiffAdd")
+      vim.api.nvim_buf_set_extmark(S.buf, paint, green[1], 0, { end_row = green[2], hl_group = "DiffAdd", hl_eol = true, priority = 10000 })
     end
   end
   local anchor = green or red
