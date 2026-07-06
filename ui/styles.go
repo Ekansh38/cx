@@ -62,4 +62,12 @@ var (
 	// Proposed-edit diff lines
 	diffOldStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 	diffNewStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+
+	// Prompt input box (rounded, Claude Code style); dim while streaming
+	inputBoxStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("245")).
+			Padding(0, 1)
+	inputBoxDimStyle = inputBoxStyle.
+				BorderForeground(lipgloss.Color("240"))
 )
