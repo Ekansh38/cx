@@ -897,16 +897,22 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	}
 
 	// Pick up an editor highlight, if one was sent over (see README: neovim bridge).
-	// Selections from files that aren't connected docs are ignored.
+	// Skip selections whose file no longer exists (stale from a crashed nvim
+	// or a prior test run) so they don't hijack the message and auto-connect
+	// a bogus doc.
 	display := input
 	if sel := readSelection(); sel != nil {
-		if len(m.docs) == 0 {
-			m, _ = m.connectDoc(sel.file) // auto-connect the highlighted file
-		}
-		if m.findDoc(sel.file) != nil {
-			m.pendingSel = sel
-			consumeSelection()
-			display += fmt.Sprintf("\n[highlighted L%d-%d in %s]", sel.start, sel.end, filepath.Base(sel.file))
+		if _, err := os.Stat(sel.file); err != nil {
+			consumeSelection() // stale reference: throw it away silently
+		} else {
+			if len(m.docs) == 0 {
+				m, _ = m.connectDoc(sel.file) // auto-connect the highlighted file
+			}
+			if m.findDoc(sel.file) != nil {
+				m.pendingSel = sel
+				consumeSelection()
+				display += fmt.Sprintf("\n[highlighted L%d-%d in %s]", sel.start, sel.end, filepath.Base(sel.file))
+			}
 		}
 	}
 	// Resolve @file mentions: text files connect as docs, images and PDFs

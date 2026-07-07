@@ -31,6 +31,7 @@ func main() {
 	os.Remove(filepath.Join(dd, "edits.json"))
 	os.Remove(filepath.Join(dd, "edits-done.json"))
 	os.Remove(filepath.Join(dd, "reject-now.jsonl"))
+	os.Remove(filepath.Join(dd, "selection.txt")) // stale editor highlight from a crashed nvim / prior tests
 
 	// cx vim [file] — open a document in the user's editor with the cx bridge
 	// (RPC socket + review lua when neovim), but WITHOUT a tmux split. Use
