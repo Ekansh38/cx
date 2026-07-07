@@ -38,6 +38,32 @@ func webTools() []llm.Tool {
 			},
 		},
 		{
+			Name:        "apply_pending_edit",
+			Description: "Apply ONE specific pending edit by its 1-based number (the same number shown in the neovim review footer 'cx X/N'). Use when the user says 'yes to edit 3', 'accept that one', 'apply the Backlog change', etc. — you decide which index they mean based on context.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"index": map[string]any{
+						"type":        "integer",
+						"description": "1-based edit number",
+					},
+				},
+				"required": []string{"index"},
+			},
+		},
+		{
+			Name:        "reject_pending_edit",
+			Description: "Reject ONE specific pending edit by its 1-based number, with an optional reason. If a reason is given, cx sends it back to you so you can propose a revised edit in the same response. Use for 'no not that one', 'skip edit 4', 'reject the OSTEP change because ...'.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"index":  map[string]any{"type": "integer", "description": "1-based edit number"},
+					"reason": map[string]any{"type": "string", "description": "why (optional)"},
+				},
+				"required": []string{"index"},
+			},
+		},
+		{
 			Name:        "web_search",
 			Description: "Search the live web. Use for anything current: news, prices, rankings, recent releases, or facts you are not certain about. Craft a specific search query; do not pass the user's message verbatim. Returns findings with source URLs.",
 			Parameters: map[string]any{
@@ -79,6 +105,35 @@ func execWebTool(ctx context.Context, cfg *config.Config, call llm.ToolCall) (st
 	case "apply_all_pending_edits":
 		applyAllExternalReview()
 		return "applying all pending edits", "OK, applied every pending edit."
+
+	case "apply_pending_edit":
+		var args struct {
+			Index int `json:"index"`
+		}
+		if err := json.Unmarshal([]byte(call.Args), &args); err != nil || args.Index < 1 {
+			return "applying edit", "error: apply_pending_edit needs a positive 1-based index"
+		}
+		if !applyPendingEditByIndex(args.Index) {
+			return fmt.Sprintf("applying edit %d", args.Index), fmt.Sprintf("could not reach neovim to apply edit %d", args.Index)
+		}
+		return fmt.Sprintf("applying edit %d", args.Index), fmt.Sprintf("OK, applied edit %d.", args.Index)
+
+	case "reject_pending_edit":
+		var args struct {
+			Index  int    `json:"index"`
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal([]byte(call.Args), &args); err != nil || args.Index < 1 {
+			return "rejecting edit", "error: reject_pending_edit needs a positive 1-based index"
+		}
+		if !rejectPendingEditByIndex(args.Index, args.Reason) {
+			return fmt.Sprintf("rejecting edit %d", args.Index), fmt.Sprintf("could not reach neovim to reject edit %d", args.Index)
+		}
+		note := fmt.Sprintf("OK, rejected edit %d", args.Index)
+		if args.Reason != "" {
+			note += ": " + args.Reason
+		}
+		return fmt.Sprintf("rejecting edit %d", args.Index), note + "."
 
 	case "web_search":
 		var args struct {
