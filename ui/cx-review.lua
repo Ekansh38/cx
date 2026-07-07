@@ -309,6 +309,26 @@ local function goto_next_pending()
   end
 end
 
+-- suppress_plugins disables markdown-rendering plugins that paint per-token
+-- backgrounds on #, ##, -, *, ● at priorities that beat line_hl_group.
+-- Returns a restore fn called on finish/abort.
+local function suppress_plugins(buf)
+  local restores = {}
+  local ok, rm = pcall(require, "render-markdown")
+  if ok and rm then
+    if type(rm.buf_disable) == "function" then
+      pcall(rm.buf_disable, buf)
+      table.insert(restores, function() pcall(rm.buf_enable, buf) end)
+    elseif type(rm.disable) == "function" then
+      pcall(rm.disable)
+      table.insert(restores, function() pcall(rm.enable) end)
+    end
+  end
+  return function()
+    for _, r in ipairs(restores) do r() end
+  end
+end
+
 local function finish()
   local results, applied = {}, 0
   for _, h in ipairs(S.hunks) do
@@ -352,6 +372,10 @@ local function finish()
   pcall(vim.fn.setqflist, {}, "r")
   vim.fn.writefile({ vim.json.encode({ results = results }) }, datadir .. "/edits-done.json")
   vim.notify(string.format("cx: %d/%d applied", applied, #results))
+  if S.restore_plugins then
+    S.restore_plugins()
+    S.restore_plugins = nil
+  end
   S.hunks = nil
 end
 
@@ -563,6 +587,10 @@ function CxAbort()
     pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
   end
   pcall(vim.fn.setqflist, {}, "r")
+  if S.restore_plugins then
+    S.restore_plugins()
+    S.restore_plugins = nil
+  end
   S.hunks = nil
   vim.notify("cx: review discarded")
   return 1
@@ -638,6 +666,7 @@ function CxReview()
   S.buf = buf
   S.total = #req.edits
   S.hunks = {}
+  S.restore_plugins = suppress_plugins(buf)
 
   for _, e in ipairs(req.edits) do
     local h = { search = lines_of(e.search), replace = lines_of(e.replace) }
