@@ -299,6 +299,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				for _, ev := range events {
 					fmt.Fprintf(&sb, "I rejected the proposed edit changing %q to %q. Reason: %q. ",
 						clip(ev.Search, 300), clip(ev.Replace, 300), ev.Reason)
+					if ev.SelectionText != "" {
+						fmt.Fprintf(&sb, "I was highlighting lines %d-%d in %s: %q. ",
+							ev.SelectionFrom, ev.SelectionTo,
+							filepath.Base(ev.SelectionFile),
+							clip(ev.SelectionText, 800))
+					}
 				}
 				sb.WriteString("Revise it now and propose an updated <edit> block. The other proposed edits are still under review; do not resend them.")
 				note := sb.String()
@@ -463,11 +469,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				edits = nil // don't start a review below
 			}
 			if len(edits) > 0 && len(m.extGroups) > 0 {
-				// A review is already on screen in neovim: queue these
+				// A review is already on screen in neovim: queue silently
 				// behind it and re-arm the tick — the previous chain
 				// exited when the original group's results were consumed
 				m.extGroups = append(m.extGroups, groupEditsByFile(edits)...)
-				m.injectSystemLine(fmt.Sprintf("queued %d more edits behind the current review", len(edits)))
 				reviewCmd = extReviewTick(0)
 			} else if len(edits) > 0 {
 				groups := groupEditsByFile(edits)

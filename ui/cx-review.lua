@@ -37,14 +37,20 @@ end
 -- diff colors: the changed span is a stronger shade of the SAME hue
 -- (git-delta / GitHub convention), never a different color like DiffText.
 local function setup_word_hl()
-  local target = vim.o.background == "dark" and 0xFFFFFF or 0x000000
+  -- Bold-only was too subtle. Emphasize by INVERTING the line's diff bg
+  -- as the changed span's fg, plus underline + bold. Whatever fg the base
+  -- theme uses on the diff line becomes the span's bg — maximum contrast
+  -- against the surrounding red/green line.
   for base, name in pairs({ DiffDelete = "CxWordDel", DiffAdd = "CxWordAdd" }) do
     local h = vim.api.nvim_get_hl(0, { name = base, link = false })
-    if h.bg then
-      vim.api.nvim_set_hl(0, name, { bg = blend(h.bg, target, 0.22), fg = h.fg, bold = true })
-    else
-      vim.api.nvim_set_hl(0, name, { underline = true, bold = true })
+    local spec = { bold = true, underline = true, reverse = true }
+    if h.fg then
+      spec.fg = h.fg
     end
+    if h.bg then
+      spec.bg = h.bg
+    end
+    vim.api.nvim_set_hl(0, name, spec)
   end
 end
 
@@ -510,13 +516,27 @@ local function decide(action)
       h.reason = reason
       if reason ~= "" then
         h.reported = true
+        local ev = {
+          reason = reason,
+          search = table.concat(h.search, "\n"),
+          replace = table.concat(h.replace, "\n"),
+        }
+        -- Fold any pending editor highlight into the rejection so the
+        -- model can act on it while retrying, without needing a separate
+        -- chat message
+        local ok, sel = pcall(vim.fn.readfile, datadir .. "/selection.txt")
+        if ok and #sel >= 3 then
+          local from, to = sel[2]:match("(%d+)-(%d+)")
+          ev.selection_file = sel[1]
+          ev.selection_from = tonumber(from)
+          ev.selection_to = tonumber(to)
+          ev.selection_text = table.concat({ unpack(sel, 3) }, "\n")
+          -- consume so the next chat message doesn't re-send it
+          pcall(os.remove, datadir .. "/selection.txt")
+        end
         local f = io.open(datadir .. "/reject-now.jsonl", "a")
         if f then
-          f:write(vim.json.encode({
-            reason = reason,
-            search = table.concat(h.search, "\n"),
-            replace = table.concat(h.replace, "\n"),
-          }) .. "\n")
+          f:write(vim.json.encode(ev) .. "\n")
           f:close()
         end
       end
