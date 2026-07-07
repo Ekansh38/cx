@@ -684,6 +684,106 @@ function CxSyncDocs()
   return n
 end
 
+-- prepare_hunk turns a raw {search, replace} edit into the fully-populated
+-- hunk table (delN, insN, pivot handling, word-diff eligibility). Returns
+-- a notfound-marked hunk when the search can't be located.
+function prepare_hunk(buf, e)
+  local h = { search = lines_of(e.search), replace = lines_of(e.replace) }
+  h.start = locate(buf, h.search)
+  if not h.start then
+    h.notfound = true
+    return h
+  end
+  local p, sfx = common_affixes(h.search, h.replace)
+  h.p = p
+  h.delN = #h.search - p - sfx
+  h.insN = #h.replace - p - sfx
+  h.old = {}
+  for k = p + 1, #h.search - sfx do
+    table.insert(h.old, h.search[k])
+  end
+  h.new = {}
+  for k = p + 1, #h.replace - sfx do
+    table.insert(h.new, h.replace[k])
+  end
+  h.word = h.delN == 1 and h.insN == 1
+    and is_ascii(h.old[1] or "") and is_ascii(h.new[1] or "")
+
+  -- Pivot detection (see CxReview comments).
+  local pivotK = 0
+  local minLen = math.min(#h.old, #h.new)
+  for k = 1, minLen do
+    local match = true
+    for i = 1, k do
+      if h.old[#h.old - k + i] ~= h.new[i] then
+        match = false
+        break
+      end
+    end
+    if match then
+      pivotK = k
+    end
+  end
+  h.redPaintN = h.delN
+  h.greenPaintN = h.insN
+  h.newToInsert = h.new
+  if pivotK > 0 and pivotK < #h.new and pivotK < #h.old then
+    h.redPaintN = h.delN - pivotK
+    h.greenPaintN = h.insN - pivotK
+    h.newToInsert = {}
+    for k = pivotK + 1, #h.new do
+      table.insert(h.newToInsert, h.new[k])
+    end
+    h.word = false
+  end
+  return h
+end
+
+-- CxAddEdits appends new edits to the CURRENTLY LIVE review instead of
+-- starting a fresh one. Used by cx when a retry response arrives during
+-- an open review: previous decisions stay put, remaining pending edits
+-- stay pending, and the new revised edits appear alongside them as new
+-- pending hunks. Returns the number of hunks actually added.
+function CxAddEdits()
+  if not S.hunks or not S.buf or not vim.api.nvim_buf_is_valid(S.buf) then
+    return 0
+  end
+  local ok, raw = pcall(vim.fn.readfile, datadir .. "/edits.json")
+  if not ok or #raw == 0 then
+    return 0
+  end
+  local req = vim.json.decode(table.concat(raw, "\n"))
+  if not req or not req.edits or #req.edits == 0 then
+    return 0
+  end
+  local added = 0
+  -- Insert bottom-up by locate position so earlier insertions don't shift
+  -- later ones' target rows.
+  local prepared = {}
+  for _, e in ipairs(req.edits) do
+    table.insert(prepared, prepare_hunk(S.buf, e))
+  end
+  table.sort(prepared, function(a, b)
+    return (a.start or -1) > (b.start or -1)
+  end)
+  for _, h in ipairs(prepared) do
+    if not h.notfound then
+      local oldStart = h.start + h.p
+      local insStart = oldStart + h.delN
+      if #h.newToInsert > 0 then
+        pcall(vim.api.nvim_buf_set_lines, S.buf, insStart, insStart, false, h.newToInsert)
+      end
+      decorate(h, oldStart, insStart)
+    end
+    table.insert(S.hunks, h)
+    S.total = S.total + 1
+    added = added + 1
+  end
+  repaint()
+  vim.notify(string.format("cx: %d more edit%s added to the review", added, added == 1 and "" or "s"))
+  return added
+end
+
 function CxReview()
   local ok, raw = pcall(vim.fn.readfile, datadir .. "/edits.json")
   if not ok or #raw == 0 then
@@ -725,57 +825,7 @@ function CxReview()
   S.restore_plugins = suppress_plugins(buf)
 
   for _, e in ipairs(req.edits) do
-    local h = { search = lines_of(e.search), replace = lines_of(e.replace) }
-    h.start = locate(buf, h.search)
-    if not h.start then
-      h.notfound = true
-    else
-      local p, sfx = common_affixes(h.search, h.replace)
-      h.p = p
-      h.delN = #h.search - p - sfx
-      h.insN = #h.replace - p - sfx
-      h.old = {}
-      for k = p + 1, #h.search - sfx do
-        table.insert(h.old, h.search[k])
-      end
-      h.new = {}
-      for k = p + 1, #h.replace - sfx do
-        table.insert(h.new, h.replace[k])
-      end
-      h.word = h.delN == 1 and h.insN == 1
-        and is_ascii(h.old[1] or "") and is_ascii(h.new[1] or "")
-
-      -- Pivot: h.old's suffix == h.new's prefix. Model anchored on an
-      -- unchanged landmark; without this the pivot line would render as
-      -- red-then-green duplicated.
-      local pivotK = 0
-      local minLen = math.min(#h.old, #h.new)
-      for k = 1, minLen do
-        local match = true
-        for i = 1, k do
-          if h.old[#h.old - k + i] ~= h.new[i] then
-            match = false
-            break
-          end
-        end
-        if match then
-          pivotK = k
-        end
-      end
-      h.redPaintN = h.delN
-      h.greenPaintN = h.insN
-      h.newToInsert = h.new
-      if pivotK > 0 and pivotK < #h.new and pivotK < #h.old then
-        h.redPaintN = h.delN - pivotK
-        h.greenPaintN = h.insN - pivotK
-        h.newToInsert = {}
-        for k = pivotK + 1, #h.new do
-          table.insert(h.newToInsert, h.new[k])
-        end
-        h.word = false
-      end
-    end
-    table.insert(S.hunks, h)
+    table.insert(S.hunks, prepare_hunk(buf, e))
   end
 
   -- Insert green blocks bottom-up so earlier positions stay valid. Any
