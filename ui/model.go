@@ -273,6 +273,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case extReviewTickMsg:
 		if consumeReviewDiscard() {
+			abortExternalReview() // nvim may still hold the review; wipe it
 			m.extGroups = nil
 			m.extNotes = nil
 			m.extRetry = false
@@ -451,6 +452,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			edits, noops = explodeEdits(edits, m.docs)
 			if len(edits) == 0 && noops > 0 {
 				m.injectSystemLine(fmt.Sprintf("%d proposed edit(s) matched the document already, nothing to apply", noops))
+			}
+			if len(edits) > 0 && consumeReviewDiscard() {
+				abortExternalReview()
+				m.extGroups = nil
+				m.extNotes = nil
+				m.extRetry = false
+				m.lastApplied = nil
+				m.injectSystemLine("discarded pending edits (via cx)")
+				edits = nil // don't start a review below
 			}
 			if len(edits) > 0 && len(m.extGroups) > 0 {
 				// A review is already on screen in neovim: queue these

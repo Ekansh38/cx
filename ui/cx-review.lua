@@ -563,6 +563,42 @@ function CxApplyAll()
   return 1
 end
 
+-- CxApplyIndex accepts one pending hunk by 1-based index.
+function CxApplyIndex(i)
+  if not S.hunks or i < 1 or i > #S.hunks then return 0 end
+  local h = S.hunks[i]
+  if state(h) ~= "pending" then return 0 end
+  do_apply(h)
+  repaint()
+  if pending() == 0 then finish() end
+  return 1
+end
+
+-- CxRejectIndex rejects one pending hunk by 1-based index with an optional
+-- reason. Writes a reject-now event so cx can auto-retry (same as N).
+function CxRejectIndex(i, reason)
+  if not S.hunks or i < 1 or i > #S.hunks then return 0 end
+  local h = S.hunks[i]
+  if state(h) ~= "pending" then return 0 end
+  do_skip(h)
+  h.reason = reason or ""
+  if reason and reason ~= "" then
+    h.reported = true
+    local f = io.open(datadir .. "/reject-now.jsonl", "a")
+    if f then
+      f:write(vim.json.encode({
+        reason = reason,
+        search = table.concat(h.search, "\n"),
+        replace = table.concat(h.replace, "\n"),
+      }) .. "\n")
+      f:close()
+    end
+  end
+  repaint()
+  if pending() == 0 then finish() end
+  return 1
+end
+
 -- CxAbort discards a live review: pending proposal (green) blocks are
 -- removed, decorations and keymaps cleaned up, no results written. Called
 -- by cx when it abandons a review, and by CxReview before starting a new

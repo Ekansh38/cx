@@ -469,6 +469,31 @@ func applyAllExternalReview() {
 	rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxApplyAll()")
 }
 
+// applyPendingEditByIndex applies a specific pending hunk by its 1-based
+// index (matches the "cx X/N" number in the review footer).
+func applyPendingEditByIndex(idx int) bool {
+	sock := nvimSockPath()
+	if _, err := os.Stat(sock); err != nil {
+		return false
+	}
+	reloadReviewLua()
+	return rpc(3*time.Second, "--server", sock, "--remote-expr",
+		fmt.Sprintf("v:lua.CxApplyIndex(%d)", idx)) == nil
+}
+
+// rejectPendingEditByIndex rejects a specific pending hunk with a reason.
+// The reason is streamed back so the model can auto-retry, same as N.
+func rejectPendingEditByIndex(idx int, reason string) bool {
+	sock := nvimSockPath()
+	if _, err := os.Stat(sock); err != nil {
+		return false
+	}
+	reloadReviewLua()
+	esc := strings.ReplaceAll(reason, "'", "''")
+	return rpc(3*time.Second, "--server", sock, "--remote-expr",
+		fmt.Sprintf("v:lua.CxRejectIndex(%d, '''%s''')", idx, esc)) == nil
+}
+
 // reviewSignal carries model-tool decisions (discard, apply-all) from the
 // tool goroutine to the extReviewTick handler in Update.
 var reviewSignal struct {
