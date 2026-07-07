@@ -400,9 +400,13 @@ type editResult struct {
 
 // rejectEvent is one N-with-note decision flagged for an immediate revision.
 type rejectEvent struct {
-	Reason  string `json:"reason"`
-	Search  string `json:"search"`
-	Replace string `json:"replace"`
+	Reason        string `json:"reason"`
+	Search        string `json:"search"`
+	Replace       string `json:"replace"`
+	SelectionFile string `json:"selection_file,omitempty"`
+	SelectionFrom int    `json:"selection_from,omitempty"`
+	SelectionTo   int    `json:"selection_to,omitempty"`
+	SelectionText string `json:"selection_text,omitempty"`
 }
 
 // consumeRejectNow returns rejections neovim flagged for an immediate
@@ -467,6 +471,37 @@ func applyAllExternalReview() {
 	}
 	reloadReviewLua()
 	rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxApplyAll()")
+}
+
+// appendExternalReview injects new edits into the live in-editor review
+// (no fresh review, no aborting the current one, no queueing). Returns
+// false when there's no live socket or the RPC fails; caller falls back
+// to starting a fresh review.
+func appendExternalReview(docPath string, edits []docEdit) bool {
+	sock := nvimSockPath()
+	if !nvimAlive(sock) {
+		return false
+	}
+	type reqEdit struct {
+		Search  string `json:"search"`
+		Replace string `json:"replace"`
+	}
+	req := struct {
+		File  string    `json:"file"`
+		Edits []reqEdit `json:"edits"`
+	}{File: docPath}
+	for _, e := range edits {
+		req.Edits = append(req.Edits, reqEdit{Search: e.search, Replace: e.replace})
+	}
+	buf, err := json.Marshal(req)
+	if err != nil {
+		return false
+	}
+	if err := os.WriteFile(editsReqPath(), buf, 0o644); err != nil {
+		return false
+	}
+	reloadReviewLua()
+	return rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxAddEdits()") == nil
 }
 
 // applyPendingEditByIndex applies a specific pending hunk by its 1-based

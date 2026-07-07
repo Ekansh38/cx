@@ -469,10 +469,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				edits = nil // don't start a review below
 			}
 			if len(edits) > 0 && len(m.extGroups) > 0 {
-				// A review is already on screen in neovim: queue silently
-				// behind it and re-arm the tick — the previous chain
-				// exited when the original group's results were consumed
-				m.extGroups = append(m.extGroups, groupEditsByFile(edits)...)
+				// A review is already on screen: INJECT the new edits into
+				// it as additional pending hunks. No aborting the current
+				// review, no queueing behind unfinished decisions, no user
+				// waiting to finish before the fix appears.
+				groups := groupEditsByFile(edits)
+				injected := 0
+				for _, g := range groups {
+					if appendExternalReview(g.file, g.edits) {
+						m.extGroups[len(m.extGroups)-1].edits = append(m.extGroups[len(m.extGroups)-1].edits, g.edits...)
+						injected += len(g.edits)
+					}
+				}
+				if injected == 0 {
+					// Append failed (bridge down mid-session): fall back to
+					// the old queue path so the retry isn't lost entirely.
+					m.extGroups = append(m.extGroups, groups...)
+				}
 				reviewCmd = extReviewTick(0)
 			} else if len(edits) > 0 {
 				groups := groupEditsByFile(edits)
