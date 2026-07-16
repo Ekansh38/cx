@@ -327,6 +327,64 @@ func (s *Store) ForkConversation(srcID int64, model string, beforeCreated, befor
 	return conv, err
 }
 
+// RecentSummaries returns, for each of the most recently updated conversations
+// other than excludeConvID, a one-paragraph recap suitable for cross-
+// conversation memory context. It prefers the latest persisted compaction
+// summary row; conversations without one fall back to their first user
+// message (often the prompt that frames the whole thread). limit caps the
+// number of conversations returned.
+func (s *Store) RecentSummaries(excludeConvID int64, limit int) ([]*Message, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(
+		`SELECT c.id, c.title, c.updated_at,
+		        (SELECT content FROM messages m
+		         WHERE m.conversation_id = c.id AND m.role = 'summary'
+		         ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS summary,
+		        (SELECT content FROM messages m
+		         WHERE m.conversation_id = c.id AND m.role = 'user'
+		         ORDER BY m.created_at ASC, m.id ASC LIMIT 1) AS first_user
+		 FROM conversations c
+		 WHERE c.id != ?
+		 ORDER BY c.updated_at DESC
+		 LIMIT ?`,
+		excludeConvID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*Message
+	for rows.Next() {
+		var (
+			convID   int64
+			title    string
+			updated  int64
+			summary  sql.NullString
+			firstUsr sql.NullString
+		)
+		if err := rows.Scan(&convID, &title, &updated, &summary, &firstUsr); err != nil {
+			return nil, err
+		}
+		content := ""
+		if summary.Valid && strings.TrimSpace(summary.String) != "" {
+			content = strings.TrimSpace(summary.String)
+		} else if firstUsr.Valid {
+			content = strings.TrimSpace(firstUsr.String)
+		}
+		out = append(out, &Message{
+			ID:        0,
+			ConvID:    convID,
+			Role:      "summary",
+			Content:   title + "\u0000" + content,
+			CreatedAt: updated,
+		})
+	}
+	return out, rows.Err()
+}
+
 // WipeAll deletes every conversation and message from the database.
 func (s *Store) WipeAll() error {
 	_, err := s.db.Exec(`DELETE FROM conversations`)

@@ -2,6 +2,7 @@ package store
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -115,4 +116,67 @@ func TestForkConversation(t *testing.T) {
 		t.Errorf("source mutated: %d messages", len(srcMsgs))
 	}
 	_ = m1
+}
+
+func TestRecentSummaries(t *testing.T) {
+	st := testStore(t)
+
+	// Conv A: has a compaction summary.
+	convA, _ := st.CreateConversation("m")
+	st.UpdateTitle(convA.ID, "Project A")
+	st.AddMessage(convA.ID, "user", "first prompt in A")
+	st.AddMessage(convA.ID, "assistant", "reply")
+	st.AddMessageAt(convA.ID, "summary", "Decided to use Go for the API. Discussed auth.", 0)
+	st.AddMessage(convA.ID, "user", "next turn")
+
+	// Conv B: no summary yet — should fall back to the first user message.
+	convB, _ := st.CreateConversation("m")
+	st.UpdateTitle(convB.ID, "Project B")
+	st.AddMessage(convB.ID, "user", "explain how transformers work")
+
+	// Conv C (the "current" one, excluded).
+	convC, _ := st.CreateConversation("m")
+	st.UpdateTitle(convC.ID, "Current")
+	st.AddMessage(convC.ID, "user", "hi")
+
+	// Touch A so it's the most recently updated (order matters for the query).
+	st.TouchConversation(convA.ID)
+
+	recaps, err := st.RecentSummaries(convC.ID, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recaps) != 2 {
+		t.Fatalf("want 2 recaps (A and B, excluding current C); got %d", len(recaps))
+	}
+
+	// A should be first (most recently updated) and carry its summary.
+	a := recaps[0]
+	if !strings.Contains(a.Content, "Project A") {
+		t.Errorf("recap A missing title: %q", a.Content)
+	}
+	if !strings.Contains(a.Content, "Decided to use Go") {
+		t.Errorf("recap A missing summary content: %q", a.Content)
+	}
+
+	// B falls back to its first user message.
+	b := recaps[1]
+	if !strings.Contains(b.Content, "Project B") {
+		t.Errorf("recap B missing title: %q", b.Content)
+	}
+	if !strings.Contains(b.Content, "explain how transformers work") {
+		t.Errorf("recap B missing fallback first-user content: %q", b.Content)
+	}
+
+	// Current conversation must be excluded.
+	for _, r := range recaps {
+		if r.ConvID == convC.ID {
+			t.Error("current conversation leaked into recaps")
+		}
+	}
+
+	// limit=0 is a no-op.
+	if r, _ := st.RecentSummaries(convC.ID, 0); len(r) != 0 {
+		t.Errorf("limit=0 should return nothing; got %d", len(r))
+	}
 }

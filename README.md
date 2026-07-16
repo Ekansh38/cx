@@ -55,7 +55,7 @@ cx vim notes.md   # same, with the file given directly
 |-----|--------|
 | `enter` | Send message |
 | `alt+enter` | Newline (multiline input; the box grows as you type, and big pastes collapse to `[paste #N, X lines]`) |
-| `esc` | Clear input line |
+| `esc` | Dismiss a stuck error banner (never wipes the input) |
 | `up/down` | Move through your prompt (scrolls chat when empty) |
 | `ctrl+c` | Cancel stream / quit |
 | `ctrl+l` | Conversation picker |
@@ -64,6 +64,7 @@ cx vim notes.md   # same, with the file given directly
 | `ctrl+t` | Model switcher |
 | `ctrl+e` | Open `$EDITOR` for long input |
 | `ctrl+u/d` | Scroll half page |
+| `ctrl+r` | Voice dictation (toggle) — records mic, transcribes via Groq Whisper, cleans up disfluencies + custom vocabulary, inserts into input |
 | `tab` | Autocomplete `/command` or `@file` |
 
 ### Commands
@@ -82,7 +83,7 @@ cx vim notes.md   # same, with the file given directly
 | `/copy prompt [n]` | Copy your last n messages |
 | `/copy all [n]` | Copy the last n prompt/response pairs |
 | `/retry` / `/r` | Re-send last message |
-| `/fork` | Fuzzy-pick a past prompt and branch a new conversation from it |
+| `/fork` | Fuzzy-pick a past prompt, DELETE everything from it onwards in this chat, and load it back into the input for redo (rewrites history in place — no new conversation) |
 | `/img <path> [text]` | Send an image |
 | `/rename <title>` | Rename conversation |
 | `/model <name>` | Switch model |
@@ -161,9 +162,43 @@ Web search is agentic and on by default: the model gets `web_search` and `fetch_
 
 cx keeps a structured markdown profile at `~/.config/cx/memory.md`, organized into sections like **Identity**, **Preferences**, **Projects**, **Tools & Workflow**, **Feedback**, **References**, and **Recent conversations** — not a flat list of bullet points. The Recent conversations section is an episodic log (date · title · what was decided) so new sessions know what you've already discussed.
 
-After every response, the configured `memory_model` re-reads the file plus the latest exchange and **rewrites the whole file** — merging new facts into the right sections, generalizing patterns, and pruning stale details. The result is injected into every conversation's system prompt.
+**Always live.** cx re-reads `memory.md` from disk before *every* message you send. So if you `/remember` something in one chat, then switch back to a chat that was already open, the next message picks up the new memory without a restart.
 
-`/remember <fact>` and `/forget <query>` also route through the model, so manual edits stay organized in the same structure. `/memory` shows the current file. You can also edit `memory.md` directly if you want.
+**Confident updates.** After each response, the configured `memory_model` reads the file plus the latest exchange and **rewrites the whole file** — merging new facts into the right sections, generalizing patterns, and pruning stale details. When you contradict something (age changed, graduated, moved cities, dropped a project, changed a preference), the memory model **overwrites** the old bullet instead of stacking a contradiction next to it. If a fact goes clearly out of date, it gets deleted.
+
+`/remember <fact>` and `/forget <query>` also route through the model, so manual edits stay organized in the same structure. `/memory` shows the current file. You can also edit `memory.md` directly — the next message picks up your edits.
+
+### External memory files
+
+`/mem [path]` attaches an arbitrary file as read-only external memory: its contents get pasted into the system prompt of *every* conversation, so cx knows about your life-notes, curriculum, vault entries, whatever. The model is explicitly told not to propose edits — you maintain those files yourself.
+
+- `/mem` — fuzzy picker over `.md`/`.txt` files under the cwd
+- `/mem <path>` — attach directly (tilde and relatives resolve)
+- `/mem list` — show currently attached
+- `/mem off [path]` — detach (picker if no path given)
+
+The list lives at `~/.config/cx/external-memory.txt` (one absolute path per line). Files that no longer resolve are silently skipped.
+
+### Voice dictation
+
+Press `ctrl+r` to start recording, `ctrl+r` again to stop. cx captures the default mic with `ffmpeg`, sends the WAV to **Groq's `whisper-large-v3-turbo`** for transcription (sub-second latency), and pipes the raw transcript through a fast LLM cleanup pass (fixes disfluencies, applies your custom vocabulary, punctuates) before dropping the text into your input.
+
+Custom vocabulary — proper nouns, easily-misheard words — lives at `~/.config/cx/dictation-vocab.txt`, one line per hint:
+
+```
+Ekansh (not Ekaansh, Akansh)
+Geno (not Gino, Jeno)
+```
+
+The file is created with sensible defaults on first run.
+
+Requires:
+- `ffmpeg` on `$PATH` (`brew install ffmpeg`)
+- Groq API key (`groq.api_key` in `config.toml` or `GROQ_API_KEY` env). Get one at [console.groq.com](https://console.groq.com) — the free tier covers casual use.
+
+Cleanup uses `dictation_model` in `config.toml` if set, else `memory_model`, else `google/gemini-2.5-flash`.
+
+Recordings are hard-capped at 5 minutes. Recordings under 4KB (accidentally-tapped ctrl+r twice) are dropped silently.
 
 ### Context Compaction
 

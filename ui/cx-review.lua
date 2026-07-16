@@ -357,7 +357,7 @@ local function finish()
   vim.api.nvim_buf_clear_namespace(S.buf, ns, 0, -1)
   vim.api.nvim_buf_clear_namespace(S.buf, paint, 0, -1)
   vim.api.nvim_clear_autocmds({ group = aug, buffer = S.buf })
-  for _, lhs in ipairs({ "y", "n", "N", "a", "q" }) do
+  for _, lhs in ipairs({ "y", "n", "N", "a", "q", "<Esc>" }) do
     pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
   end
   pcall(vim.api.nvim_buf_call, S.buf, function()
@@ -639,7 +639,7 @@ function CxAbort()
   vim.api.nvim_buf_clear_namespace(S.buf, ns, 0, -1)
   vim.api.nvim_buf_clear_namespace(S.buf, paint, 0, -1)
   pcall(vim.api.nvim_clear_autocmds, { group = aug, buffer = S.buf })
-  for _, lhs in ipairs({ "y", "n", "N", "a", "q" }) do
+  for _, lhs in ipairs({ "y", "n", "N", "a", "q", "<Esc>" }) do
     pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
   end
   pcall(vim.fn.setqflist, {}, "r")
@@ -869,6 +869,11 @@ function CxReview()
       decide(action)
     end, { buffer = buf, nowait = true })
   end
+  -- Defensive: swallow <Esc> in the review buffer. Some user configs map
+  -- <Esc><Esc> globally (clear highlights, close popups, etc.) and one of
+  -- those turned out to bleed into review-buffer state as an "apply all".
+  -- The review has no legitimate <Esc> action, so make it a hard no-op.
+  vim.keymap.set("n", "<Esc>", "<Nop>", { buffer = buf, nowait = true, silent = true })
 
   -- vim-native undo/redo (or any edit) repaints the review state
   vim.api.nvim_clear_autocmds({ group = aug, buffer = buf })
