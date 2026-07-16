@@ -189,6 +189,10 @@ func stopDictationCmd(cfg *config.Config) tea.Cmd {
 			// an empty transcription.
 			return dictationDoneMsg{err: errors.New("recording too short — hold the mic key longer")}
 		}
+		// audioBytes is 16 kHz mono S16 PCM = 32,000 bytes/sec. So a 3-second
+		// recording is ~96 KB. Below ~2s of net audio we consider it
+		// "short" and apply the hallucination filter below.
+		wavShort := fi.Size() < 64_000
 
 		key := cfg.Groq.APIKey
 		if key == "" {
@@ -206,6 +210,13 @@ func stopDictationCmd(cfg *config.Config) tea.Cmd {
 		if raw == "" {
 			return dictationDoneMsg{err: errors.New("empty transcript")}
 		}
+		if wavShort && isWhisperHallucination(raw) {
+			// Silence into whisper reliably comes back as "Thank you." /
+			// "Thanks for watching." / etc. Drop those on short recordings
+			// so you can ctrl+r-twice-by-accident without garbage landing
+			// in your prompt.
+			return dictationDoneMsg{err: errors.New("nothing heard — silence hallucination filtered")}
+		}
 
 		clean, err := cleanupTranscript(ctx, cfg, raw)
 		if err != nil || strings.TrimSpace(clean) == "" {
@@ -218,8 +229,57 @@ func stopDictationCmd(cfg *config.Config) tea.Cmd {
 	}
 }
 
+// whisperHallucinations catches the well-known set of phrases the Whisper
+// LM emits when it hears silence or non-speech noise (breathing, keyboard,
+// fan). They come almost exclusively from YouTube auto-caption training
+// data. The list is short by design — we only want to filter obviously-
+// hallucinated one-liners on short recordings, not censor real speech.
+var whisperHallucinations = []string{
+	"thank you",
+	"thanks",
+	"thanks for watching",
+	"thanks for watching!",
+	"thank you for watching",
+	"thank you for watching!",
+	"please subscribe",
+	"like and subscribe",
+	"see you next time",
+	"see you in the next video",
+	"bye",
+	"bye bye",
+	"goodbye",
+	"peace",
+	"ok",
+	"okay",
+	"you",
+	".",
+	"...",
+	"[music]",
+	"[silence]",
+	"(silence)",
+}
+
+// isWhisperHallucination reports whether the transcript is one of the
+// canonical silence-hallucination phrases. Case- and punctuation-insensitive.
+func isWhisperHallucination(raw string) bool {
+	norm := strings.ToLower(strings.TrimSpace(raw))
+	// Strip trailing punctuation the LM likes to add.
+	norm = strings.TrimRight(norm, ".!?,;: ")
+	if norm == "" {
+		return true
+	}
+	for _, h := range whisperHallucinations {
+		if strings.TrimRight(h, ".!?,;: ") == norm {
+			return true
+		}
+	}
+	return false
+}
+
 // transcribeGroq POSTs the WAV as multipart/form-data to Groq's OpenAI-
-// compatible transcription endpoint.
+// compatible transcription endpoint. temperature=0 keeps the sampling
+// deterministic; the LM head is what hallucinates "Thank you." /
+// "Thanks for watching." on silence, and non-zero temp makes it worse.
 func transcribeGroq(ctx context.Context, wavPath, apiKey string) (string, error) {
 	f, err := os.Open(wavPath)
 	if err != nil {
@@ -229,9 +289,10 @@ func transcribeGroq(ctx context.Context, wavPath, apiKey string) (string, error)
 
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
-	// model + response format
 	_ = mw.WriteField("model", groqSTTModel)
 	_ = mw.WriteField("response_format", "json")
+	_ = mw.WriteField("temperature", "0")
+	_ = mw.WriteField("language", "en")
 	// audio file
 	fw, err := mw.CreateFormFile("file", filepath.Base(wavPath))
 	if err != nil {
