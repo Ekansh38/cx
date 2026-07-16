@@ -44,6 +44,32 @@ const (
 	groqSTTModel        = "whisper-large-v3-turbo"
 )
 
+// System sound names (macOS). Fire-and-forget via afplay in a goroutine.
+const (
+	soundRecStart  = "Tink"   // short crisp ping — begin
+	soundRecStop   = "Pop"    // small pop — stopped
+	soundTextReady = "Glass"  // soft ding — text landed in input
+	soundError     = "Basso"  // low bass — something failed
+)
+
+// playSound spawns afplay in a goroutine so it doesn't block the tea loop.
+// Silently no-ops if afplay isn't found (Linux users just get no sound; not
+// an error). Uses macOS built-in sounds under /System/Library/Sounds.
+func playSound(name string) {
+	go func() {
+		exe, err := exec.LookPath("afplay")
+		if err != nil {
+			return
+		}
+		path := fmt.Sprintf("/System/Library/Sounds/%s.aiff", name)
+		if _, err := os.Stat(path); err != nil {
+			return
+		}
+		// Detach; caller doesn't wait. afplay exits when the sound ends.
+		_ = exec.Command(exe, path).Run()
+	}()
+}
+
 // dictationSession holds the state of an in-progress recording.
 type dictationSession struct {
 	cmd     *exec.Cmd
@@ -57,6 +83,16 @@ type dictationSession struct {
 // the pipeline can reach it without threading state.
 var currentDictation *dictationSession
 
+// dictationElapsed returns "MM:SS" since the current recording started,
+// or "" when nothing's recording.
+func dictationElapsed() string {
+	if currentDictation == nil {
+		return ""
+	}
+	d := time.Since(currentDictation.started)
+	return fmt.Sprintf("%d:%02d", int(d.Minutes()), int(d.Seconds())%60)
+}
+
 // Tea messages so the pipeline can drive the model without blocking the UI.
 type (
 	dictationStartedMsg struct{ err error }
@@ -64,7 +100,18 @@ type (
 		text string
 		err  error
 	}
+	// dictationTickMsg fires every ~500ms while recording so the status bar
+	// can show elapsed time (see statusView / model.go).
+	dictationTickMsg struct{}
 )
+
+// dictationTick emits a dictationTickMsg after ~500ms. Chained by the model's
+// Update loop while m.dictating.
+func dictationTick() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg {
+		return dictationTickMsg{}
+	})
+}
 
 // startDictationCmd returns a tea.Cmd that spawns ffmpeg and reports the
 // outcome. On success, the message carries a nil error and a session is
@@ -99,6 +146,7 @@ func startDictationCmd(_ *config.Config) tea.Cmd {
 			return dictationStartedMsg{err: fmt.Errorf("ffmpeg: %w", err)}
 		}
 		currentDictation = &dictationSession{cmd: cmd, wavPath: wav, started: time.Now(), stderr: &stderr}
+		playSound(soundRecStart)
 		return dictationStartedMsg{}
 	}
 }
@@ -113,6 +161,7 @@ func stopDictationCmd(cfg *config.Config) tea.Cmd {
 		if sess == nil {
 			return dictationDoneMsg{err: errors.New("not recording")}
 		}
+		playSound(soundRecStop)
 		if sess.cmd.Process != nil {
 			// SIGINT gives ffmpeg time to flush and close the WAV header.
 			// Kill would truncate.
