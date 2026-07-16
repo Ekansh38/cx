@@ -38,6 +38,8 @@ const (
 	stateDocPicker              // filesystem document picker for /doc
 	stateDocListPicker          // connected-docs picker (/disconnect doc / /doc edit)
 	stateForkPicker             // past-prompt picker for /fork
+	stateMemAddPicker           // filesystem picker for /mem
+	stateMemRemovePicker        // current external-memory list picker for /mem off
 )
 
 // ── tea.Msg types ─────────────────────────────────────────────────────────────
@@ -103,7 +105,7 @@ var commands = []string{
 	"/clear", "/connect doc", "/copy", "/copy response ", "/copy prompt ", "/copy all ", "/debug", "/debug expand", "/debug collapse",
 	"/delete", "/disconnect doc", "/doc", "/editor", "/fork",
 	"/edit", "/forget ", "/grep", "/help", "/img ",
-	"/list", "/memory", "/model ", "/models", "/new",
+	"/list", "/mem", "/mem list", "/mem off ", "/memory", "/model ", "/models", "/new",
 	"/paste", "/quit", "/r", "/remember ",
 	"/rename ", "/retry", "/sel", "/stop", "/undo", "/web", "/wipe",
 }
@@ -190,10 +192,20 @@ type Model struct {
 	forkFilter string
 	forkCursor int
 
+	// external memory picker state (/mem [off])
+	memFiles  []string // add: cwd candidates; remove: currently attached paths
+	memFilter string
+	memCursor int
+	memMode   string // "add" or "remove"
+
 	// system
 	systemPrompt string
 	verbose      bool // /debug expand: show full notes, memory + context events
 	webSearch    bool // web tools offered to the model (default on; /web toggles)
+
+	// voice dictation state (ctrl+r)
+	dictating     bool
+	dictationBusy bool // between stop and text-in-box: transcription/cleanup in flight
 
 	// markdown rendering (cached — glamour is expensive)
 	mdRenderer *glamour.TermRenderer
@@ -269,6 +281,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case docReloadMsg:
 		m.reloadDocs()
+		return m, nil
+
+	case dictationStartedMsg:
+		if msg.err != nil {
+			m.errMsg = "dictation: " + msg.err.Error()
+			m.dictating = false
+			return m, nil
+		}
+		m.dictating = true
+		m.errMsg = ""
+		return m, nil
+
+	case dictationDoneMsg:
+		m.dictationBusy = false
+		if msg.err != nil {
+			m.errMsg = "dictation: " + msg.err.Error()
+			return m, nil
+		}
+		// Splice the transcribed text at the cursor position in the input
+		// box, adding a leading space when the caret is already after text.
+		cur := m.input.Value()
+		insert := msg.text
+		if cur != "" && !strings.HasSuffix(cur, " ") && !strings.HasSuffix(cur, "\n") {
+			insert = " " + insert
+		}
+		m.input.SetValue(cur + insert)
+		m.input.CursorEnd()
+		m.syncInputHeight()
 		return m, nil
 
 	case extReviewTickMsg:
@@ -493,7 +533,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.extGroups = groups
 					m.extNotes = nil
 					m.extRetry = false
-					m.lastApplied = nil
+					// lastApplied is NOT reset here: retry cascades within a
+					// single user prompt (N-with-note → revised proposal →
+					// review again) accumulate into one /undo scope. Reset
+					// happens on the next user prompt (see handleInput).
 					word := "edits"
 					if len(edits) == 1 {
 						word = "edit"
@@ -509,7 +552,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.docEdits = edits
 					m.docEditIdx = 0
 					m.docReview = true
-					m.lastApplied = nil
 					m.showDocEdit()
 				}
 			}
@@ -692,6 +734,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateDocListPicker(msg)
 		case stateForkPicker:
 			return m.updateForkPicker(msg)
+		case stateMemAddPicker, stateMemRemovePicker:
+			return m.updateMemPicker(msg)
 		default:
 			return m.updateChat(msg)
 		}
@@ -772,9 +816,8 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		return m.handleInput(input)
 
 	case tea.KeyEsc:
-		m.pastes = nil
-		m.input.Reset()
-		m.syncInputHeight()
+		// Never wipe the prompt on esc: too easy to trigger by accident
+		// and lose a long draft. Only dismiss a stuck error banner.
 		m.errMsg = ""
 		return m, nil
 
@@ -818,6 +861,19 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.viewport.HalfViewDown()
 		m.atBottom = m.viewport.AtBottom()
 		return m, nil
+
+	case tea.KeyCtrlR:
+		// Toggle voice dictation: press to start, press again to stop.
+		// If a transcription is already in flight, ignore.
+		if m.dictationBusy {
+			return m, nil
+		}
+		if m.dictating {
+			m.dictating = false
+			m.dictationBusy = true
+			return m, stopDictationCmd(m.cfg)
+		}
+		return m, startDictationCmd(m.cfg)
 
 	case tea.KeyUp, tea.KeyDown:
 		// With text in the prompt, arrows move the cursor through it (like
@@ -973,6 +1029,11 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	syncDocs(m.docPaths())
 	m.reloadDocs()
 
+	// Refresh the system prompt from memory.md on every message so a chat
+	// left running in the background picks up memory edits made in another
+	// cx session (or via /remember from a different chat) without a restart.
+	m.reloadSystemPrompt()
+
 	if saved, err := m.store.AddMessageWithImage(m.conv.ID, "user", display, mentionImage); err == nil {
 		m.messages = append(m.messages, saved)
 	} else {
@@ -981,6 +1042,12 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	m.refreshContent()
 	m.viewport.GotoBottom()
 	m.atBottom = true
+
+	// A new prompt starts a fresh /undo scope. Retry cascades within one
+	// response (N-with-note → revised proposal → apply again) all fold into
+	// the same scope, so /undo reverses the whole chain — not just the last
+	// review round.
+	m.lastApplied = nil
 
 	// Check if compaction needed before sending
 	if m.contextTokens() > m.cfg.MaxContextTokens*3/4 {
@@ -1483,6 +1550,9 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.injectSystemLine("── memory file ──\n" + content)
 		return m, nil
 
+	case "/mem":
+		return m.handleMemCommand(parts)
+
 	case "/remember":
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
 			m.errMsg = "usage: /remember <fact>"
@@ -1579,106 +1649,92 @@ func (m *Model) injectSystemLine(text string) {
 	m.atBottom = true
 }
 
-const helpText = `keybindings
-  ctrl+c       cancel stream / quit (or /stop)
-  ctrl+l       conversation picker
-  ctrl+n       new conversation
-  ctrl+g       search all messages
-  ctrl+t       model switcher
-  ctrl+e       open $EDITOR for long input
-  ctrl+u / d   scroll half page
-  alt+enter    newline (multiline input)
-               big pastes collapse to [paste #N] and expand on send
-  esc          clear the input field
-  up/down      move through your prompt (scroll chat when empty)
-  ↑ ↓          scroll one line
-  tab          autocomplete /command or @file
+const helpText = `KEYS
+  enter       send   ·   alt+enter  newline   ·   esc  dismiss error (never wipes input)
+  ctrl+c      cancel stream / quit           ·   ctrl+l  conv picker    ctrl+n  new conv
+  ctrl+g      search all messages            ·   ctrl+t  model picker
+  ctrl+e      open $EDITOR for long input    ·   ctrl+u / d  half-page scroll
+  ctrl+r      voice dictation (toggle) — records mic, cleans up, inserts text
+  up/down     walk prompt (scrolls chat when empty)
+  tab         autocomplete /command or @file
 
-commands  (type / to see completions)
-  /help                 this help
-  /quit (or :q)         quit
-  /new                  new conversation
-  /list                 conversation picker
-  /grep                 search messages
-  /copy [n]             copy the last n responses (default 1)
-  /copy prompt [n]      copy your last n messages
-  /copy all [n]         copy the last n prompt/response pairs
-                        (returns what exists if the chat is shorter)
-  /edit                 edit your last message (loads into input, re-send)
-  /editor               open $EDITOR for long input (same as ctrl+e)
-  /fork                 fuzzy-pick a past prompt, branch a new conversation
-                        from just before it, and edit the prompt to resend
-                        (the original conversation is untouched)
-  /undo                 revert the edits applied by the last review
-  /web [on|off]         web tools (on by default): the model searches the
-                        live web and reads pages whenever it decides to,
-                        showing "searching the web: ..." as it works
-  /retry / /r           re-send last message (gets a new response)
-  /img <path> [text]    send an image (png/jpg/gif/webp)
-                        (or just paste/drop an image path, auto-detected)
-  /paste [text]         send the image on your clipboard
-  @file                 mention a file anywhere in a message: text files
-                        connect as docs, images and PDFs attach, and image
-                        URLs (@https://...png) attach too (tab completes)
-  /doc [path]           connect a document and open it in your editor
-                        (no path = fuzzy picker over the current directory)
-  /doc edit             reopen a connected doc in your editor
-  /doc off              disconnect (same as /disconnect doc)
-  /connect doc [path]   connect a doc without opening the editor
-                        (no path = the last doc you connected)
-  /disconnect doc       disconnect a doc (picker with ALL when several)
-  /sel                  preview the editor selection waiting for your next msg
-  /sel clear            drop it
-  /stop                 stop the current response (same as ctrl+c)
-  /delete               delete the current conversation
-  /rename <title>       rename this conversation
-  /model <name>         switch model mid-conversation
-  /models               model switcher (fetches from OpenRouter)
-  /memory               show the memory file
-  /remember <fact>      ask the memory model to add a fact
-  /forget <query>       ask the memory model to drop matching content
-  /clear                clear injected notes (history kept)
-  /debug                show full API payload
-  /debug expand         verbose mode: full notes, memory + context events
-  /debug collapse       back to the clean default
-  /wipe                 delete ALL conversations and messages (asks confirm)
+CHAT
+  /new · /list · /rename <t> · /delete · /wipe        make / pick / rename / delete
+  /retry (/r) · /edit · /stop                          re-send · edit last · stop stream
+  /fork                                                fuzzy-pick a past prompt, DELETE
+                                                       everything from it onwards in THIS
+                                                       chat, load it into input for redo
+  /copy [n] · /copy prompt [n] · /copy all [n]        yank recent replies / prompts / pairs
+  /grep                                                search all messages
+  /clear                                               clear injected system notes
 
-doc mode  (/doc / /connect doc)
-  documents live in YOUR editor (opened beside cx in tmux);
-  cx just knows the files. a chat can have several docs connected;
-  all of them are sent to the model every turn, re-read from disk,
-  so every save is picked up automatically.
-  reference passages as @L12, @L12-30, @## Heading.
-  proposed edits are reviewed IN NEOVIM. cx diffs whatever the
-  model sends and splits it into minimal hunks, so a typo fix is
-  a one-line diff even if the model rewrote the whole file. every
-  hunk renders at once (word-level highlighting for small changes)
-  and fills the quickfix list: ]q / [q jump between them. with the
-  cursor on a hunk:
-  [y] apply  [n] skip  [N] reject+note  [a] all  [u] undo  [q] quit
-  N fires the revision immediately; new edits queue behind the
-  current review.
-  (without the neovim bridge, the y/n review happens in cx instead)
+MODEL & WEB
+  /model <name>     switch mid-chat        /models      picker (OpenRouter)
+  /web [on|off]     agentic web tools; the model runs multi-round searches inline
 
-neovim side-by-side
-  cx doc <file>   (from your shell) sets everything up: a tmux
-  session with neovim on the left, cx on the right, doc attached.
-  inside tmux, /doc / the doc picker / e also auto-open the editor
-  in a split pane. add the keybinding from the README, highlight
-  text in neovim, press <leader>cs, and cx attaches the selection to
-  your next message (auto-attaching the doc if needed). status bar
-  shows "sel L12-30" while one is waiting; /sel previews it.
+DOCS   (see "DOC MODE" below)
+  /doc [path]        connect + open in editor       /doc edit    reopen connected doc
+  /doc off           disconnect                     /connect doc [path]   connect only
+  /disconnect doc    disconnect (picker if many)
+  /sel · /sel clear  preview / drop editor selection
+  /undo              revert edits from the last user prompt (across retries)
+  @file              mention: .txt/.md connects, images/PDFs attach, URLs pass through
 
-memory
-  cx keeps a structured markdown profile at ~/.config/cx/memory.md,
-  organized into sections like Identity / Preferences / Projects /
-  Tools & Workflow / Feedback / References.
-  after each response, the memory model rewrites the file:
-  merging, generalizing, and pruning what it knows about you.
-  /remember and /forget also route through the model so edits stay
-  organized and don't leave dangling bullets.
-  set memory_model in config.toml to pick a stronger curation model.
-  context auto-compacted when the conversation gets long.`
+IMAGES
+  /img <path> [text]  · /paste [text]  · drag-drop an image path also works
+
+MEMORY   (see "MEMORY" below)
+  /memory            show the file       /remember <fact>   add via memory model
+  /forget <query>    drop via memory model
+  /mem [path]        attach an external memory file (no path = fuzzy picker over cwd).
+                     read-only context injected into the system prompt of EVERY chat.
+  /mem list · /mem off [path]                                   show / detach
+
+DEBUG
+  /debug · /debug expand · /debug collapse
+
+SHELL
+  cx doc [file]      open editor + cx side-by-side (tmux split)
+  cx vim [file]      extra doc in nvim with the cx bridge (no split)
+
+DOC MODE
+  · Docs live in YOUR editor; cx just holds file paths. Multiple docs per chat.
+  · Every message re-reads all connected docs from disk (every :w is picked up).
+  · Reference passages inline: @L12, @L12-30, @## Heading.
+  · Proposed edits are reviewed IN NEOVIM: cx splits them into minimal hunks and
+    inserts them as real green buffer lines below the red originals.
+  · On a hunk: y apply · n skip · N reject+note · a apply all · q finish · u vim undo.
+    ]q / [q jump between hunks; N fires an immediate revision request.
+  · /undo (in cx) reverts everything the last user prompt applied — including
+    edits from retry cascades (N-with-note → revised proposal → apply).
+
+MEMORY
+  · Structured markdown profile at ~/.config/cx/memory.md, organized into
+    ## Identity · Preferences · Projects · Tools & Workflow · Feedback · References ·
+    Recent conversations (episodic log so future chats know what was discussed).
+  · Injected into every system prompt. cx re-reads it before EVERY message you
+    send, so memory edits from another chat show up immediately.
+  · After each response the memory model (cfg.memory_model) rewrites the whole
+    file: merging, generalizing, pruning. It OVERWRITES stale facts confidently
+    (age, grade, city, current project, tastes all change) — say "I graduated"
+    once and old "grade 12" gets replaced, not stacked.
+  · /remember and /forget route through the same model so the file stays tidy.
+  · Direct edits to memory.md work too — the next message picks them up.
+  · /mem [path] attaches EXTERNAL memory files (life notes, vault entries, etc.)
+    that get pasted into every chat's system prompt as READ-ONLY context. The
+    model sees the path + contents so it has your notes for reference, but is
+    told not to edit them — you maintain those files yourself.
+
+VOICE DICTATION  (ctrl+r)
+  · Toggle: press ctrl+r to start recording, press again to stop.
+  · ffmpeg captures the default mic → Groq whisper-large-v3-turbo transcribes
+    (sub-second) → a fast LLM (dictation_model, default = memory_model) cleans
+    up disfluencies + punctuation + proper nouns → text lands in your input.
+  · Custom vocabulary lives at ~/.config/cx/dictation-vocab.txt (one hint per
+    line, e.g. "Ekansh (not Ekaansh)"). Edited freely; picked up on next run.
+  · Requires: ffmpeg installed (brew install ffmpeg) + groq.api_key in
+    config.toml (or GROQ_API_KEY env var). ~5-8/mo for heavy dictation use.
+  · Hard cap 5 min per recording. Recordings <4KB are dropped as accidental.`
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
 
@@ -1940,6 +1996,12 @@ Rules:
 - Rich, substantive bullets — not one-word tags. Merge related facts into single bullets.
 - Consolidate duplicates; generalize when patterns emerge (three similar facts become one insight)
 - Drop stale, trivial, or conversation-specific details (except in Recent conversations).
+- OVERWRITE stale facts confidently when the user contradicts or updates them. Age, grade,
+  role, city, current project, tastes, and traits all change. If a new turn implies an old
+  bullet is outdated (e.g. "I graduated" invalidates "grade 12"; "moved to Berlin" invalidates
+  a prior city; a corrected preference supersedes the earlier one), REPLACE the old bullet
+  rather than stack a contradiction next to it. When something is clearly no longer true,
+  delete it — do not hedge with "was X, now Y" unless the history itself matters.
 - Every ## section that survives must have at least one bullet.
 - Keep the total file under 200 lines. Quality over quantity.
 - Never invent facts or extrapolate beyond what was actually said.
@@ -2853,6 +2915,8 @@ func (m Model) View() string {
 		return m.docListPickerView()
 	case stateForkPicker:
 		return m.forkPickerView()
+	case stateMemAddPicker, stateMemRemovePicker:
+		return m.memPickerView()
 	default:
 		return m.chatView()
 	}
@@ -2937,6 +3001,12 @@ func (m Model) statusView() string {
 	}
 	if !m.webSearch {
 		left += "  ·  no-web"
+	}
+	switch {
+	case m.dictating:
+		left += "  ·  🎙 recording (ctrl+r to stop)"
+	case m.dictationBusy:
+		left += "  ·  transcribing…"
 	}
 
 	tok := m.contextTokens()
@@ -3575,29 +3645,42 @@ func (m Model) updateForkPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
 	return m, nil
 }
 
-// forkFrom branches a new conversation containing everything before the
-// chosen prompt and loads that prompt into the input for editing.
+// forkFrom rewrites the CURRENT chat's history in place: everything from the
+// chosen prompt onwards is deleted, and the picked prompt is loaded into the
+// input for editing. No new conversation is created — the current chat now
+// diverges from that point when the user hits enter.
 func (m Model) forkFrom(sel *store.Message) (Model, tea.Cmd) {
-	conv, err := m.store.ForkConversation(m.conv.ID, m.model, sel.CreatedAt, sel.ID)
-	if err != nil {
+	m.stopStream() // cancel any streaming so we don't append a stale reply
+	if err := m.store.DeleteMessagesFrom(m.conv.ID, sel.ID); err != nil {
 		m.errMsg = "fork failed: " + err.Error()
 		m.state = stateChat
 		return m, nil
 	}
-	// Seamlessly transfer the source conversation's episodic memory bullet
-	// to the fork: the fork now carries that discussion as live history, so
-	// the bullet's title/date are updated to describe the fork instead. No
-	// fork metadata is persisted or shown to the model — it just sees a
-	// coherent memory file. (If the source had no bullet yet, no-op.)
-	srcTitle := m.conv.Title
-	today := time.Now().Format("2006-01-02")
-	memory.TransferBulletOnFork(srcTitle, conv.Title, today)
-	m2, cmd := m.switchConversation(conv.ID)
-	m2.injectSystemLine("forked: history up to the chosen prompt, edit and resend")
-	m2.input.SetValue(stripPlaceholders(sel.Content))
-	m2.input.CursorEnd()
-	m2.syncInputHeight()
-	return m2, cmd
+	// Drop those messages from the live slice too, using the same predicate
+	// as the DB (id >= sel.ID). Messages are stored in insertion order so a
+	// tail-trim by ID matches the SQL DELETE.
+	kept := m.messages[:0]
+	for _, msg := range m.messages {
+		if msg.ID != 0 && msg.ID >= sel.ID {
+			continue
+		}
+		kept = append(kept, msg)
+	}
+	m.messages = kept
+	// The memory model's episodic bullet described the pre-fork history that
+	// still exists after the truncation — no rewrite needed.
+	m.state = stateChat
+	m.errMsg = ""
+	m.streamBuf.Reset()
+	m.lastApplied = nil // the following turns are gone, so /undo scope resets too
+	m.input.SetValue(stripPlaceholders(sel.Content))
+	m.input.CursorEnd()
+	m.syncInputHeight()
+	m.injectSystemLine("history rewritten from this prompt — edit and hit enter to send")
+	m.refreshContent()
+	m.viewport.GotoBottom()
+	m.atBottom = true
+	return m, nil
 }
 
 func (m Model) forkPickerView() string {
@@ -3641,5 +3724,221 @@ func (m Model) forkPickerView() string {
 
 	sb.WriteString("\n\n")
 	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter fork  esc back"))
+	return sb.String()
+}
+
+// ── External memory picker (/mem) ─────────────────────────────────────────────
+//
+// External memory files are the user's persistent notes (vault entries, life
+// planning docs, whatever) that get pasted into the system prompt of every
+// conversation as read-only context. Managed globally, not per-chat: attach a
+// file with /mem, drop one with /mem off. Contents flow through the system
+// prompt (see externalMemorySection in prompt.go).
+
+// handleMemCommand routes /mem subcommands:
+//
+//	/mem              → fuzzy picker over cwd (add)
+//	/mem <path>       → add path directly (tilde/relative resolved)
+//	/mem list         → show currently attached external memory files
+//	/mem off          → picker to detach one
+//	/mem off <path>   → detach path directly
+func (m Model) handleMemCommand(parts []string) (Model, tea.Cmd) {
+	if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+		return m.enterMemAddPicker()
+	}
+	arg := strings.TrimSpace(parts[1])
+	switch {
+	case arg == "list":
+		paths := config.LoadExternalMemoryPaths()
+		if len(paths) == 0 {
+			m.injectSystemLine("no external memory files attached. use /mem <path> or /mem to pick one")
+			return m, nil
+		}
+		m.injectSystemLine("── external memory files ──\n" + strings.Join(paths, "\n"))
+		return m, nil
+
+	case arg == "off":
+		return m.enterMemRemovePicker()
+
+	case strings.HasPrefix(arg, "off "):
+		target := strings.TrimSpace(strings.TrimPrefix(arg, "off "))
+		if target == "" {
+			return m.enterMemRemovePicker()
+		}
+		if err := config.RemoveExternalMemoryPath(target); err != nil {
+			m.errMsg = "mem off: " + err.Error()
+			return m, nil
+		}
+		m.injectSystemLine("detached from external memory: " + target)
+		return m, nil
+
+	default:
+		abs, err := config.AddExternalMemoryPath(arg)
+		if err != nil {
+			m.errMsg = "mem: " + err.Error()
+			return m, nil
+		}
+		m.injectSystemLine("attached as external memory: " + abs)
+		return m, nil
+	}
+}
+
+func (m Model) enterMemAddPicker() (Model, tea.Cmd) {
+	files := listDocFiles()
+	if len(files) == 0 {
+		m.errMsg = "no .md/.txt files under " + cwdBase() + " (use /mem <path> directly)"
+		return m, nil
+	}
+	m.state = stateMemAddPicker
+	m.memMode = "add"
+	m.memFiles = files
+	m.memFilter = ""
+	m.memCursor = 0
+	return m, nil
+}
+
+func (m Model) enterMemRemovePicker() (Model, tea.Cmd) {
+	paths := config.LoadExternalMemoryPaths()
+	if len(paths) == 0 {
+		m.injectSystemLine("no external memory files attached")
+		return m, nil
+	}
+	m.state = stateMemRemovePicker
+	m.memMode = "remove"
+	m.memFiles = paths
+	m.memFilter = ""
+	m.memCursor = 0
+	return m, nil
+}
+
+func (m Model) filteredMemFiles() []string {
+	if m.memFilter == "" {
+		return m.memFiles
+	}
+	q := strings.ToLower(m.memFilter)
+	var exact, fuzzy []string
+	for _, f := range m.memFiles {
+		lf := strings.ToLower(f)
+		switch {
+		case strings.Contains(lf, q):
+			exact = append(exact, f)
+		case fuzzyMatch(q, lf):
+			fuzzy = append(fuzzy, f)
+		}
+	}
+	return append(exact, fuzzy...)
+}
+
+func (m Model) updateMemPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.state = stateChat
+		return m, nil
+
+	case tea.KeyEnter:
+		filtered := m.filteredMemFiles()
+		if len(filtered) == 0 {
+			m.state = stateChat
+			return m, nil
+		}
+		picked := filtered[m.memCursor]
+		m.state = stateChat
+		if m.memMode == "remove" {
+			if err := config.RemoveExternalMemoryPath(picked); err != nil {
+				m.errMsg = "mem off: " + err.Error()
+				return m, nil
+			}
+			m.injectSystemLine("detached from external memory: " + picked)
+			return m, nil
+		}
+		abs, err := config.AddExternalMemoryPath(picked)
+		if err != nil {
+			m.errMsg = "mem: " + err.Error()
+			return m, nil
+		}
+		m.injectSystemLine("attached as external memory: " + abs)
+		return m, nil
+
+	case tea.KeyUp:
+		if m.memCursor > 0 {
+			m.memCursor--
+		}
+		return m, nil
+
+	case tea.KeyDown:
+		if m.memCursor < len(m.filteredMemFiles())-1 {
+			m.memCursor++
+		}
+		return m, nil
+
+	case tea.KeyBackspace, tea.KeyDelete:
+		if len(m.memFilter) > 0 {
+			_, size := utf8.DecodeLastRuneInString(m.memFilter)
+			m.memFilter = m.memFilter[:len(m.memFilter)-size]
+			m.memCursor = 0
+		}
+		return m, nil
+
+	case tea.KeySpace:
+		m.memFilter += " "
+		m.memCursor = 0
+		return m, nil
+
+	case tea.KeyRunes:
+		m.memFilter += string(msg.Runes)
+		m.memCursor = 0
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) memPickerView() string {
+	filtered := m.filteredMemFiles()
+	maxVisible := max(m.height-10, 1)
+	start := 0
+	if m.memCursor >= maxVisible {
+		start = m.memCursor - maxVisible + 1
+	}
+	end := min(start+maxVisible, len(filtered))
+
+	title := "   Attach external memory  "
+	sub := "(" + cwdBase() + ")"
+	if m.memMode == "remove" {
+		title = "   Detach external memory  "
+		sub = "(currently attached)"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n\n")
+	sb.WriteString(pickerTitleStyle.Render(title) + dimStyle.Render(sub) + "\n\n")
+
+	filterText := m.memFilter
+	if filterText == "" {
+		filterText = dimStyle.Render("type to filter...")
+	}
+	sb.WriteString(promptStyle.Render("   > ") + filterText + "\n\n")
+
+	if len(filtered) == 0 {
+		sb.WriteString(dimStyle.Render("   no matches") + "\n")
+	} else {
+		for i := start; i < end; i++ {
+			label := truncate(filtered[i], max(m.width-10, 20))
+			if i == m.memCursor {
+				sb.WriteString(pickerSelectedStyle.Render(" › "+label) + "\n")
+			} else {
+				sb.WriteString(pickerRowStyle.Render("   "+label) + "\n")
+			}
+		}
+		if len(filtered) > maxVisible {
+			sb.WriteString("\n" + dimStyle.Render(fmt.Sprintf("   … %d more", len(filtered)-maxVisible)) + "\n")
+		}
+	}
+
+	verb := "attach"
+	if m.memMode == "remove" {
+		verb = "detach"
+	}
+	sb.WriteString("\n\n")
+	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter " + verb + "  esc back"))
 	return sb.String()
 }
