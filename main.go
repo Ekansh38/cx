@@ -56,6 +56,11 @@ func main() {
 		}
 	}
 
+	// cx incognito — start an ephemeral chat: no memory injection, no external
+	// memory, no system prompt, no persistence. The conversation is created
+	// in the DB so tea's model shape stays uniform, but it's deleted on quit.
+	incognito := len(os.Args) >= 2 && (os.Args[1] == "incognito" || os.Args[1] == "-i")
+
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "config: %v\n", err)
@@ -98,30 +103,46 @@ func main() {
 		os.Exit(1)
 	}
 
-	if conv == nil {
+	if conv == nil || incognito {
 		conv, err = st.CreateConversation(model)
 		if err != nil {
 			log.Fatal(err)
+		}
+		if incognito {
+			// Tag the ephemeral chat clearly so if it somehow survives
+			// a crash it's obvious in /list what it was.
+			_ = st.UpdateTitle(conv.ID, "(incognito)")
+			conv.Title = "(incognito)"
 		}
 	}
 
 	// Doc mode opens the editor beside cx and remembers the file, but does
 	// NOT connect it to any conversation: that stays explicit (/connect doc)
-	if docPath != "" {
+	if docPath != "" && !incognito {
 		ui.SaveLastDoc(docPath)
 	}
 
-	// Load messages
+	// Load messages (incognito starts fresh — the row was just created).
 	msgs, err := st.GetMessages(conv.ID)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Build system prompt (default + memory.md)
-	sysPrompt := ui.BuildSystemPrompt(config.LoadMemory())
+	// Build system prompt. Incognito skips memory + external memory: just
+	// the base personality prompt so the model is still a decent assistant
+	// but knows nothing about the user.
+	var sysPrompt string
+	if incognito {
+		sysPrompt = ui.LoadBasePromptOnly()
+	} else {
+		sysPrompt = ui.BuildSystemPrompt(config.LoadMemory())
+	}
 
 	// Launch TUI
 	m := ui.New(cfg, st, conv, msgs, prov, model, sysPrompt)
+	if incognito {
+		m = m.MarkIncognito()
+	}
 	if startDocPicker {
 		m = m.StartInDocPicker()
 	}
@@ -129,6 +150,13 @@ func main() {
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "tui: %v\n", err)
 		os.Exit(1)
+	}
+	if incognito {
+		// The whole point of incognito: leave nothing behind. Deletion
+		// after Run() returns catches both clean quits and any tea.Quit
+		// paths that landed us here. If it somehow fails, the conv still
+		// has "(incognito)" title so it's spot-able in /list.
+		_ = st.DeleteConversation(conv.ID)
 	}
 }
 

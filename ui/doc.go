@@ -1089,6 +1089,16 @@ func (m Model) StartInDocPicker() Model {
 	return m2
 }
 
+// MarkIncognito flags this session as ephemeral: no memory injection, no
+// external memory, no memory curation, no /remember. Called by main.go when
+// cx was launched via `cx incognito`. The conversation row is deleted on
+// quit (see main.go).
+func (m Model) MarkIncognito() Model {
+	m.incognito = true
+	m.injectSystemLine("── incognito mode ── no memory, no external files, chat deleted on quit")
+	return m
+}
+
 func cwdBase() string {
 	if wd, err := os.Getwd(); err == nil {
 		return filepath.Base(wd)

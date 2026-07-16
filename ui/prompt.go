@@ -33,6 +33,13 @@ func loadBasePrompt() string {
 	return strings.TrimSpace(defaultSystemPrompt)
 }
 
+// LoadBasePromptOnly returns just the base personality prompt, with no
+// memory.md or external memory injection. Used by incognito mode so the
+// model is still a decent assistant but knows nothing about the user.
+func LoadBasePromptOnly() string {
+	return loadBasePrompt()
+}
+
 // BuildSystemPrompt combines the base prompt with the memory file and any
 // external memory files the user has attached via /mem.
 func BuildSystemPrompt(memory string) string {

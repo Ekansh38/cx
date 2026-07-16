@@ -47,6 +47,9 @@ cx vim            # fuzzy-pick among the current chat's connected docs (or
                   # bridge — no tmux split. handy when several docs are
                   # connected to one chat
 cx vim notes.md   # same, with the file given directly
+cx incognito      # ephemeral chat: no memory, no external files, no
+                  # system prompt beyond the base. deleted on quit.
+                  # (alias: cx -i)
 ```
 
 ### Keybindings
@@ -181,7 +184,11 @@ The list lives at `~/.config/cx/external-memory.txt` (one absolute path per line
 
 ### Voice dictation
 
-Press `ctrl+r` to start recording, `ctrl+r` again to stop. cx captures the default mic with `ffmpeg`, sends the WAV to **Groq's `whisper-large-v3-turbo`** for transcription (sub-second latency), and pipes the raw transcript through a fast LLM cleanup pass (fixes disfluencies, applies your custom vocabulary, punctuates) before dropping the text into your input.
+Press `ctrl+r` to start recording, `ctrl+r` again to stop (**toggle**, not hold — terminal key-up events aren't reliable). cx captures the default mic with `ffmpeg`, sends the WAV to **Groq's `whisper-large-v3-turbo`** for transcription (sub-second latency), and pipes the raw transcript through a fast LLM cleanup pass (fixes disfluencies, applies your custom vocabulary, punctuates) before dropping the text into your input.
+
+**Feedback so you can eyes-off the terminal**:
+- Status bar shows `🎙 rec 0:12 (ctrl+r to stop)` with a live elapsed clock while recording, then `⚙ transcribing…` during the pipeline.
+- macOS system sounds fire at each phase: `Tink` on start, `Pop` on stop, `Glass` when text lands in your input, `Basso` on error.
 
 Custom vocabulary — proper nouns, easily-misheard words — lives at `~/.config/cx/dictation-vocab.txt`, one line per hint:
 
@@ -199,6 +206,20 @@ Requires:
 Cleanup uses `dictation_model` in `config.toml` if set, else `memory_model`, else `google/gemini-2.5-flash`.
 
 Recordings are hard-capped at 5 minutes. Recordings under 4KB (accidentally-tapped ctrl+r twice) are dropped silently.
+
+### Incognito mode
+
+```bash
+cx incognito   # or: cx -i
+```
+
+Launches an ephemeral chat with **no memory injection, no external memory files, and only the base personality prompt**. The model knows nothing about you — good for one-off questions you don't want cross-contaminating your memory, or for testing what a fresh cx looks like.
+
+- No auto-title (title stays `(incognito)`)
+- No memory curation runs
+- `/remember` and `/forget` are disabled
+- Status bar shows `🕶 INCOGNITO` for the whole session
+- **The conversation is deleted on quit**. If cx crashes, the `(incognito)` title makes the leftover row easy to spot in `/list` and drop with `/delete`.
 
 ### Context Compaction
 

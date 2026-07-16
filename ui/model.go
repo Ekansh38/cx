@@ -207,6 +207,11 @@ type Model struct {
 	dictating     bool
 	dictationBusy bool // between stop and text-in-box: transcription/cleanup in flight
 
+	// incognito mode (cx incognito): no memory injection, no external
+	// memory, no memory curation, no /remember. Conversation is deleted
+	// on quit (main.go). Set once at construction via MarkIncognito.
+	incognito bool
+
 	// markdown rendering (cached — glamour is expensive)
 	mdRenderer *glamour.TermRenderer
 	mdWidth    int
@@ -285,20 +290,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case dictationStartedMsg:
 		if msg.err != nil {
+			playSound(soundError)
 			m.errMsg = "dictation: " + msg.err.Error()
 			m.dictating = false
 			return m, nil
 		}
 		m.dictating = true
 		m.errMsg = ""
-		return m, nil
+		return m, dictationTick()
+
+	case dictationTickMsg:
+		if !m.dictating {
+			return m, nil
+		}
+		// Refresh so the elapsed clock in the status bar re-renders.
+		return m, dictationTick()
 
 	case dictationDoneMsg:
 		m.dictationBusy = false
 		if msg.err != nil {
+			playSound(soundError)
 			m.errMsg = "dictation: " + msg.err.Error()
 			return m, nil
 		}
+		playSound(soundTextReady)
 		// Splice the transcribed text at the cursor position in the input
 		// box, adding a leading space when the caret is already after text.
 		cur := m.input.Value()
@@ -561,7 +576,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if reviewCmd != nil {
 			cmds = append(cmds, reviewCmd)
 		}
-		if !m.autoTitled && m.conv.Title == "Untitled" && len(m.messages) >= 2 {
+		if !m.autoTitled && !m.incognito && m.conv.Title == "Untitled" && len(m.messages) >= 2 {
 			m.autoTitled = true
 			cmds = append(cmds, m.autoTitleCmd())
 		}
@@ -1554,6 +1569,10 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m.handleMemCommand(parts)
 
 	case "/remember":
+		if m.incognito {
+			m.errMsg = "/remember is disabled in incognito mode"
+			return m, nil
+		}
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
 			m.errMsg = "usage: /remember <fact>"
 			return m, nil
@@ -1563,6 +1582,10 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m, m.editMemoryCmd("Remember this: "+fact, "memory updated, remembered: "+fact)
 
 	case "/forget":
+		if m.incognito {
+			m.errMsg = "/forget is disabled in incognito mode"
+			return m, nil
+		}
 		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
 			m.errMsg = "usage: /forget <query>"
 			return m, nil
@@ -1696,6 +1719,8 @@ DEBUG
 SHELL
   cx doc [file]      open editor + cx side-by-side (tmux split)
   cx vim [file]      extra doc in nvim with the cx bridge (no split)
+  cx incognito       ephemeral chat: no memory, no external files, no
+                     system prompt beyond base. deleted on quit. (alias: -i)
 
 DOC MODE
   · Docs live in YOUR editor; cx just holds file paths. Multiple docs per chat.
@@ -1727,6 +1752,10 @@ MEMORY
 
 VOICE DICTATION  (ctrl+r)
   · Toggle: press ctrl+r to start recording, press again to stop.
+  · Feedback: status bar shows "🎙 rec 0:12 (ctrl+r to stop)" with a live
+    elapsed clock, then "⚙ transcribing…" during the pipeline. macOS system
+    sounds fire on start (Tink), stop (Pop), text-ready (Glass), and error
+    (Basso) so you can eyes-off the terminal.
   · ffmpeg captures the default mic → Groq whisper-large-v3-turbo transcribes
     (sub-second) → a fast LLM (dictation_model, default = memory_model) cleans
     up disfluencies + punctuation + proper nouns → text lands in your input.
@@ -1734,7 +1763,16 @@ VOICE DICTATION  (ctrl+r)
     line, e.g. "Ekansh (not Ekaansh)"). Edited freely; picked up on next run.
   · Requires: ffmpeg installed (brew install ffmpeg) + groq.api_key in
     config.toml (or GROQ_API_KEY env var). ~5-8/mo for heavy dictation use.
-  · Hard cap 5 min per recording. Recordings <4KB are dropped as accidental.`
+  · Hard cap 5 min per recording. Recordings <4KB are dropped as accidental.
+
+INCOGNITO  (cx incognito)
+  · Launch with "cx incognito" (or "cx -i") for an ephemeral throwaway chat.
+  · The model sees NO memory.md, NO external memory files, and only the base
+    personality prompt — it knows nothing about you.
+  · No auto-title. No memory curation. /remember and /forget are disabled.
+  · Status bar shows "🕶 INCOGNITO" for the whole session.
+  · Chat is deleted on quit. If cx crashes, the title stays "(incognito)"
+    so you can spot and delete the leftover row.`
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
 
@@ -1918,7 +1956,13 @@ func (m Model) contextTokens() int {
 }
 
 // reloadSystemPrompt rebuilds the system prompt from memory.md on disk.
+// In incognito mode we keep the base personality prompt only — no memory,
+// no external memory — so the model never sees anything about the user.
 func (m *Model) reloadSystemPrompt() {
+	if m.incognito {
+		m.systemPrompt = LoadBasePromptOnly()
+		return
+	}
 	m.systemPrompt = BuildSystemPrompt(config.LoadMemory())
 }
 
@@ -2142,6 +2186,10 @@ func (m Model) buildOtherConvRecaps() string {
 }
 
 func (m Model) curateMemoryCmd() tea.Cmd {
+	// Incognito: never touch memory.md. The whole point of the mode.
+	if m.incognito {
+		return nil
+	}
 	// Collect the IDs of all assistant turns still pending curation. The
 	// caller appends to m.memPending after each streamEnd; here we snapshot
 	// it and clear it, so a concurrent re-entry doesn't double-count.
@@ -2989,6 +3037,9 @@ func (m Model) statusView() string {
 	}
 
 	left := "  " + modelDisplay + "  ·  " + m.conv.Title
+	if m.incognito {
+		left += "  ·  🕶 INCOGNITO"
+	}
 	switch len(m.docs) {
 	case 0:
 	case 1:
@@ -3004,9 +3055,13 @@ func (m Model) statusView() string {
 	}
 	switch {
 	case m.dictating:
-		left += "  ·  🎙 recording (ctrl+r to stop)"
+		el := dictationElapsed()
+		if el == "" {
+			el = "0:00"
+		}
+		left += "  ·  🎙 rec " + el + " (ctrl+r to stop)"
 	case m.dictationBusy:
-		left += "  ·  transcribing…"
+		left += "  ·  ⚙ transcribing…"
 	}
 
 	tok := m.contextTokens()
