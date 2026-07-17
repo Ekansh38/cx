@@ -1737,113 +1737,80 @@ func (m *Model) injectSystemLine(text string) {
 }
 
 const helpText = `KEYS
-  enter       send   ·   alt+enter  newline   ·   esc  dismiss error (never wipes input)
-  ctrl+c      cancel stream / quit           ·   ctrl+l  conv picker    ctrl+n  new conv
-  ctrl+g      search all messages            ·   ctrl+t  model picker
-  ctrl+e      open $EDITOR for long input    ·   ctrl+u / d  half-page scroll
-  ctrl+r      voice dictation (toggle) — records mic, cleans up, inserts text
-  up/down     walk prompt (scrolls chat when empty)
-  tab         autocomplete /command or @file
+  enter                  send
+  alt+enter              newline
+  esc                    dismiss error banner
+  ctrl+c                 cancel stream / quit
+  ctrl+l                 conversation picker
+  ctrl+n                 new conversation
+  ctrl+g                 search all messages
+  ctrl+t                 model picker
+  ctrl+e                 open $EDITOR for long input
+  ctrl+u / ctrl+d        scroll half page
+  ctrl+r                 toggle voice dictation
+  up / down              walk prompt (scroll chat when empty)
+  tab                    autocomplete /command or @file
 
 CHAT
-  /new · /list · /rename <t> · /delete · /wipe        make / pick / rename / delete
-  /retry (/r) · /edit · /stop                          re-send · edit last · stop stream
-  /fork                                                fuzzy-pick a past prompt, DELETE
-                                                       everything from it onwards in THIS
-                                                       chat, load it into input for redo
-  /copy [n] · /copy prompt [n] · /copy all [n]        yank recent replies / prompts / pairs
-  /grep                                                search all messages
-  /clear                                               clear injected system notes
+  /new                   new conversation
+  /list                  conversation picker
+  /rename <title>        rename current conversation
+  /delete                delete current conversation
+  /wipe                  delete ALL conversations (asks confirm)
+  /retry  (or /r)        re-send last message
+  /edit                  edit your last message
+  /stop                  stop current response
+  /fork                  pick a past prompt, delete from it onwards, load into input
+  /copy [n]              copy last n responses
+  /copy prompt [n]       copy last n prompts
+  /copy all [n]          copy last n prompt/response pairs
+  /grep                  search messages
+  /clear                 clear injected system notes
 
 MODEL & WEB
-  /model <name>     switch mid-chat        /models      picker (OpenRouter)
-  /web [on|off]     agentic web tools; the model runs multi-round searches inline
+  /model <name>          switch model
+  /models                model picker (OpenRouter)
+  /web [on|off]          toggle agentic web tools
 
-DOCS   (see "DOC MODE" below)
-  /doc [path]        connect + open in editor       /doc edit    reopen connected doc
-  /doc off           disconnect                     /connect doc [path]   connect only
-  /disconnect doc    disconnect (picker if many)
-  /sel · /sel clear  preview / drop editor selection
-  /undo              revert edits from the last user prompt (across retries)
-  @file              mention: .txt/.md connects, images/PDFs attach, URLs pass through
+DOCS
+  /doc [path]            connect a doc + open in editor
+  /doc edit              reopen a connected doc in editor
+  /doc off               disconnect
+  /connect doc [path]    connect a doc without opening the editor
+  /disconnect doc        disconnect a doc
+  /sel                   preview editor selection
+  /sel clear             drop editor selection
+  /undo                  revert edits from the last user prompt
+  @file                  mention: .md/.txt connect, images/PDFs attach
 
 IMAGES
-  /img <path> [text]  · /paste [text]  · drag-drop an image path also works
-
-MEMORY   (see "MEMORY" below)
-  /memory            show the file       /remember <fact>   add via memory model
-  /forget <query>    drop via memory model
-  /mem [path]        attach an external memory file (no path = fuzzy picker over cwd).
-                     read-only context injected into the system prompt of EVERY chat.
-  /mem list · /mem off [path]                                   show / detach
-
-DEBUG
-  /debug · /debug expand · /debug collapse
-
-SHELL
-  cx doc [file]      open editor + cx side-by-side (tmux split)
-  cx vim [file]      extra doc in nvim with the cx bridge (no split)
-  cx incognito       ephemeral chat: no memory, no external files, no
-                     system prompt beyond base. deleted on quit. (alias: -i)
-
-DOC MODE
-  · Docs live in YOUR editor; cx just holds file paths. Multiple docs per chat.
-  · Every message re-reads all connected docs from disk (every :w is picked up).
-  · Reference passages inline: @L12, @L12-30, @## Heading.
-  · Proposed edits are reviewed IN NEOVIM: cx splits them into minimal hunks and
-    inserts them as real green buffer lines below the red originals.
-  · On a hunk: y apply · n skip · N reject+note · a apply all · q finish · u vim undo.
-    ]q / [q jump between hunks; N fires an immediate revision request.
-  · /undo (in cx) reverts everything the last user prompt applied — including
-    edits from retry cascades (N-with-note → revised proposal → apply).
+  /img <path> [text]     send an image
+  /paste [text]          send image from clipboard
 
 MEMORY
-  · Structured markdown profile at ~/.config/cx/memory.md, organized into
-    ## Identity · Preferences · Projects · Tools & Workflow · Feedback · References ·
-    Recent conversations (episodic log so future chats know what was discussed).
-  · Injected into every system prompt. cx re-reads it before EVERY message you
-    send, so memory edits from another chat show up immediately.
-  · After each response the memory model (cfg.memory_model) rewrites the whole
-    file: merging, generalizing, pruning. It OVERWRITES stale facts confidently
-    (age, grade, city, current project, tastes all change) — say "I graduated"
-    once and old "grade 12" gets replaced, not stacked.
-  · /remember and /forget route through the same model so the file stays tidy.
-  · Direct edits to memory.md work too — the next message picks them up.
-  · /mem [path] attaches EXTERNAL memory files (life notes, vault entries, etc.)
-    that get pasted into every chat's system prompt as READ-ONLY context. The
-    model sees the path + contents so it has your notes for reference, but is
-    told not to edit them — you maintain those files yourself.
+  /memory                show memory.md
+  /remember <fact>       add via memory model
+  /forget <query>        drop via memory model
+  /mem [path]            attach external memory file (read-only) — picker if no path
+  /mem list              list attached
+  /mem off [path]        detach — picker if no path
 
-VOICE DICTATION  (ctrl+r)
-  · Toggle: press ctrl+r to start recording, press again to stop.
-  · Feedback: an animated banner pops above the prompt while active — a
-    live waveform + braille spinner + elapsed clock while recording, and a
-    scrolling "TRANSCRIBING…" bar during cleanup. Always visible regardless
-    of terminal width. Status bar also shows the same info as a fallback.
-    macOS system sounds fire on start (Tink), stop (Pop), text-ready
-    (Glass), and error (Basso) so you can eyes-off the terminal.
-  · ffmpeg captures the default mic → Groq whisper-large-v3-turbo transcribes
-    (sub-second) → a fast LLM (dictation_model, default = memory_model) cleans
-    up disfluencies + punctuation + proper nouns → text lands in your input.
-  · Custom vocabulary lives at ~/.config/cx/dictation-vocab.txt (one hint per
-    line, e.g. "Ekansh (not Ekaansh)"). Manage it inline:
-      /vocab                  show current entries
-      /vocab add <hint>       append one line
-      /vocab remove <substr>  drop lines matching substr
-      /vocab edit             open the file in $EDITOR
-    Changes are picked up on the next ctrl+r — no cx restart needed.
-  · Requires: ffmpeg installed (brew install ffmpeg) + groq.api_key in
-    config.toml (or GROQ_API_KEY env var). ~5-8/mo for heavy dictation use.
-  · Hard cap 5 min per recording. Recordings <4KB are dropped as accidental.
+DICTATION VOCAB
+  /vocab                 show current entries
+  /vocab add <hint>      append a line
+  /vocab remove <substr> drop matching lines
+  /vocab edit            open in $EDITOR
 
-INCOGNITO  (cx incognito)
-  · Launch with "cx incognito" (or "cx -i") for an ephemeral throwaway chat.
-  · The model sees NO memory.md, NO external memory files, and only the base
-    personality prompt — it knows nothing about you.
-  · No auto-title. No memory curation. /remember and /forget are disabled.
-  · Status bar shows "🕶 INCOGNITO" for the whole session.
-  · Chat is deleted on quit. If cx crashes, the title stays "(incognito)"
-    so you can spot and delete the leftover row.`
+DEBUG
+  /debug                 show full API payload
+  /debug expand          verbose mode
+  /debug collapse        back to default
+
+SHELL
+  cx                     chat
+  cx doc [file]          open editor + cx side-by-side (tmux)
+  cx vim [file]          open doc in nvim with cx bridge (no split)
+  cx incognito           (or cx -i) ephemeral chat, no memory, deleted on quit`
 
 // ── Streaming ─────────────────────────────────────────────────────────────────
 
