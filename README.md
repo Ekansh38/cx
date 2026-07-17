@@ -199,7 +199,16 @@ Ekansh (not Ekaansh, Akansh)
 Geno (not Gino, Jeno)
 ```
 
-The file is created with sensible defaults on first run.
+The file is seeded with sensible defaults on first run. Manage it inline without leaving cx:
+
+| Command | Action |
+|---------|--------|
+| `/vocab` | Show current entries (skips comment lines) |
+| `/vocab add <hint>` | Append a new line, e.g. `/vocab add Xerxes (not Zerxes)` |
+| `/vocab remove <substr>` | Drop lines containing substr (case-insensitive) |
+| `/vocab edit` | Open the file in `$EDITOR` |
+
+Changes are picked up on the very next `ctrl+r` — no cx restart.
 
 Requires:
 - `ffmpeg` on `$PATH` (`brew install ffmpeg`)

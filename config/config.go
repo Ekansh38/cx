@@ -222,3 +222,24 @@ func LoadDictationVocab() string {
 	}
 	return string(data)
 }
+
+// SaveDictationVocab overwrites the vocab file with the given text.
+func SaveDictationVocab(text string) error {
+	return os.WriteFile(DictationVocabPath(), []byte(text), 0o644)
+}
+
+// AppendDictationVocab appends line as a new entry, seeding defaults first
+// if the file didn't exist. Trims whitespace and duplicate empty lines.
+func AppendDictationVocab(line string) error {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return nil
+	}
+	current := LoadDictationVocab() // seeds defaults on first call
+	// Guarantee we're on a fresh line — the appended entry shouldn't glue
+	// onto whatever was there before.
+	if !strings.HasSuffix(current, "\n") {
+		current += "\n"
+	}
+	return SaveDictationVocab(current + line + "\n")
+}
