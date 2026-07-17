@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -32,6 +33,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"cx/config"
 	"cx/llm"
@@ -105,10 +107,11 @@ type (
 	dictationTickMsg struct{}
 )
 
-// dictationTick emits a dictationTickMsg after ~500ms. Chained by the model's
-// Update loop while m.dictating.
+// dictationTick emits a dictationTickMsg on a ~120ms cadence — fast enough
+// for the waveform / spinner animation to feel alive without flooding the
+// tea loop. Chained by the model's Update loop while dictating or busy.
 func dictationTick() tea.Cmd {
-	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
 		return dictationTickMsg{}
 	})
 }
@@ -383,4 +386,135 @@ Return ONLY the cleaned text. Nothing else.`, vocab)
 		return "", err
 	}
 	return out, nil
+}
+
+// ── Animated banner ─────────────────────────────────────────────────────────
+//
+// The banner floats above the input while dictating or transcribing so the
+// state is visible regardless of terminal width — the status-bar indicator
+// gets truncated in narrow windows.
+
+// bannerRecStyle draws the recording banner: red accent border, red-ish
+// waveform, tight two-line footprint.
+var (
+	bannerRecStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("196")).
+			Foreground(lipgloss.Color("196")).
+			Padding(0, 2)
+
+	bannerBusyStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("214")).
+			Foreground(lipgloss.Color("214")).
+			Padding(0, 2)
+
+	bannerDimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+)
+
+// waveformBars renders one row of a moving waveform. The heights come from
+// a sum of two sines: a slow "envelope" (the mouth opening/closing) plus a
+// faster per-column shimmer, so it looks like real audio, not a metronome.
+// Bar rune ladder is 1..8 stops of Unicode block-eighths.
+func waveformBars(frame, width int) string {
+	if width < 4 {
+		return ""
+	}
+	bars := []rune("▁▂▃▄▅▆▇█")
+	var sb strings.Builder
+	for i := 0; i < width; i++ {
+		envelope := math.Sin(float64(frame)*0.20 + float64(i)*0.15)
+		shimmer := math.Sin(float64(frame)*0.55 + float64(i)*1.31)
+		combined := (envelope*0.7 + shimmer*0.3 + 1) / 2 // 0..1
+		if combined < 0 {
+			combined = 0
+		}
+		if combined > 1 {
+			combined = 1
+		}
+		idx := int(combined * float64(len(bars)-1))
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(bars) {
+			idx = len(bars) - 1
+		}
+		sb.WriteRune(bars[idx])
+	}
+	return sb.String()
+}
+
+// brailleSpinner returns one frame of the classic 8-phase braille spinner.
+func brailleSpinner(frame int) rune {
+	frames := []rune("⣾⣽⣻⢿⡿⣟⣯⣷")
+	return frames[((frame%len(frames))+len(frames))%len(frames)]
+}
+
+// transcribeDots animates "TRANSCRIBING…" by cycling the dot count.
+func transcribeDots(frame int) string {
+	n := (frame / 3) % 4 // 0..3
+	return strings.Repeat(".", n) + strings.Repeat(" ", 3-n)
+}
+
+// dictationBannerView renders the two-row animated overlay above the prompt.
+// Returns "" when neither dictating nor busy.
+func (m Model) dictationBannerView() string {
+	if !m.dictating && !m.dictationBusy {
+		return ""
+	}
+	inner := m.width - 8 // border (2) + padding (2*2) + tiny slack
+	if inner < 20 {
+		inner = 20
+	}
+	if m.dictating {
+		elapsed := dictationElapsed()
+		if elapsed == "" {
+			elapsed = "0:00"
+		}
+		spin := string(brailleSpinner(m.dictationFrame))
+		label := fmt.Sprintf("%s  REC  %s", spin, elapsed)
+		hint := "ctrl+r to stop"
+		labelStyled := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")).Render(label)
+		hintStyled := bannerDimStyle.Render(hint)
+		// Compose header row: label on left, hint on right, pad in between
+		headerW := lipgloss.Width(labelStyled) + lipgloss.Width(hintStyled)
+		pad := inner - headerW
+		if pad < 1 {
+			pad = 1
+		}
+		header := labelStyled + strings.Repeat(" ", pad) + hintStyled
+		wave := waveformBars(m.dictationFrame, inner)
+		body := header + "\n" + wave
+		return bannerRecStyle.Width(inner + 4).Render(body)
+	}
+	// Busy / transcribing
+	spin := string(brailleSpinner(m.dictationFrame))
+	label := fmt.Sprintf("%s  TRANSCRIBING%s", spin, transcribeDots(m.dictationFrame))
+	hint := "cleaning up + custom vocab…"
+	labelStyled := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render(label)
+	hintStyled := bannerDimStyle.Render(hint)
+	headerW := lipgloss.Width(labelStyled) + lipgloss.Width(hintStyled)
+	pad := inner - headerW
+	if pad < 1 {
+		pad = 1
+	}
+	header := labelStyled + strings.Repeat(" ", pad) + hintStyled
+	// A subtle scrolling underline of dots so the pipeline still feels alive.
+	underline := strings.Repeat("·", inner)
+	// Rotate a "highlight window" across the underline.
+	hlWidth := 8
+	hlStart := m.dictationFrame % (inner + hlWidth)
+	if hlStart >= inner {
+		hlStart = 0
+	}
+	hlEnd := hlStart + hlWidth
+	if hlEnd > inner {
+		hlEnd = inner
+	}
+	prefix := underline[:hlStart]
+	middle := lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true).Render(underline[hlStart:hlEnd])
+	suffix := bannerDimStyle.Render(underline[hlEnd:])
+	prefixStyled := bannerDimStyle.Render(prefix)
+	body := header + "\n" + prefixStyled + middle + suffix
+	return bannerBusyStyle.Width(inner + 4).Render(body)
 }

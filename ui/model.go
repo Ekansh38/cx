@@ -204,8 +204,9 @@ type Model struct {
 	webSearch    bool // web tools offered to the model (default on; /web toggles)
 
 	// voice dictation state (ctrl+r)
-	dictating     bool
-	dictationBusy bool // between stop and text-in-box: transcription/cleanup in flight
+	dictating      bool
+	dictationBusy  bool // between stop and text-in-box: transcription/cleanup in flight
+	dictationFrame int  // monotonic tick counter for the banner animation
 
 	// incognito mode (cx incognito): no memory injection, no external
 	// memory, no memory curation, no /remember. Conversation is deleted
@@ -293,17 +294,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			playSound(soundError)
 			m.errMsg = "dictation: " + msg.err.Error()
 			m.dictating = false
+			m.syncInputHeight()
 			return m, nil
 		}
 		m.dictating = true
+		m.dictationFrame = 0
 		m.errMsg = ""
+		m.syncInputHeight() // banner rows come out of the viewport
 		return m, dictationTick()
 
 	case dictationTickMsg:
-		if !m.dictating {
+		if !m.dictating && !m.dictationBusy {
 			return m, nil
 		}
-		// Refresh so the elapsed clock in the status bar re-renders.
+		m.dictationFrame++
+		// Chain the tick as long as either state is active — animation
+		// keeps running through the transcribing phase too.
 		return m, dictationTick()
 
 	case dictationDoneMsg:
@@ -311,9 +317,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			playSound(soundError)
 			m.errMsg = "dictation: " + msg.err.Error()
+			m.syncInputHeight() // banner gone, viewport reclaims rows
 			return m, nil
 		}
 		playSound(soundTextReady)
+		m.syncInputHeight()
 		// Splice the transcribed text at the cursor position in the input
 		// box, adding a leading space when the caret is already after text.
 		cur := m.input.Value()
@@ -886,7 +894,9 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 		if m.dictating {
 			m.dictating = false
 			m.dictationBusy = true
-			return m, stopDictationCmd(m.cfg)
+			// Tick keeps chaining because dictationBusy is true — the
+			// spinner animation stays alive through transcription.
+			return m, tea.Batch(stopDictationCmd(m.cfg), dictationTick())
 		}
 		return m, startDictationCmd(m.cfg)
 
@@ -1752,10 +1762,12 @@ MEMORY
 
 VOICE DICTATION  (ctrl+r)
   · Toggle: press ctrl+r to start recording, press again to stop.
-  · Feedback: status bar shows "🎙 rec 0:12 (ctrl+r to stop)" with a live
-    elapsed clock, then "⚙ transcribing…" during the pipeline. macOS system
-    sounds fire on start (Tink), stop (Pop), text-ready (Glass), and error
-    (Basso) so you can eyes-off the terminal.
+  · Feedback: an animated banner pops above the prompt while active — a
+    live waveform + braille spinner + elapsed clock while recording, and a
+    scrolling "TRANSCRIBING…" bar during cleanup. Always visible regardless
+    of terminal width. Status bar also shows the same info as a fallback.
+    macOS system sounds fire on start (Tink), stop (Pop), text-ready
+    (Glass), and error (Basso) so you can eyes-off the terminal.
   · ffmpeg captures the default mic → Groq whisper-large-v3-turbo transcribes
     (sub-second) → a fast LLM (dictation_model, default = memory_model) cleans
     up disfluencies + punctuation + proper nouns → text lands in your input.
@@ -2971,6 +2983,20 @@ func (m Model) View() string {
 }
 
 func (m Model) chatView() string {
+	// The dictation banner floats above the input so the state stays
+	// visible even when the terminal is narrow enough to truncate the
+	// status bar. sepView is skipped while it's showing — we don't want
+	// two things competing for that row.
+	if banner := m.dictationBannerView(); banner != "" {
+		return lipgloss.JoinVertical(
+			lipgloss.Left,
+			m.viewport.View(),
+			banner,
+			m.inputView(),
+			"",
+			m.statusView(),
+		)
+	}
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
 		m.viewport.View(),
@@ -3351,7 +3377,13 @@ func (m *Model) renderMarkdown(content string) string {
 
 func (m Model) viewportHeight() int {
 	// sep(1) + input box borders(2) + input(dynamic) + gap(1) + status(1)
-	return max(m.height-5-m.inputHeight(), 1)
+	base := m.height - 5 - m.inputHeight()
+	// While the dictation banner is showing it replaces the 1-row sep with
+	// a 4-row bordered card, so the viewport gives up 3 extra rows.
+	if m.dictating || m.dictationBusy {
+		base -= 3
+	}
+	return max(base, 1)
 }
 
 // wordWrap wraps text at width, preserving explicit newlines.
