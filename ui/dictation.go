@@ -78,6 +78,98 @@ type dictationSession struct {
 	wavPath string
 	started time.Time
 	stderr  *bytes.Buffer
+
+	// Live audio levels for the waveform banner. Every tick reads whatever
+	// ffmpeg has appended to the WAV file since lastReadOffset, computes
+	// one RMS bucket per tick, and pushes it into levels (bounded ring).
+	// The banner renders the rightmost N entries.
+	lastReadOffset int64
+	levels         []float64
+}
+
+// wavHeaderSize is the standard PCM WAV RIFF header. ffmpeg writes exactly
+// this many bytes before the raw sample data. If it ever changes we'll get
+// a bit of garbage in the first bucket, no worse.
+const wavHeaderSize int64 = 44
+
+// maxWaveformHistory is the number of past buckets kept for rendering.
+// The banner uses the rightmost `width` (usually 60-100).
+const maxWaveformHistory = 200
+
+// sampleWaveform reads any new PCM samples ffmpeg has written to the WAV
+// since the last call, computes ONE RMS bucket, and appends it to
+// session.levels. Called from the model's tea Update loop on every
+// dictationTickMsg while recording. Errors are swallowed silently — if the
+// file isn't ready yet the bar just doesn't move that tick.
+func sampleWaveform(sess *dictationSession) {
+	if sess == nil {
+		return
+	}
+	fi, err := os.Stat(sess.wavPath)
+	if err != nil {
+		return
+	}
+	off := sess.lastReadOffset
+	if off < wavHeaderSize {
+		off = wavHeaderSize
+	}
+	if fi.Size() <= off {
+		// Nothing new. Push a decayed level so the bar doesn't freeze
+		// during silence — it visibly drops instead.
+		last := 0.0
+		if n := len(sess.levels); n > 0 {
+			last = sess.levels[n-1] * 0.7
+		}
+		sess.levels = append(sess.levels, last)
+		if len(sess.levels) > maxWaveformHistory {
+			sess.levels = sess.levels[len(sess.levels)-maxWaveformHistory:]
+		}
+		return
+	}
+	f, err := os.Open(sess.wavPath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return
+	}
+	// Cap what we read this tick so a long-idle tick doesn't slurp a
+	// megabyte. 64 KB = 2 seconds of 16 kHz mono S16, plenty per bucket.
+	toRead := fi.Size() - off
+	if toRead > 64*1024 {
+		toRead = 64 * 1024
+	}
+	buf := make([]byte, toRead)
+	n, _ := io.ReadFull(f, buf)
+	if n < 2 {
+		return
+	}
+	sess.lastReadOffset = off + int64(n)
+
+	// int16 LE PCM. Compute mean-square over the chunk.
+	var sumSq float64
+	samples := n / 2
+	for i := 0; i < samples; i++ {
+		s := int16(uint16(buf[i*2]) | uint16(buf[i*2+1])<<8)
+		v := float64(s) / 32768.0
+		sumSq += v * v
+	}
+	rms := math.Sqrt(sumSq / float64(samples))
+	// Gain + soft-clip. Speech typically sits at RMS ~0.02-0.10 so raw
+	// values look tiny; boost so normal talking half-fills the bars and
+	// loud speech pins the top.
+	level := rms * 6
+	if level > 1 {
+		level = 1
+	}
+	// Gamma curve so quiet passages still visibly move.
+	level = math.Pow(level, 0.6)
+
+	sess.levels = append(sess.levels, level)
+	if len(sess.levels) > maxWaveformHistory {
+		sess.levels = sess.levels[len(sess.levels)-maxWaveformHistory:]
+	}
 }
 
 // active recording, if any. One at a time by construction (the ctrl+r
@@ -141,6 +233,10 @@ func startDictationCmd(_ *config.Config) tea.Cmd {
 			"-ac", "1",
 			"-ar", fmt.Sprintf("%d", dictationSampleRate),
 			"-t", fmt.Sprintf("%d", dictationMaxMinutes*60), // hard cap
+			// Flush every packet so the live waveform can read fresh samples
+			// each tick. Without this ffmpeg buffers several seconds and the
+			// bars visibly lag behind your voice.
+			"-flush_packets", "1",
 			"-y", wav,
 		)
 		var stderr bytes.Buffer
@@ -412,27 +508,36 @@ var (
 	bannerDimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 )
 
-// waveformBars renders one row of a moving waveform. The heights come from
-// a sum of two sines: a slow "envelope" (the mouth opening/closing) plus a
-// faster per-column shimmer, so it looks like real audio, not a metronome.
-// Bar rune ladder is 1..8 stops of Unicode block-eighths.
-func waveformBars(frame, width int) string {
+// waveformBars renders one row of the moving waveform from real audio
+// levels sampled off the WAV file ffmpeg is writing (see sampleWaveform).
+// The rightmost bar is the newest bucket; older buckets scroll left as the
+// ring buffer fills. Bar rune ladder is 1..8 stops of Unicode block-eighths.
+// Empty gaps (before any audio has been sampled) show as the smallest bar
+// so the row visibly exists.
+func waveformBars(levels []float64, width int) string {
 	if width < 4 {
 		return ""
 	}
 	bars := []rune("▁▂▃▄▅▆▇█")
 	var sb strings.Builder
-	for i := 0; i < width; i++ {
-		envelope := math.Sin(float64(frame)*0.20 + float64(i)*0.15)
-		shimmer := math.Sin(float64(frame)*0.55 + float64(i)*1.31)
-		combined := (envelope*0.7 + shimmer*0.3 + 1) / 2 // 0..1
-		if combined < 0 {
-			combined = 0
+	// Take the last `width` levels, right-align.
+	start := len(levels) - width
+	if start < 0 {
+		start = 0
+	}
+	pad := width - (len(levels) - start)
+	for i := 0; i < pad; i++ {
+		sb.WriteRune(bars[0])
+	}
+	for i := start; i < len(levels); i++ {
+		v := levels[i]
+		if v < 0 {
+			v = 0
 		}
-		if combined > 1 {
-			combined = 1
+		if v > 1 {
+			v = 1
 		}
-		idx := int(combined * float64(len(bars)-1))
+		idx := int(v * float64(len(bars)-1))
 		if idx < 0 {
 			idx = 0
 		}
@@ -483,7 +588,13 @@ func (m Model) dictationBannerView() string {
 			pad = 1
 		}
 		header := labelStyled + strings.Repeat(" ", pad) + hintStyled
-		wave := waveformBars(m.dictationFrame, inner)
+		// Snapshot the levels; currentDictation could be nil'd between
+		// here and any subsequent access if a stop races the render.
+		var levels []float64
+		if currentDictation != nil {
+			levels = append(levels, currentDictation.levels...)
+		}
+		wave := waveformBars(levels, inner)
 		body := header + "\n" + wave
 		return bannerRecStyle.Width(inner + 4).Render(body)
 	}
