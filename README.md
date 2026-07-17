@@ -187,7 +187,9 @@ The list lives at `~/.config/cx/external-memory.txt` (one absolute path per line
 Press `ctrl+r` to start recording, `ctrl+r` again to stop (**toggle**, not hold — terminal key-up events aren't reliable). cx captures the default mic with `ffmpeg`, sends the WAV to **Groq's `whisper-large-v3-turbo`** for transcription (sub-second latency), and pipes the raw transcript through a fast LLM cleanup pass (fixes disfluencies, applies your custom vocabulary, punctuates) before dropping the text into your input.
 
 **Feedback so you can eyes-off the terminal**:
-- Status bar shows `🎙 rec 0:12 (ctrl+r to stop)` with a live elapsed clock while recording, then `⚙ transcribing…` during the pipeline.
+- An **animated banner** pops above the prompt while recording — a live block-eighths waveform driven by a two-sine model (so it looks like real audio, not a metronome), a braille spinner, a red `REC` label, and an elapsed clock. Stays visible even on narrow terminals where the status bar truncates.
+- During cleanup the banner turns amber and shows a scrolling `TRANSCRIBING…` bar with a highlight window sweeping across the underline.
+- Status bar mirrors the state as a fallback: `🎙 rec 0:12 (ctrl+r to stop)` while recording, `⚙ transcribing…` during the pipeline.
 - macOS system sounds fire at each phase: `Tink` on start, `Pop` on stop, `Glass` when text lands in your input, `Basso` on error.
 
 Custom vocabulary — proper nouns, easily-misheard words — lives at `~/.config/cx/dictation-vocab.txt`, one line per hint:
