@@ -107,7 +107,9 @@ var commands = []string{
 	"/edit", "/forget ", "/grep", "/help", "/img ",
 	"/list", "/mem", "/mem list", "/mem off ", "/memory", "/model ", "/models", "/new",
 	"/paste", "/quit", "/r", "/remember ",
-	"/rename ", "/retry", "/sel", "/stop", "/undo", "/web", "/wipe",
+	"/rename ", "/retry", "/sel", "/stop", "/undo",
+	"/vocab", "/vocab add ", "/vocab remove ", "/vocab edit",
+	"/web", "/wipe",
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -660,6 +662,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.convID == m.conv.ID {
 			m.conv.Title = msg.title
 		}
+		return m, nil
+
+	case vocabEditedMsg:
+		m.injectSystemLine("dictation vocab saved. next ctrl+r picks it up.")
 		return m, nil
 
 	case editorDoneMsg:
@@ -1623,6 +1629,9 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 	case "/mem":
 		return m.handleMemCommand(parts)
 
+	case "/vocab":
+		return m.handleVocabCommand(parts)
+
 	case "/remember":
 		if m.incognito {
 			m.errMsg = "/remember is disabled in incognito mode"
@@ -1817,7 +1826,12 @@ VOICE DICTATION  (ctrl+r)
     (sub-second) → a fast LLM (dictation_model, default = memory_model) cleans
     up disfluencies + punctuation + proper nouns → text lands in your input.
   · Custom vocabulary lives at ~/.config/cx/dictation-vocab.txt (one hint per
-    line, e.g. "Ekansh (not Ekaansh)"). Edited freely; picked up on next run.
+    line, e.g. "Ekansh (not Ekaansh)"). Manage it inline:
+      /vocab                  show current entries
+      /vocab add <hint>       append one line
+      /vocab remove <substr>  drop lines matching substr
+      /vocab edit             open the file in $EDITOR
+    Changes are picked up on the next ctrl+r — no cx restart needed.
   · Requires: ffmpeg installed (brew install ffmpeg) + groq.api_key in
     config.toml (or GROQ_API_KEY env var). ~5-8/mo for heavy dictation use.
   · Hard cap 5 min per recording. Recordings <4KB are dropped as accidental.
@@ -4161,3 +4175,110 @@ func (m Model) memPickerView() string {
 	sb.WriteString(dimStyle.Render("   ↑↓ navigate  enter " + verb + "  esc back"))
 	return sb.String()
 }
+
+// ── Dictation vocab (/vocab) ─────────────────────────────────────────────────
+//
+// The dictation cleanup pass consumes ~/.config/cx/dictation-vocab.txt as
+// custom-vocabulary hints (proper nouns, easily-misheard words). These
+// commands make it trivial to keep the file up to date without leaving cx.
+
+// handleVocabCommand routes:
+//
+//	/vocab                        → show the file inline
+//	/vocab add <hint>             → append a line (auto-seeds defaults if missing)
+//	/vocab remove <substr>        → drop lines containing substr (case-insensitive)
+//	/vocab edit                   → open the file in $EDITOR
+func (m Model) handleVocabCommand(parts []string) (Model, tea.Cmd) {
+	if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+		content := config.LoadDictationVocab()
+		// Skip the boilerplate comments in the display so a busy vocab is
+		// still readable inline. Full contents still land via /vocab edit.
+		var out []string
+		for _, ln := range strings.Split(content, "\n") {
+			t := strings.TrimSpace(ln)
+			if t == "" || strings.HasPrefix(t, "#") {
+				continue
+			}
+			out = append(out, ln)
+		}
+		if len(out) == 0 {
+			m.injectSystemLine("dictation vocab is empty. use /vocab add <hint>")
+			return m, nil
+		}
+		m.injectSystemLine("── dictation vocab ──\n" + strings.Join(out, "\n"))
+		return m, nil
+	}
+	arg := strings.TrimSpace(parts[1])
+	switch {
+	case arg == "edit":
+		path := config.DictationVocabPath()
+		// Seed defaults so the file exists before $EDITOR opens it.
+		_ = config.LoadDictationVocab()
+		editor := os.Getenv("EDITOR")
+		if editor == "" {
+			editor = "vim"
+		}
+		return m, tea.ExecProcess(exec.Command(editor, path), func(err error) tea.Msg {
+			if err != nil {
+				return nil
+			}
+			return vocabEditedMsg{}
+		})
+
+	case strings.HasPrefix(arg, "add "):
+		line := strings.TrimSpace(strings.TrimPrefix(arg, "add "))
+		if line == "" {
+			m.errMsg = "usage: /vocab add <hint>"
+			return m, nil
+		}
+		if err := config.AppendDictationVocab(line); err != nil {
+			m.errMsg = "vocab: " + err.Error()
+			return m, nil
+		}
+		m.injectSystemLine("added to dictation vocab: " + line)
+		return m, nil
+
+	case strings.HasPrefix(arg, "remove "):
+		query := strings.TrimSpace(strings.TrimPrefix(arg, "remove "))
+		if query == "" {
+			m.errMsg = "usage: /vocab remove <substring>"
+			return m, nil
+		}
+		content := config.LoadDictationVocab()
+		q := strings.ToLower(query)
+		var kept []string
+		dropped := 0
+		for _, ln := range strings.Split(content, "\n") {
+			t := strings.TrimSpace(ln)
+			// Preserve blank + comment lines untouched; only match real entries.
+			if t == "" || strings.HasPrefix(t, "#") {
+				kept = append(kept, ln)
+				continue
+			}
+			if strings.Contains(strings.ToLower(t), q) {
+				dropped++
+				continue
+			}
+			kept = append(kept, ln)
+		}
+		if dropped == 0 {
+			m.errMsg = "no vocab lines matched " + query
+			return m, nil
+		}
+		if err := config.SaveDictationVocab(strings.Join(kept, "\n")); err != nil {
+			m.errMsg = "vocab: " + err.Error()
+			return m, nil
+		}
+		m.injectSystemLine(fmt.Sprintf("dropped %d vocab line(s) matching %q", dropped, query))
+		return m, nil
+
+	default:
+		m.errMsg = "usage: /vocab [add <hint> | remove <substr> | edit]"
+		return m, nil
+	}
+}
+
+// vocabEditedMsg fires after $EDITOR returns from /vocab edit so the model
+// can note the change. Content is re-read from disk on the next ctrl+r
+// automatically — no in-memory copy to invalidate.
+type vocabEditedMsg struct{}
