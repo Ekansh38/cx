@@ -16,12 +16,52 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // maxLines is a hard safety cap so a runaway model can't bloat the file.
 const maxLines = 200
 
 var mu sync.Mutex
+
+// ── Cross-process curation lock ─────────────────────────────────────────────
+//
+// Two cx instances running memory curation concurrently would race on the
+// memory.md rewrite — last-write-wins, and the loser's turns are dropped
+// from that pass. TryLockCuration takes a POSIX advisory lock on a small
+// sidecar file; only the process holding the lock is allowed to curate.
+// The other instance either skips this round (its threshold will fire
+// again) or waits for the next tick.
+
+// TryLockCuration attempts a non-blocking exclusive flock on
+// ~/.config/cx/memory.md.lock. Returns the open lock handle on success;
+// the caller MUST call UnlockCuration to release. Returns (nil, nil) if
+// another process holds the lock — that's not an error, just a signal to
+// defer this curation round.
+func TryLockCuration() (*os.File, error) {
+	path := filepath.Join(configDir(), "memory.md.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if err == syscall.EWOULDBLOCK {
+			return nil, nil // contention, not a real failure
+		}
+		return nil, err
+	}
+	return f, nil
+}
+
+// UnlockCuration releases the advisory lock and closes the file.
+func UnlockCuration(f *os.File) {
+	if f == nil {
+		return
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
+}
 
 // Raw returns the full memory file content ("" if it doesn't exist).
 func Raw(path string) (string, error) {

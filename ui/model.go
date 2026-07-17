@@ -213,6 +213,11 @@ type Model struct {
 	// on quit (main.go). Set once at construction via MarkIncognito.
 	incognito bool
 
+	// Cross-instance sync: mtime of the SQLite DB at last sync check. If
+	// mtime moves without our doing (another cx wrote to it), we pull the
+	// current conv's messages + docs + title from disk on the next tick.
+	lastDBMod time.Time
+
 	// markdown rendering (cached — glamour is expensive)
 	mdRenderer *glamour.TermRenderer
 	mdWidth    int
@@ -260,7 +265,17 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 }
 
 func (m Model) Init() tea.Cmd {
-	return textarea.Blink
+	return tea.Batch(textarea.Blink, dbSyncTick())
+}
+
+// dbSyncTickMsg fires every ~2s. The handler pulls fresh conv state from
+// SQLite if another cx instance has written to it since our last check.
+type dbSyncTickMsg struct{}
+
+func dbSyncTick() tea.Cmd {
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+		return dbSyncTickMsg{}
+	})
 }
 
 // ── Update ────────────────────────────────────────────────────────────────────
@@ -288,6 +303,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case docReloadMsg:
 		m.reloadDocs()
 		return m, nil
+
+	case dbSyncTickMsg:
+		// Cheap cross-instance sync: stat the DB, and if another cx has
+		// touched it since our last check, pull the current conv's fresh
+		// messages, docs, and title. We deliberately skip during any
+		// activity that mutates in-flight state (streaming, active edit
+		// review, overlays) — the reload would fight with those.
+		if m.state == stateChat && !m.streaming && !m.docReview && !m.dictating && !m.dictationBusy {
+			m.dbSyncNow()
+		}
+		return m, dbSyncTick()
 
 	case dictationStartedMsg:
 		if msg.err != nil {
@@ -694,10 +720,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.verbose {
 					m.injectSystemLine(fmt.Sprintf("memory update rejected: suspicious shrink (%d lines -> %d)", oldLines, newLines))
 				}
-			} else if err := memory.SaveRaw(config.MemoryPath(), msg.content); err != nil {
-				m.injectSystemLine("memory write failed: " + err.Error())
 			} else {
-				m.reloadSystemPrompt()
+				// Cross-process advisory lock so two cx instances rewriting
+				// memory.md concurrently can't clobber each other. Lock
+				// contention just defers this write — the next threshold
+				// will retry, and the other process's turns are already
+				// covered by the write we're waiting on.
+				lk, _ := memory.TryLockCuration()
+				if lk == nil && !m.verbose {
+					// Someone else is curating right now; skip silently.
+					// verbose users still see the "no changes" note below.
+				} else if err := memory.SaveRaw(config.MemoryPath(), msg.content); err != nil {
+					memory.UnlockCuration(lk)
+					m.injectSystemLine("memory write failed: " + err.Error())
+				} else {
+					memory.UnlockCuration(lk)
+					m.reloadSystemPrompt()
+				}
 			}
 		}
 		if msg.note != "" {
@@ -1982,6 +2021,93 @@ func (m *Model) reloadSystemPrompt() {
 		return
 	}
 	m.systemPrompt = BuildSystemPrompt(config.LoadMemory())
+}
+
+// dbSyncNow is the reload half of the cross-instance sync. Called from the
+// dbSyncTickMsg handler when the runtime state is safe to mutate. Compares
+// the DB mtime; on change, pulls fresh conv metadata, messages, and docs
+// for the currently-open conversation.
+//
+// Design notes:
+//   - Reload happens ONLY for the currently-open conv. Other conversations'
+//     changes surface at the next /list + switch, as they always have.
+//   - We keep new messages appended by other instances but don't try to
+//     merge concurrent local edits — cx doesn't have any (typing in the
+//     input box doesn't persist).
+//   - Incognito mode is exempt: the ephemeral chat isn't shared with any
+//     other cx and reloading it would be pointless overhead.
+func (m *Model) dbSyncNow() {
+	if m.incognito || m.conv == nil {
+		return
+	}
+	mt := m.store.ModTime()
+	if mt.IsZero() {
+		return
+	}
+	if m.lastDBMod.IsZero() {
+		// First check: just capture the current mtime as the baseline. Any
+		// legitimate change since startup was already reflected in the
+		// snapshot the ui/model.New picked up.
+		m.lastDBMod = mt
+		return
+	}
+	if !mt.After(m.lastDBMod) {
+		return
+	}
+	m.lastDBMod = mt
+
+	// Conv metadata (title, model). Auto-title from another instance is the
+	// common case; picking up model swaps is a bonus.
+	if conv, err := m.store.GetConversation(m.conv.ID); err == nil {
+		if conv.Title != m.conv.Title {
+			m.conv.Title = conv.Title
+		}
+		m.conv.UpdatedAt = conv.UpdatedAt
+	}
+
+	// Messages: refetch and detect appended tail. We compare by count first
+	// (fast), then splice-in. Deletions (fork's in-place rewrite) collapse
+	// to a full replacement.
+	msgs, err := m.store.GetMessages(m.conv.ID)
+	if err != nil {
+		return
+	}
+	changed := false
+	switch {
+	case len(msgs) > len(m.messages):
+		added := len(msgs) - len(m.messages)
+		m.messages = msgs
+		m.injectSystemLine(fmt.Sprintf("↻ synced %d new message(s) from another cx instance", added))
+		changed = true
+	case len(msgs) < len(m.messages):
+		// The other instance rewrote history (fork in-place) or deleted
+		// something. Adopt the shorter tail.
+		m.messages = msgs
+		m.injectSystemLine("↻ synced: history was rewritten by another cx instance")
+		changed = true
+	default:
+		// Same length; the tail could still differ if messages were
+		// swapped somehow. Cheap check: compare the last row's ID.
+		if len(msgs) > 0 && len(m.messages) > 0 && msgs[len(msgs)-1].ID != m.messages[len(m.messages)-1].ID {
+			m.messages = msgs
+			changed = true
+		}
+	}
+
+	// Docs: another instance may have connected/disconnected. loadConvDocs
+	// re-reads conversation_docs from SQLite.
+	prevDocs := len(m.docs)
+	m.loadConvDocs()
+	if len(m.docs) != prevDocs {
+		changed = true
+	}
+
+	if changed {
+		m.refreshContent()
+		if m.atBottom {
+			m.viewport.GotoBottom()
+		}
+	}
 }
 
 // ── Auto-title ────────────────────────────────────────────────────────────────

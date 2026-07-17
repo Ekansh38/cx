@@ -209,6 +209,14 @@ Cleanup uses `dictation_model` in `config.toml` if set, else `memory_model`, els
 
 Recordings are hard-capped at 5 minutes. Recordings under 4KB (accidentally-tapped ctrl+r twice) are dropped silently.
 
+### Multi-instance sync
+
+Run two (or more) cx windows on the same machine — they stay in sync on the same conversation. Every ~2 seconds cx stats the SQLite DB; if another instance has written to it, the current conversation's messages, docs, and title are pulled from disk. New messages from the other instance show up with a `↻ synced N new message(s) from another cx instance` note; in-place fork rewrites and title changes propagate the same way.
+
+Sync is skipped during activity that would fight it: while streaming a response, during a doc edit review, and during voice dictation. It resumes as soon as you're back to a resting chat state. Incognito chats are exempt (they're never shared).
+
+Memory-file curation uses a cross-process `flock` on `memory.md.lock`, so two instances curating at once can't clobber each other — the loser just skips that round and picks it up on the next threshold.
+
 ### Incognito mode
 
 ```bash
