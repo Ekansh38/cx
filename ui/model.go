@@ -308,6 +308,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.dictationFrame++
+		if m.dictating {
+			// Read whatever ffmpeg has written since last tick and turn it
+			// into one waveform bucket. Silent ticks decay the previous
+			// level so the bar visibly drops instead of freezing.
+			sampleWaveform(currentDictation)
+		}
 		// Chain the tick as long as either state is active — animation
 		// keeps running through the transcribing phase too.
 		return m, dictationTick()
