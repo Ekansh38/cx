@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -54,7 +55,8 @@ type Message struct {
 }
 
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string // db file path — kept for mtime-based cross-instance sync
 }
 
 func New(path string) (*Store, error) {
@@ -70,7 +72,27 @@ func New(path string) (*Store, error) {
 	// Move legacy single-doc attachments into conversation_docs (the doc_path
 	// column only exists on older DBs; the error is ignored on fresh ones)
 	db.Exec(`INSERT OR IGNORE INTO conversation_docs (conversation_id, path) SELECT id, doc_path FROM conversations WHERE doc_path != ''`)
-	return &Store{db: db}, nil
+	return &Store{db: db, path: path}, nil
+}
+
+// Path returns the on-disk path of the SQLite database. Used by the UI to
+// stat the file for cross-instance change detection.
+func (s *Store) Path() string { return s.path }
+
+// ModTime returns the mtime of the SQLite database file, or zero on error.
+// The WAL journaling mode means writes also touch the -wal and -shm sidecar
+// files, but the main file's mtime moves on checkpoint; polling either
+// works for coarse "did anything change since last check" detection. The
+// -wal file changes more often, so we watch that when it exists.
+func (s *Store) ModTime() time.Time {
+	if fi, err := os.Stat(s.path + "-wal"); err == nil {
+		return fi.ModTime()
+	}
+	fi, err := os.Stat(s.path)
+	if err != nil {
+		return time.Time{}
+	}
+	return fi.ModTime()
 }
 
 func (s *Store) Close() error {

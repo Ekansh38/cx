@@ -125,6 +125,14 @@ func RunFlushChild(statePath string) int {
 	if oldLines >= 20 && newLines*3 < oldLines {
 		return 0
 	}
+	// Cross-process lock: skip if another cx instance is curating right
+	// now. The post-quit flush is best-effort; a missed write here is
+	// caught by the surviving instance's next threshold.
+	lk, _ := memory.TryLockCuration()
+	if lk == nil {
+		return 0
+	}
+	defer memory.UnlockCuration(lk)
 	if err := memory.SaveRaw(memPath, result); err != nil {
 		return 1
 	}
