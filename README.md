@@ -4,9 +4,10 @@ Terminal AI chat client. Fast, keyboard-first, multi-model. Built with Go + Bubb
 
 ## Screenshots
 
-<!-- Drop screenshots / GIFs here -->
+<img width="1507" height="898" alt="Screenshot 2026-07-18 at 6 52 11 PM" src="https://github.com/user-attachments/assets/4594e7e1-ed9b-417e-8f1a-bebc726f027d" />
+<img width="598" height="154" alt="Screenshot 2026-07-18 at 6 45 56 PM" src="https://github.com/user-attachments/assets/5cc2b40d-5fc0-45ff-a156-009e330653dc" />
+<img width="1510" height="926" alt="Screenshot 2026-07-18 at 6 00 15 PM" src="https://github.com/user-attachments/assets/c0f2c342-3f92-4110-aa8e-b38d194fe729" />
 
-_(placeholder — screenshots coming soon)_
 
 ## Install
 
