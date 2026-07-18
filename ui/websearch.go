@@ -23,7 +23,7 @@ func webTools() []llm.Tool {
 	return []llm.Tool{
 		{
 			Name:        "discard_pending_edits",
-			Description: "Discard EVERY edit currently under review (in the user's editor) and any queued behind it. Use when the user redirects the conversation instead of reviewing — 'let's discuss this instead', 'wait, before you change anything', a question about the doc, or any message that isn't approval — so your obsolete proposals don't clutter their editor. After discarding, respond in prose only; do NOT propose new edits in the same response.",
+			Description: "Discard EVERY edit currently under review (in the user's editor) and any queued behind it. NARROW USE: only when the user explicitly asks to cancel, undo, or forget the pending proposals — 'cancel these', 'never mind', 'discard those', 'let's abandon this and just discuss', 'wait, I want to talk about something else first'. Do NOT call this when the user wants MORE edits, DIFFERENT edits, ADDITIONAL edits (including edits that remove content from the doc, e.g. 'also remove X' or 'trim these too'), or when they're asking a question about the doc while still expecting the review to continue. In those cases just emit the new SEARCH/REPLACE edit blocks — cx will INJECT them into the running review alongside the existing pending ones, no discard needed. After discarding, respond in prose only; do NOT propose new edits in the same response.",
 			Parameters: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
