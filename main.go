@@ -6,7 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -22,6 +25,13 @@ func main() {
 	if len(os.Args) >= 3 && os.Args[1] == "_curate" {
 		os.Exit(ui.RunFlushChild(os.Args[2]))
 	}
+
+	// Zombie-cx guard. Every review overwrites ~/.local/share/cx/cx-review.lua
+	// with whatever cx wrote it last; a stale cx from a previous build kept
+	// stomping the fresh lua and breaking the diff render. On every startup,
+	// look for other cx processes running from an older binary and kill them.
+	// Same-binary siblings are LEFT ALONE (legitimate multi-window use is fine).
+	killStaleSiblings()
 
 	// Review handoff files (edits/edits-done/reject-now) are per-session
 	// ephemera. If cx or the bridged neovim crashed last time, leftovers
@@ -334,4 +344,86 @@ func fuzzyPick(candidates []string) (string, bool) {
 		return "", false
 	}
 	return picked, true
+}
+
+// killStaleSiblings finds any other running cx processes whose executable
+// is older than ours and sends them SIGTERM. Same-binary siblings and any
+// process whose binary path we can't resolve are left alone.
+//
+// Why: startExternalReview writes ~/.local/share/cx/cx-review.lua from the
+// currently-running binary's embedded copy. If a stale cx from a previous
+// build performs a review, it clobbers a newer sibling's lua. The user
+// then sees a review that renders no diff and cx feels broken. Killing
+// the stale processes on startup makes this class of bug impossible.
+//
+// Best-effort: any error (no lsof, weird ps output, no permission) short-
+// circuits without noise. The guard is a safety net, not a hard requirement.
+func killStaleSiblings() {
+	myExe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	myExeAbs, err := filepath.EvalSymlinks(myExe)
+	if err != nil {
+		myExeAbs = myExe
+	}
+	myFi, err := os.Stat(myExeAbs)
+	if err != nil {
+		return
+	}
+	myPID := os.Getpid()
+
+	// Find candidate cx PIDs by name. `pgrep -x cx` matches processes whose
+	// basename is exactly "cx" — safer than a substring match that would
+	// hit "cx-something".
+	pgrepOut, err := exec.Command("pgrep", "-x", filepath.Base(myExe)).Output()
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(pgrepOut)), "\n") {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || pid == myPID || pid <= 0 {
+			continue
+		}
+		peerExe := binaryPathOfPID(pid)
+		if peerExe == "" {
+			continue
+		}
+		peerFi, err := os.Stat(peerExe)
+		if err != nil {
+			continue
+		}
+		// Skip identical binaries. Two legitimate concurrent cx windows on
+		// the same build are fine.
+		if peerFi.ModTime().Equal(myFi.ModTime()) && peerFi.Size() == myFi.Size() {
+			continue
+		}
+		// Only kill if the sibling's binary is STRICTLY older. Newer
+		// siblings might have upgraded past us — don't fight them.
+		if !peerFi.ModTime().Before(myFi.ModTime()) {
+			continue
+		}
+		fmt.Fprintf(os.Stderr,
+			"cx: killing stale sibling PID %d (binary from %s)\n",
+			pid, peerFi.ModTime().Format(time.Kitchen))
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+}
+
+// binaryPathOfPID returns the absolute path of the executable a running PID
+// is bound to, or "" if it can't be resolved. Uses lsof on macOS/Linux:
+// the `txt` file for a process is its executable image. Falls back to
+// empty string if lsof isn't installed.
+func binaryPathOfPID(pid int) string {
+	out, err := exec.Command("lsof", "-p", strconv.Itoa(pid), "-a", "-d", "txt", "-Fn").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		// lsof -F output prefixes fields with a single char. "n" = name.
+		if strings.HasPrefix(line, "n/") {
+			return strings.TrimPrefix(line, "n")
+		}
+	}
+	return ""
 }
