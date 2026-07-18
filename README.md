@@ -2,15 +2,19 @@
 
 Terminal AI chat client. Fast, keyboard-first, multi-model. Built with Go + Bubbletea.
 
+## Screenshots
+
+<!-- Drop screenshots / GIFs here -->
+
+_(placeholder — screenshots coming soon)_
+
 ## Install
 
 ```bash
 git clone https://github.com/Ekansh38/cx.git
 cd cx
 go build -o cx .
-
-# Add to PATH (add to ~/.zshrc or ~/.bashrc)
-export PATH="$PATH:$(pwd)"
+export PATH="$PATH:$(pwd)"   # add to ~/.zshrc or ~/.bashrc
 ```
 
 ## Setup
@@ -24,249 +28,171 @@ model = "anthropic/claude-sonnet-4-5"
 api_key = "sk-or-v1-..."
 ```
 
-Or use direct provider keys:
-
-```toml
-model = "gemini-2.0-flash"
-
-[gemini]
-api_key = "..."
-```
-
-Env vars override config: `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`.
+Direct-provider keys work too (`[gemini]`, `[openai]`, `[ollama]`, `[groq]`). Env vars override the file: `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `GROQ_API_KEY`.
 
 ## Usage
 
 ```bash
 cx                # chat
-cx doc            # fuzzy-pick a doc, open it in neovim beside cx
-cx doc notes.md   # same, with the file given directly
-                  # (opening does NOT connect: /connect doc attaches it)
-cx vim            # fuzzy-pick among the current chat's connected docs (or
-                  # files in the cwd) and open one in neovim with the cx
-                  # bridge — no tmux split. handy when several docs are
-                  # connected to one chat
-cx vim notes.md   # same, with the file given directly
-cx incognito      # ephemeral chat: no memory, no external files, no
-                  # system prompt beyond the base. deleted on quit.
-                  # (alias: cx -i)
+cx doc [file]     # editor + cx side-by-side in tmux
+cx vim [file]     # extra doc in nvim with the cx bridge (no split)
+cx incognito      # ephemeral chat — no memory, deleted on quit (alias: -i)
 ```
 
-### Keybindings
+## Keys
 
 | Key | Action |
 |-----|--------|
-| `enter` | Send message |
-| `alt+enter` | Newline (multiline input; the box grows as you type, and big pastes collapse to `[paste #N, X lines]`) |
-| `esc` | Dismiss a stuck error banner (never wipes the input) |
-| `up/down` | Move through your prompt (scrolls chat when empty) |
+| `enter` | Send |
+| `alt+enter` | Newline (multiline input) |
+| `esc` | Dismiss error banner |
 | `ctrl+c` | Cancel stream / quit |
 | `ctrl+l` | Conversation picker |
 | `ctrl+n` | New conversation |
 | `ctrl+g` | Search all messages |
-| `ctrl+t` | Model switcher |
+| `ctrl+t` | Model picker |
 | `ctrl+e` | Open `$EDITOR` for long input |
-| `ctrl+u/d` | Scroll half page |
-| `ctrl+r` | Voice dictation (toggle) — records mic, transcribes via Groq Whisper, cleans up disfluencies + custom vocabulary, inserts into input |
+| `ctrl+u` / `ctrl+d` | Scroll half page |
+| `ctrl+r` | Voice dictation (toggle) |
+| `up` / `down` | Walk prompt (scroll chat when empty) |
 | `tab` | Autocomplete `/command` or `@file` |
 
-### Commands
+## Commands
 
 | Command | Action |
 |---------|--------|
-| `/help` | Show all keybinds + commands |
-| `/quit` (or `:q`) | Quit |
-| `/new` | New conversation |
-| `/list` | Conversation picker |
-| `/edit` | Edit your last message |
-| `/stop` | Stop streaming response |
-| `/delete` | Delete the current conversation |
-| `/grep` | Search all messages |
-| `/copy [n]` | Copy the last n responses (default 1) |
-| `/copy prompt [n]` | Copy your last n messages |
-| `/copy all [n]` | Copy the last n prompt/response pairs |
-| `/retry` / `/r` | Re-send last message |
-| `/fork` | Fuzzy-pick a past prompt, DELETE everything from it onwards in this chat, and load it back into the input for redo (rewrites history in place — no new conversation) |
-| `/img <path> [text]` | Send an image |
-| `/rename <title>` | Rename conversation |
-| `/model <name>` | Switch model |
-| `/models` | Model picker (fetches from OpenRouter) |
-| `/remember <fact>` | Save to memory |
-| `/forget <query>` | Remove from memory |
-| `/paste [text]` | Paste image from clipboard |
-| `/doc [path]` | Connect a doc and open it in your editor (no path = fuzzy picker) |
-| `/doc edit` | Reopen a connected doc in your editor |
-| `/doc off` | Disconnect (same as `/disconnect doc`) |
-| `/undo` | Revert the edits applied by the last review |
-| `/web [on|off]` | Toggle live web search (OpenRouter models) |
-| `/connect doc [path]` | Connect a doc without opening the editor (no path = last doc) |
-| `/disconnect doc` | Disconnect a doc (picker with ALL when several) |
-| `/memory` | Show current memory file |
-| `/debug` | Show full API payload |
-| `/debug expand` | Verbose mode: full notes, memory + context events |
-| `/debug collapse` | Back to the clean default |
-| `/wipe` | Delete all data (asks confirm) |
+| `/help` | This help |
+| `/new` · `/list` · `/rename <t>` · `/delete` · `/wipe` | Manage conversations |
+| `/retry` (`/r`) · `/edit` · `/stop` | Re-send · edit last · stop stream |
+| `/fork` | Pick a past prompt, delete history from it onwards, load into input |
+| `/copy [n]` · `/copy prompt [n]` · `/copy all [n]` | Copy recent output |
+| `/grep` | Search messages |
+| `/model <name>` · `/models` | Switch model / picker |
+| `/web [on\|off]` | Toggle agentic web tools |
+| `/doc [path]` | Connect a doc + open in editor |
+| `/doc edit` · `/doc off` | Reopen · disconnect |
+| `/connect doc [path]` · `/disconnect doc` | Connect without opening · disconnect |
+| `/sel` · `/sel clear` | Preview / drop editor selection |
+| `/undo` | Revert edits from the last user prompt |
+| `/img <path> [text]` · `/paste [text]` | Send an image |
+| `/memory` · `/remember <fact>` · `/forget <query>` | Memory file ops |
+| `/mem [path]` · `/mem list` · `/mem off [path]` | External memory files |
+| `/vocab` · `/vocab add <hint>` · `/vocab remove <substr>` | Dictation vocab |
+| `/tokens` (or `/stats`) | Token breakdown (system / docs / transcript / total vs limit) + conversation shape |
+| `/debug` · `/debug expand` · `/debug collapse` | Payload / verbose modes |
 
-### @file mentions
+## @file mentions
 
-Mention a file anywhere in a message with `@` — tab fuzzy-completes against md/txt/image/pdf files under the current directory, with candidates shown live as you type. On send, text files **connect as docs**, images and **PDFs attach to the message** (sent as native document input — models read them directly), and image URLs (`@https://site.com/pic.png`) pass straight through for the provider to fetch. `@` that doesn't resolve to a file (emails, handles) passes through as plain text.
+Type `@` anywhere in a message; `tab` fuzzy-completes over md/txt/image/pdf files under the cwd, with live candidates as you type.
+
+- **Text files** (`.md`, `.txt`) → **connect as docs**. Content is sent every turn and the model **can propose edits** to them via the doc-review flow (see below).
+- **Images / PDFs** → **attach to that message** (read-only; can't be edited).
+- **Image URLs** (`@https://…png`) → passed through for the provider to fetch.
+- **Anything else** (`@ekansh`, `@notes@2024`) → plain text passthrough.
 
 ```
-fix the intro of @notes.md and make it match the tone of @draft.md
+fix the intro of @notes.md and match the tone of @draft.md
 what's wrong in @screenshot.png
 ```
 
-### Doc chat
+## Doc chat
 
-Connect markdown/text files with `/doc` (fuzzy picker over the current directory), `/doc <path>`, or `/connect doc [path]` — with no path, `/connect doc` reuses the last doc you connected (cx remembers it across sessions). A chat can have **multiple docs connected**; all of them are sent to the model every turn (re-read from disk, so every save is picked up). Documents live in *your editor* — inside tmux, `/doc` opens them beside cx automatically; for extra docs just open them in neovim yourself, or use `/doc edit` to open a connected one with the cx bridge wired up.
+Connect md/txt files with `/doc [path]`, `/connect doc [path]`, or an `@` mention. A chat can hold multiple docs; all are re-read from disk on every message so `:w` in your editor is instantly visible. Reference passages inline: `@L12`, `@L12-30`, `@## Heading`.
 
-Reference passages as `@L12`, `@L12-30`, or `@## Heading`. Disconnect with `/disconnect doc` — instant with one doc, a fuzzy picker (including an ALL option) with several.
+**Review flow** (when the model proposes edits):
 
-- When the model proposes changes, the review happens **in neovim**. cx line-diffs whatever the model sends and splits it into minimal hunks — even if the model rewrites the whole document, you review a handful of small diffs, not one giant one. The proposed text is inserted as **real buffer lines** (green) below the lines it replaces (red) — scroll it, search it, even tweak it before deciding. Every hunk fills the quickfix list, so `]q` / `[q` jump between edits. With the cursor on a hunk: `y` apply, `n` skip, `N` reject with a note, `a` apply all, `q` finish. Undo is just **vim's `u`** — decisions are ordinary buffer edits, and undoing one brings the full diff (highlights, footer, quickfix entry) right back. After a review is finished, `/undo` in cx reverts everything it applied. The file saves when the review ends; applied hunks sit in the normal undo tree, so plain `u` after the review undoes them like any other edit. Pressing `N` fires the revision request **immediately** — the model starts reworking that edit while you keep reviewing the rest, and its new proposal queues up behind the current review.
-- cx spawns neovim with an RPC socket (`--listen`), which also powers hot reload: when cx writes the file, your buffer refreshes instantly.
-- Without the neovim bridge (different `$EDITOR`, no socket), the y/n review falls back to cx's chat pane.
-- Connections persist with the conversation; reopening a chat reconnects its docs
+- Reviewed **in neovim** if the bridge is up, else in cx's chat pane
+- cx line-diffs the proposal and splits it into minimal hunks — a typo fix stays a one-liner even if the model rewrites the whole doc
+- Proposed lines land as **real green buffer lines** below the **red** originals. Scroll them, search them, tweak them
+- On a hunk: `y` apply · `n` skip · `N` reject-with-note · `a` apply all · `q` finish · `u` vim undo. `]q`/`[q` jump between hunks. `N` fires an immediate revision request
+- `/undo` in cx reverts everything the last user prompt applied — including retry cascades
 
-#### Neovim side-by-side
-
-One command sets the whole thing up:
-
-```bash
-cx doc            # fuzzy-pick from md/txt files under the current directory
-cx doc notes.md   # or name the file directly
-```
-
-That opens a tmux session with neovim on the left and cx on the right. The doc is remembered but NOT connected to the conversation: type `/connect doc` (no path needed) when you want it in context. The picker matches fuzzily — `nts` finds `notes.md`. Inside cx, `/doc` and `/doc edit` also auto-open the editor in a split when you're in tmux.
-
-cx re-reads the doc from disk on every message, so every `:w` in neovim is instantly visible to the model. To also send it *what you've highlighted*, add this to your neovim config:
+**Neovim selections**: add this to your nvim config to send highlighted lines with your next message:
 
 ```vim
-" visual mode: send the selection to cx
 xnoremap <silent> <leader>cs :<C-u>call writefile(
       \ [expand('%:p'), line("'<").'-'.line("'>")] + getline(line("'<"), line("'>")),
       \ expand('~/.local/share/cx/selection.txt'))<CR>
 ```
 
-Workflow: highlight lines in neovim → `<leader>cs` → switch panes → just type your question. cx attaches the highlighted passage to that message (auto-attaching the file with `/doc` if you hadn't). The status bar shows `sel L12-30` while a selection is waiting; `/sel` previews it, `/sel clear` drops it.
+Highlight → `<leader>cs` → switch panes → type your question. Status bar shows `sel L12-30` while a selection is queued. `/sel` previews, `/sel clear` drops.
 
-Tip: if cx applies edits while the file is open in neovim, set `:set autoread` so neovim picks them up.
+**Edit-management tools**: the model can also call `discard_pending_edits`, `apply_all_pending_edits`, `apply_pending_edit <n>`, `reject_pending_edit <n>` — a hands-free alternative to `y/n/N/a`.
 
-### Web search
+## Web search
 
-### Edit-management tools
+`web_search` and `fetch_url` tools are on by default. The model picks its own queries, runs multiple rounds, and inline-shows `searching the web: "..."` as it works. Search execution reuses your OpenRouter key (cheap grounded model); page reads go through `r.jina.ai`. `/web off` removes the tools.
 
-While reviewing edits in neovim, the model can also **discard** its own pending edits or **apply them all** through tool calls. If you redirect mid-review ("wait, let's discuss this instead"), the model will typically call `discard_pending_edits`, wipe its proposals from your editor, and answer in prose. Say "yes, apply everything" and it'll call `apply_all_pending_edits`. You can still `y/n/N` yourself — the tools are a hands-free alternative.
+## Memory
 
-### Web search
+Structured markdown profile at `~/.config/cx/memory.md` — `## Identity · Preferences · Projects · Tools & Workflow · Feedback · References · Recent conversations`.
 
-Web search is agentic and on by default: the model gets `web_search` and `fetch_url` tools, decides when to use them, crafts its own queries, and can run several rounds — you see `searching the web: "best cafes singapore 2026"` inline as it works, and the searches stay in the transcript for follow-up context. Search execution reuses your OpenRouter key (a cheap grounded model does the lookup); page reading goes through the free r.jina.ai reader. `/web off` removes the tools (status bar shows `no-web`).
+- **Always live.** Re-read from disk before every message. Edit in another cx or another chat and the next message picks it up.
+- **Auto-curated.** After each response the `memory_model` rewrites the whole file — merges facts, prunes stale ones. Overwrites contradictions confidently (age, grade, city, project change → old bullet replaced).
+- **Safety cap**: 200 lines. Suspicious shrinks (drops to <1/3 the size) are rejected.
+- `/remember` and `/forget` route through the same model. `/memory` shows the file. Direct edits work too.
 
-### Memory
+### External memory files (read-only)
 
-cx keeps a structured markdown profile at `~/.config/cx/memory.md`, organized into sections like **Identity**, **Preferences**, **Projects**, **Tools & Workflow**, **Feedback**, **References**, and **Recent conversations** — not a flat list of bullet points. The Recent conversations section is an episodic log (date · title · what was decided) so new sessions know what you've already discussed.
+`/mem [path]` attaches any file as read-only context, pasted into the system prompt of every chat. The model gets the path + full contents but is told not to propose edits — you maintain those files yourself.
 
-**Always live.** cx re-reads `memory.md` from disk before *every* message you send. So if you `/remember` something in one chat, then switch back to a chat that was already open, the next message picks up the new memory without a restart.
+List lives at `~/.config/cx/external-memory.txt`. Missing files are silently skipped.
 
-**Confident updates.** After each response, the configured `memory_model` reads the file plus the latest exchange and **rewrites the whole file** — merging new facts into the right sections, generalizing patterns, and pruning stale details. When you contradict something (age changed, graduated, moved cities, dropped a project, changed a preference), the memory model **overwrites** the old bullet instead of stacking a contradiction next to it. If a fact goes clearly out of date, it gets deleted.
+## Voice dictation
 
-`/remember <fact>` and `/forget <query>` also route through the model, so manual edits stay organized in the same structure. `/memory` shows the current file. You can also edit `memory.md` directly — the next message picks up your edits.
+`ctrl+r` toggles recording. Groq's `whisper-large-v3-turbo` transcribes (sub-second), a fast LLM cleans it up with your custom vocabulary, cleaned text lands in your input.
 
-### External memory files
-
-`/mem [path]` attaches an arbitrary file as read-only external memory: its contents get pasted into the system prompt of *every* conversation, so cx knows about your life-notes, curriculum, vault entries, whatever. The model is explicitly told not to propose edits — you maintain those files yourself.
-
-- `/mem` — fuzzy picker over `.md`/`.txt` files under the cwd
-- `/mem <path>` — attach directly (tilde and relatives resolve)
-- `/mem list` — show currently attached
-- `/mem off [path]` — detach (picker if no path given)
-
-The list lives at `~/.config/cx/external-memory.txt` (one absolute path per line). Files that no longer resolve are silently skipped.
-
-### Voice dictation
-
-Press `ctrl+r` to start recording, `ctrl+r` again to stop (**toggle**, not hold — terminal key-up events aren't reliable). cx captures the default mic with `ffmpeg`, sends the WAV to **Groq's `whisper-large-v3-turbo`** for transcription (sub-second latency), and pipes the raw transcript through a fast LLM cleanup pass (fixes disfluencies, applies your custom vocabulary, punctuates) before dropping the text into your input.
-
-**Feedback so you can eyes-off the terminal**:
-- An **animated banner** pops above the prompt while recording — a live block-eighths waveform driven by a two-sine model (so it looks like real audio, not a metronome), a braille spinner, a red `REC` label, and an elapsed clock. Stays visible even on narrow terminals where the status bar truncates.
-- During cleanup the banner turns amber and shows a scrolling `TRANSCRIBING…` bar with a highlight window sweeping across the underline.
-- Status bar mirrors the state as a fallback: `🎙 rec 0:12 (ctrl+r to stop)` while recording, `⚙ transcribing…` during the pipeline.
-- macOS system sounds fire at each phase: `Tink` on start, `Pop` on stop, `Glass` when text lands in your input, `Basso` on error.
-
-Custom vocabulary — proper nouns, easily-misheard words — lives at `~/.config/cx/dictation-vocab.txt`, one line per hint:
+Custom vocabulary lives at `~/.config/cx/dictation-vocab.txt`:
 
 ```
 Ekansh (not Ekaansh, Akansh)
 Geno (not Gino, Jeno)
 ```
 
-The file is seeded with sensible defaults on first run. Manage it inline without leaving cx:
+Manage inline: `/vocab`, `/vocab add <hint>`, `/vocab remove <substr>`. Changes apply on the next `ctrl+r`.
 
-| Command | Action |
-|---------|--------|
-| `/vocab` | Show current entries (skips comment lines) |
-| `/vocab add <hint>` | Append a new line, e.g. `/vocab add Xerxes (not Zerxes)` |
-| `/vocab remove <substr>` | Drop lines containing substr (case-insensitive) |
-| `/vocab edit` | Open the file in `$EDITOR` |
+Requires `ffmpeg` (`brew install ffmpeg`) and a `groq.api_key` in `config.toml` (or `GROQ_API_KEY` env). Cleanup uses `dictation_model` if set, else `memory_model`, else `google/gemini-2.5-flash`. 5-min recording cap; <4KB recordings are dropped.
 
-Changes are picked up on the very next `ctrl+r` — no cx restart.
+## Multi-instance sync
 
-Requires:
-- `ffmpeg` on `$PATH` (`brew install ffmpeg`)
-- Groq API key (`groq.api_key` in `config.toml` or `GROQ_API_KEY` env). Get one at [console.groq.com](https://console.groq.com) — the free tier covers casual use.
+Two cx windows on the same conversation stay in sync. Every ~2s cx stats the SQLite DB; if another instance wrote, the current conv's messages / docs / title are pulled. New messages show up with `↻ synced N new message(s) from another cx instance`. Skipped during streaming, doc review, or dictation. Memory-file curation uses a cross-process `flock` so concurrent rewrites can't clobber each other.
 
-Cleanup uses `dictation_model` in `config.toml` if set, else `memory_model`, else `google/gemini-2.5-flash`.
-
-Recordings are hard-capped at 5 minutes. Recordings under 4KB (accidentally-tapped ctrl+r twice) are dropped silently.
-
-### Multi-instance sync
-
-Run two (or more) cx windows on the same machine — they stay in sync on the same conversation. Every ~2 seconds cx stats the SQLite DB; if another instance has written to it, the current conversation's messages, docs, and title are pulled from disk. New messages from the other instance show up with a `↻ synced N new message(s) from another cx instance` note; in-place fork rewrites and title changes propagate the same way.
-
-Sync is skipped during activity that would fight it: while streaming a response, during a doc edit review, and during voice dictation. It resumes as soon as you're back to a resting chat state. Incognito chats are exempt (they're never shared).
-
-Memory-file curation uses a cross-process `flock` on `memory.md.lock`, so two instances curating at once can't clobber each other — the loser just skips that round and picks it up on the next threshold.
-
-### Incognito mode
+## Incognito
 
 ```bash
 cx incognito   # or: cx -i
 ```
 
-Launches an ephemeral chat with **no memory injection, no external memory files, and only the base personality prompt**. The model knows nothing about you — good for one-off questions you don't want cross-contaminating your memory, or for testing what a fresh cx looks like.
+Ephemeral chat: **no memory injection, no external memory, no auto-title, no curation**. `/remember` and `/forget` are disabled. Status bar shows `🕶 INCOGNITO`. Conversation is deleted on quit; if cx crashes, the leftover row is titled `(incognito)` for easy cleanup.
 
-- No auto-title (title stays `(incognito)`)
-- No memory curation runs
-- `/remember` and `/forget` are disabled
-- Status bar shows `🕶 INCOGNITO` for the whole session
-- **The conversation is deleted on quit**. If cx crashes, the `(incognito)` title makes the leftover row easy to spot in `/list` and drop with `/delete`.
+## Compaction
 
-### Context Compaction
-
-When conversations get long, cx automatically summarizes older messages to stay within the context window. Recent messages stay verbatim.
-
-Configure in `config.toml`:
+Long chats get auto-summarized so older messages stay within context. Configure in `config.toml`:
 
 ```toml
-memory_model = "google/gemini-2.5-flash"  # model for memory curation + compaction
+memory_model = "google/gemini-2.5-flash"
 max_context_tokens = 128000
-max_tokens = 16384  # max output tokens per response
+max_tokens = 16384
 ```
 
-### Models
+## Models
 
-cx works with any OpenAI-compatible API:
+Any OpenAI-compatible API works.
 
-- **OpenRouter** (recommended): Models like `anthropic/claude-sonnet-4-5`, `openai/gpt-4o`, `google/gemini-2.5-flash`
+- **OpenRouter** (recommended): `anthropic/claude-sonnet-4-5`, `openai/gpt-4o`, `google/gemini-2.5-flash`, …
 - **Gemini**: `gemini-2.0-flash`, `gemini-1.5-pro`
 - **OpenAI**: `gpt-4o`, `gpt-4o-mini`
-- **Ollama**: Any local model (`llama3.2`, `qwen2.5:32b`, etc.)
+- **Ollama**: `llama3.2`, `qwen2.5:32b`, any local model
+- **Groq**: whisper for dictation
 
-Switch mid-conversation with `/model <name>` or use the picker with `ctrl+t`.
+Switch mid-chat with `/model <name>` or `ctrl+t`.
 
-### Data
+## Files
 
 - Config: `~/.config/cx/config.toml`
-- System prompt: `~/.config/cx/system-prompt.md` (edit freely; delete to reset to the default)
+- System prompt: `~/.config/cx/system-prompt.md` (edit / delete to reset)
 - Memory: `~/.config/cx/memory.md`
-- Editor drafts: `~/.local/share/cx/draft.md` (persists after ctrl+e sessions, never deleted)
-- Database: `~/.local/share/cx/cx.db` (SQLite)
+- External memory list: `~/.config/cx/external-memory.txt`
+- Dictation vocab: `~/.config/cx/dictation-vocab.txt`
+- Editor drafts: `~/.local/share/cx/draft.md`
+- Database: `~/.local/share/cx/cx.db` (SQLite, WAL)

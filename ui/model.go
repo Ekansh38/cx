@@ -107,8 +107,8 @@ var commands = []string{
 	"/edit", "/forget ", "/grep", "/help", "/img ",
 	"/list", "/mem", "/mem list", "/mem off ", "/memory", "/model ", "/models", "/new",
 	"/paste", "/quit", "/r", "/remember ",
-	"/rename ", "/retry", "/sel", "/stop", "/undo",
-	"/vocab", "/vocab add ", "/vocab remove ", "/vocab edit",
+	"/rename ", "/retry", "/sel", "/stop", "/tokens", "/undo",
+	"/vocab", "/vocab add ", "/vocab remove ",
 	"/web", "/wipe",
 }
 
@@ -662,10 +662,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.convID == m.conv.ID {
 			m.conv.Title = msg.title
 		}
-		return m, nil
-
-	case vocabEditedMsg:
-		m.injectSystemLine("dictation vocab saved. next ctrl+r picks it up.")
 		return m, nil
 
 	case editorDoneMsg:
@@ -1632,6 +1628,10 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 	case "/vocab":
 		return m.handleVocabCommand(parts)
 
+	case "/tokens", "/stats":
+		m.injectSystemLine(m.tokenStatsView())
+		return m, nil
+
 	case "/remember":
 		if m.incognito {
 			m.errMsg = "/remember is disabled in incognito mode"
@@ -1799,9 +1799,9 @@ DICTATION VOCAB
   /vocab                 show current entries
   /vocab add <hint>      append a line
   /vocab remove <substr> drop matching lines
-  /vocab edit            open in $EDITOR
 
 DEBUG
+  /tokens  (or /stats)   token breakdown + conversation shape
   /debug                 show full API payload
   /debug expand          verbose mode
   /debug collapse        back to default
@@ -1968,6 +1968,86 @@ func (m Model) buildLLMMessages() []llm.Message {
 		out = append(out, lm)
 	}
 	return out
+}
+
+// tokenStatsView renders a breakdown of what's going to the model on the
+// next send, plus conversation-shape counts. Same numbers the compaction
+// threshold uses, so this doubles as a "how close am I to compaction" check.
+func (m Model) tokenStatsView() string {
+	sys := llm.EstimateTokens(m.systemPrompt)
+	var docTok int
+	for _, d := range m.docs {
+		docTok += llm.EstimateTokens(d.content)
+	}
+	// Split transcript into "since last summary" (what actually goes on the
+	// wire) vs "before the last summary" (covered by the summary already,
+	// not sent again).
+	start := 0
+	for i, msg := range m.messages {
+		if msg.Role == "summary" {
+			start = i
+		}
+	}
+	var trTok, uCount, aCount, sCount, noteCount int
+	for i, msg := range m.messages {
+		switch msg.Role {
+		case "user":
+			uCount++
+		case "assistant":
+			aCount++
+		case "summary":
+			sCount++
+		case "note":
+			noteCount++
+		}
+		if i < start {
+			continue
+		}
+		if msg.Role != "user" && msg.Role != "assistant" && msg.Role != "summary" && msg.Role != "note" {
+			continue
+		}
+		trTok += llm.EstimateTokens(msg.Content) + 4
+	}
+	total := sys + docTok + trTok
+	limit := m.cfg.MaxContextTokens
+	if limit <= 0 {
+		limit = 128000
+	}
+	pct := 0
+	if limit > 0 {
+		pct = total * 100 / limit
+	}
+	compactAt := limit * 3 / 4
+
+	fmtn := func(n int) string {
+		if n >= 1000 {
+			return fmt.Sprintf("%.1fk", float64(n)/1000)
+		}
+		return fmt.Sprintf("%d", n)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("── tokens & stats ──\n")
+	fmt.Fprintf(&sb, "  system prompt      %7s tok\n", fmtn(sys))
+	if len(m.docs) > 0 {
+		fmt.Fprintf(&sb, "  connected docs     %7s tok  (%d file(s))\n", fmtn(docTok), len(m.docs))
+	}
+	fmt.Fprintf(&sb, "  transcript         %7s tok  (since last summary)\n", fmtn(trTok))
+	fmt.Fprintf(&sb, "  ─────────────      ───────────\n")
+	fmt.Fprintf(&sb, "  total (next send)  %7s tok  (%d%% of %s limit)\n", fmtn(total), pct, fmtn(limit))
+	fmt.Fprintf(&sb, "  compact threshold  %7s tok  (75%% of limit)\n", fmtn(compactAt))
+	sb.WriteString("\n")
+	fmt.Fprintf(&sb, "  messages           %d user · %d assistant · %d summary · %d notes\n",
+		uCount, aCount, sCount, noteCount)
+	fmt.Fprintf(&sb, "  model              %s\n", m.model)
+	if m.pendingSel != nil {
+		fmt.Fprintf(&sb, "  selection queued   L%d-%d in %s\n", m.pendingSel.start, m.pendingSel.end, filepath.Base(m.pendingSel.file))
+	}
+	if len(m.pendingImages) > 0 || len(m.pendingFiles) > 0 {
+		fmt.Fprintf(&sb, "  pending attach     %d image(s), %d file(s) — excluded from token count\n",
+			len(m.pendingImages), len(m.pendingFiles))
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // contextTokens estimates the text token count of the next API payload.
@@ -4177,21 +4257,6 @@ func (m Model) handleVocabCommand(parts []string) (Model, tea.Cmd) {
 	}
 	arg := strings.TrimSpace(parts[1])
 	switch {
-	case arg == "edit":
-		path := config.DictationVocabPath()
-		// Seed defaults so the file exists before $EDITOR opens it.
-		_ = config.LoadDictationVocab()
-		editor := os.Getenv("EDITOR")
-		if editor == "" {
-			editor = "vim"
-		}
-		return m, tea.ExecProcess(exec.Command(editor, path), func(err error) tea.Msg {
-			if err != nil {
-				return nil
-			}
-			return vocabEditedMsg{}
-		})
-
 	case strings.HasPrefix(arg, "add "):
 		line := strings.TrimSpace(strings.TrimPrefix(arg, "add "))
 		if line == "" {
@@ -4240,12 +4305,7 @@ func (m Model) handleVocabCommand(parts []string) (Model, tea.Cmd) {
 		return m, nil
 
 	default:
-		m.errMsg = "usage: /vocab [add <hint> | remove <substr> | edit]"
+		m.errMsg = "usage: /vocab [add <hint> | remove <substr>]"
 		return m, nil
 	}
 }
-
-// vocabEditedMsg fires after $EDITOR returns from /vocab edit so the model
-// can note the change. Content is re-read from disk on the next ctrl+r
-// automatically — no in-memory copy to invalidate.
-type vocabEditedMsg struct{}
