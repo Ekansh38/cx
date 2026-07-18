@@ -317,19 +317,44 @@ end
 
 -- suppress_plugins disables markdown-rendering plugins that paint per-token
 -- backgrounds on #, ##, -, *, ● at priorities that beat line_hl_group.
+--
+-- render-markdown's buf_disable(buf) has proved fragile across versions —
+-- some silently ignore the buffer arg and no-op — so we always call the
+-- global disable() as the belt-and-suspenders fix. rm.enable() is called
+-- on finish/abort to restore. Also flips modifiable=true on the buffer so
+-- nvim_buf_set_lines can't fail on a doc some ftplugin marked readonly.
+--
 -- Returns a restore fn called on finish/abort.
 local function suppress_plugins(buf)
   local restores = {}
+
+  -- render-markdown: nuclear global disable. If we come back and re-enable
+  -- something the user hadn't opted into, they still have their own toggle.
   local ok, rm = pcall(require, "render-markdown")
   if ok and rm then
-    if type(rm.buf_disable) == "function" then
-      pcall(rm.buf_disable, buf)
-      table.insert(restores, function() pcall(rm.buf_enable, buf) end)
-    elseif type(rm.disable) == "function" then
+    if type(rm.disable) == "function" then
       pcall(rm.disable)
       table.insert(restores, function() pcall(rm.enable) end)
     end
+    -- buf-scoped as a second layer, best-effort
+    if type(rm.buf_disable) == "function" then
+      pcall(rm.buf_disable, buf)
+    end
   end
+
+  -- Force modifiable so set_lines can't silently fail. Common culprit: an
+  -- ftplugin or the readonly flag on a fresh-open markdown buffer.
+  local prevMod = vim.bo[buf].modifiable
+  local prevRO = vim.bo[buf].readonly
+  vim.bo[buf].modifiable = true
+  vim.bo[buf].readonly = false
+  table.insert(restores, function()
+    if vim.api.nvim_buf_is_valid(buf) then
+      vim.bo[buf].modifiable = prevMod
+      vim.bo[buf].readonly = prevRO
+    end
+  end)
+
   return function()
     for _, r in ipairs(restores) do r() end
   end
@@ -855,6 +880,19 @@ function CxReview()
   if not ok then
     pcall(CxAbort)
     return 0
+  end
+
+  -- Count how many hunks the search-locate phase couldn't anchor. If ALL
+  -- of them are notfound, the buffer looks unchanged and the user has no
+  -- idea why — surface a clear notify() before finish() writes results.
+  local nf = 0
+  for _, h in ipairs(S.hunks) do
+    if h.notfound then nf = nf + 1 end
+  end
+  if nf == #S.hunks then
+    vim.notify(string.format("cx: %d/%d edits could not be anchored — buffer content changed since the model saw it. cx will auto-retry.", nf, #S.hunks), vim.log.levels.WARN)
+  elseif nf > 0 then
+    vim.notify(string.format("cx: %d of %d edits could not be anchored — reviewing the rest", nf, #S.hunks), vim.log.levels.WARN)
   end
 
   repaint()
