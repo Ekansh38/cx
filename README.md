@@ -155,7 +155,7 @@ Requires `ffmpeg` (`brew install ffmpeg`) and a `groq.api_key` in `config.toml` 
 
 ## Multi-instance sync
 
-Two cx windows on the same conversation stay in sync. Every ~2s cx stats the SQLite DB; if another instance wrote, the current conv's messages / docs / title are pulled. New messages show up with `↻ synced N new message(s) from another cx instance`. Skipped during streaming, doc review, or dictation. Memory-file curation uses a cross-process `flock` so concurrent rewrites can't clobber each other.
+Two cx windows on the same conversation stay in sync. Every ~2s cx stats the SQLite DB; if another instance wrote, the current conv's messages / docs / title are pulled — silently. Skipped during streaming, doc review (both in-cx and the nvim bridge), and dictation, so it never fights an in-flight action. Memory-file curation uses a cross-process `flock` so concurrent rewrites can't clobber each other.
 
 ## Incognito
 
