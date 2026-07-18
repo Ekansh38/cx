@@ -415,6 +415,7 @@ local function finish()
     S.restore_plugins = nil
   end
   S.hunks = nil
+  S.pre_snapshot = nil
 end
 
 local function delete_block(id)
@@ -658,13 +659,22 @@ end
 function CxAbort()
   if not S.hunks or not vim.api.nvim_buf_is_valid(S.buf or -1) then
     S.hunks = nil
+    S.pre_snapshot = nil
     return 0
   end
-  for _, h in ipairs(S.hunks) do
-    if state(h) == "pending" and h.insN and h.insN > 0 then
-      local r = mark_info(h.greenMark)
-      if r then
-        pcall(vim.api.nvim_buf_set_lines, S.buf, r[1], r[2], false, {})
+  -- Snapshot-based restore. Beats per-hunk cleanup because it can't be
+  -- foiled by invalidated extmarks: the buffer content just goes back
+  -- to what it was before we inserted anything. Only runs when a
+  -- snapshot exists (fresh reviews always take one).
+  if S.pre_snapshot then
+    pcall(vim.api.nvim_buf_set_lines, S.buf, 0, -1, false, S.pre_snapshot)
+  else
+    for _, h in ipairs(S.hunks) do
+      if state(h) == "pending" and h.insN and h.insN > 0 then
+        local r = mark_info(h.greenMark)
+        if r then
+          pcall(vim.api.nvim_buf_set_lines, S.buf, r[1], r[2], false, {})
+        end
       end
     end
   end
@@ -680,6 +690,7 @@ function CxAbort()
     S.restore_plugins = nil
   end
   S.hunks = nil
+  S.pre_snapshot = nil
   vim.notify("cx: review discarded")
   return 1
 end
@@ -855,6 +866,14 @@ function CxReview()
   S.total = #req.edits
   S.hunks = {}
   S.restore_plugins = suppress_plugins(buf)
+  -- Snapshot the buffer BEFORE any green blocks are inserted. CxAbort
+  -- restores from this snapshot verbatim so a discard is guaranteed to
+  -- clean up, even when extmark tracking has been invalidated by heavy
+  -- user edits or an undo through the review start. Without this, hunks
+  -- with invalidated marks would have their state derive as "applied"/
+  -- "skipped", CxAbort would skip them, and green+red blocks stayed in
+  -- the buffer with no colors.
+  S.pre_snapshot = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
 
   for _, e in ipairs(req.edits) do
     table.insert(S.hunks, prepare_hunk(buf, e))

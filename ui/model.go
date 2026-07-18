@@ -534,6 +534,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			edits = normalizeEdits(edits, m.docs)
 			var noops int
 			edits, noops = explodeEdits(edits, m.docs)
+			// Loud diagnostic when the response looked like it contained an
+			// edit block but nothing parsed / resolved. Common cause: model
+			// emitted an unclosed <edit> tag, malformed SEARCH/REPLACE, or
+			// an edit that couldn't be attached to any connected doc. Silent
+			// dropping used to look like "the edit never happened" and the
+			// user had to re-ask.
+			if len(edits) == 0 && noops == 0 && strings.Contains(content, "<edit") {
+				m.injectSystemLine("model proposed an edit but I couldn't parse it. ask again, or /debug to see the raw response")
+			}
 			if len(edits) == 0 && noops > 0 {
 				m.injectSystemLine(fmt.Sprintf("%d proposed edit(s) matched the document already, nothing to apply", noops))
 			}
