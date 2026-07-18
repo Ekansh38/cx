@@ -153,9 +153,9 @@ Manage inline: `/vocab`, `/vocab add <hint>`, `/vocab remove <substr>`. Changes 
 
 Requires `ffmpeg` (`brew install ffmpeg`) and a `groq.api_key` in `config.toml` (or `GROQ_API_KEY` env). Cleanup uses `dictation_model` if set, else `memory_model`, else `google/gemini-2.5-flash`. 5-min recording cap; <4KB recordings are dropped.
 
-## Multi-instance sync
+## Multi-instance behavior
 
-Two cx windows on the same conversation stay in sync. Every ~2s cx stats the SQLite DB; if another instance wrote, the current conv's messages / docs / title are pulled — silently. Skipped during streaming, doc review (both in-cx and the nvim bridge), and dictation, so it never fights an in-flight action. Memory-file curation uses a cross-process `flock` so concurrent rewrites can't clobber each other.
+Two cx windows on the same conversation don't auto-sync. Reload manually with `/list` + switch, or restart cx. Memory-file curation uses a cross-process `flock` so concurrent rewrites can't clobber each other, so background curation is still safe.
 
 ## Incognito
 
