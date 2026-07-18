@@ -509,6 +509,10 @@ func appendExternalReview(docPath string, edits []docEdit) bool {
 	if err != nil {
 		return false
 	}
+	// Clear the previous review's results file before writing the new
+	// request. Without this, extReviewTick could pick up stale edits-done
+	// from the last review and skip polling for the new one.
+	os.Remove(editsDonePath())
 	if err := os.WriteFile(editsReqPath(), buf, 0o644); err != nil {
 		return false
 	}

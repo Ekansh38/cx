@@ -215,6 +215,12 @@ type Model struct {
 	// on quit (main.go). Set once at construction via MarkIncognito.
 	incognito bool
 
+	// contextTokens cache. Recomputing on every viewport render was the
+	// dominant cost during streaming. Refreshed via primeContextTokens
+	// from mutation sites (streamEnd, handleInput, switchConversation).
+	tokenCacheSig string
+	tokenCacheVal int
+
 	// markdown rendering (cached — glamour is expensive)
 	mdRenderer *glamour.TermRenderer
 	mdWidth    int
@@ -514,6 +520,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshContent()
 		m.viewport.GotoBottom()
 		m.atBottom = true
+		m.primeContextTokens() // status bar reflects the fresh total
 
 		// Doc mode: hand proposed edits to neovim for review (per file, in
 		// sequence), or fall back to the in-cx y/n flow without the bridge.
@@ -1094,6 +1101,10 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	// the same scope, so /undo reverses the whole chain — not just the last
 	// review round.
 	m.lastApplied = nil
+
+	// Refresh the cached token count for the status bar's next render, so
+	// it can skip the O(n) walk during streaming.
+	m.primeContextTokens()
 
 	// Check if compaction needed before sending
 	if m.contextTokens() > m.cfg.MaxContextTokens*3/4 {
@@ -2027,7 +2038,16 @@ func (m Model) tokenStatsView() string {
 // contextTokens estimates the text token count of the next API payload.
 // Images are deliberately excluded — base64 data URLs would wildly inflate
 // the estimate and trigger spurious compaction.
+//
+// This is called from the status bar, which re-renders on every keystroke
+// and tick. Walking every message + doc + system prompt each frame added
+// up to visible input lag. Cache is invalidated whenever any of the
+// counted inputs change (see invalidateTokens callers).
 func (m Model) contextTokens() int {
+	sig := m.tokenCacheSignature()
+	if m.tokenCacheSig == sig && m.tokenCacheVal > 0 {
+		return m.tokenCacheVal
+	}
 	start := 0
 	for i, msg := range m.messages {
 		if msg.Role == "summary" {
@@ -2044,7 +2064,58 @@ func (m Model) contextTokens() int {
 		}
 		n += llm.EstimateTokens(msg.Content) + 4
 	}
+	// Mutating value receiver — the cache field lives on Model-by-value, so
+	// the write survives via bubbletea's tea.Model contract only when the
+	// caller returns the updated model. Since contextTokens has a value
+	// receiver, we can't mutate m here. Instead the cache is populated
+	// via primeContextTokens (pointer receiver) called from Update paths.
 	return n
+}
+
+// tokenCacheSignature returns a cheap fingerprint of the inputs contextTokens
+// walks. When it changes, the cache is stale.
+func (m Model) tokenCacheSignature() string {
+	// Length of system prompt + message count + last message ID + doc count
+	// + total doc content length. Not cryptographic; just needs to move when
+	// any input changes.
+	var docLen int
+	for _, d := range m.docs {
+		docLen += len(d.content)
+	}
+	var lastID int64
+	if n := len(m.messages); n > 0 {
+		lastID = m.messages[n-1].ID
+	}
+	return fmt.Sprintf("%d:%d:%d:%d:%d",
+		len(m.systemPrompt), len(m.messages), lastID, len(m.docs), docLen)
+}
+
+// primeContextTokens forces a fresh compute and caches the result. Call this
+// from mutation sites (streamEnd, handleInput, switchConversation) so the
+// hot render path can read a cached value.
+func (m *Model) primeContextTokens() {
+	sig := m.tokenCacheSignature()
+	if m.tokenCacheSig == sig && m.tokenCacheVal > 0 {
+		return
+	}
+	start := 0
+	for i, msg := range m.messages {
+		if msg.Role == "summary" {
+			start = i
+		}
+	}
+	n := llm.EstimateTokens(m.systemPrompt)
+	for _, d := range m.docs {
+		n += llm.EstimateTokens(d.content)
+	}
+	for i, msg := range m.messages {
+		if i < start || (msg.Role != "user" && msg.Role != "assistant" && msg.Role != "summary" && msg.Role != "note") {
+			continue
+		}
+		n += llm.EstimateTokens(msg.Content) + 4
+	}
+	m.tokenCacheSig = sig
+	m.tokenCacheVal = n
 }
 
 // reloadSystemPrompt rebuilds the system prompt from memory.md on disk.
