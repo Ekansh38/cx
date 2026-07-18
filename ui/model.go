@@ -215,11 +215,6 @@ type Model struct {
 	// on quit (main.go). Set once at construction via MarkIncognito.
 	incognito bool
 
-	// Cross-instance sync: mtime of the SQLite DB at last sync check. If
-	// mtime moves without our doing (another cx wrote to it), we pull the
-	// current conv's messages + docs + title from disk on the next tick.
-	lastDBMod time.Time
-
 	// markdown rendering (cached — glamour is expensive)
 	mdRenderer *glamour.TermRenderer
 	mdWidth    int
@@ -267,17 +262,7 @@ func New(cfg *config.Config, st *store.Store, conv *store.Conversation, msgs []*
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(textarea.Blink, dbSyncTick())
-}
-
-// dbSyncTickMsg fires every ~2s. The handler pulls fresh conv state from
-// SQLite if another cx instance has written to it since our last check.
-type dbSyncTickMsg struct{}
-
-func dbSyncTick() tea.Cmd {
-	return tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-		return dbSyncTickMsg{}
-	})
+	return textarea.Blink
 }
 
 // ── Update ────────────────────────────────────────────────────────────────────
@@ -305,19 +290,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case docReloadMsg:
 		m.reloadDocs()
 		return m, nil
-
-	case dbSyncTickMsg:
-		// Cheap cross-instance sync: stat the DB, and if another cx has
-		// touched it since our last check, pull the current conv's fresh
-		// messages, docs, and title. Skip whenever a reload would fight
-		// in-flight state: streaming, in-cx review, nvim review (extGroups
-		// or extNotes active), dictation, or any overlay/picker.
-		reviewingInNvim := len(m.extGroups) > 0 || len(m.extNotes) > 0
-		if m.state == stateChat && !m.streaming && !m.docReview &&
-			!reviewingInNvim && !m.dictating && !m.dictationBusy {
-			m.dbSyncNow()
-		}
-		return m, dbSyncTick()
 
 	case dictationStartedMsg:
 		if msg.err != nil {
@@ -2086,96 +2058,6 @@ func (m *Model) reloadSystemPrompt() {
 	m.systemPrompt = BuildSystemPrompt(config.LoadMemory())
 }
 
-// dbSyncNow is the reload half of the cross-instance sync. Called from the
-// dbSyncTickMsg handler when the runtime state is safe to mutate.
-//
-// Compares against the DB by PERSISTED message IDs only. m.messages carries
-// display-only injected system lines (ID=0) — review placeholders, sync
-// notes, error banners — which never live in SQLite. Comparing raw lengths
-// caused false "history rewritten" alerts every time a display-only note
-// was on screen.
-//
-// The sync is silent: reloaded state just appears in the view. No injected
-// system line either way — a spurious notice on every idle chat is worse
-// than the user never being told an invisible refresh happened.
-func (m *Model) dbSyncNow() {
-	if m.incognito || m.conv == nil {
-		return
-	}
-	mt := m.store.ModTime()
-	if mt.IsZero() {
-		return
-	}
-	if m.lastDBMod.IsZero() {
-		m.lastDBMod = mt
-		return
-	}
-	if !mt.After(m.lastDBMod) {
-		return
-	}
-	m.lastDBMod = mt
-
-	// Conv metadata (title from auto-title, model swap by another instance).
-	if conv, err := m.store.GetConversation(m.conv.ID); err == nil {
-		m.conv.Title = conv.Title
-		m.conv.UpdatedAt = conv.UpdatedAt
-	}
-
-	// Messages: refetch and compare by persisted IDs, ignoring the
-	// display-only entries we've injected locally.
-	dbMsgs, err := m.store.GetMessages(m.conv.ID)
-	if err != nil {
-		return
-	}
-	dbIDs := make(map[int64]bool, len(dbMsgs))
-	for _, msg := range dbMsgs {
-		if msg.ID != 0 {
-			dbIDs[msg.ID] = true
-		}
-	}
-	localIDs := make(map[int64]bool)
-	for _, msg := range m.messages {
-		if msg.ID != 0 {
-			localIDs[msg.ID] = true
-		}
-	}
-	changed := false
-	if !sameIDSet(dbIDs, localIDs) {
-		// Adopt the DB's persisted set. Local display-only notes are dropped
-		// here — that's fine, they're display-only. The alternative
-		// (splicing DB rows in between existing local notes) is fragile
-		// and the notes are ephemeral anyway.
-		m.messages = dbMsgs
-		changed = true
-	}
-
-	// Docs: another instance may have connected/disconnected.
-	prevDocs := len(m.docs)
-	m.loadConvDocs()
-	if len(m.docs) != prevDocs {
-		changed = true
-	}
-
-	if changed {
-		m.refreshContent()
-		if m.atBottom {
-			m.viewport.GotoBottom()
-		}
-	}
-}
-
-// sameIDSet reports whether two int64 sets have identical keys.
-func sameIDSet(a, b map[int64]bool) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k := range a {
-		if !b[k] {
-			return false
-		}
-	}
-	return true
-}
 
 // ── Auto-title ────────────────────────────────────────────────────────────────
 
