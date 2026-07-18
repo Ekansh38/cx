@@ -328,32 +328,44 @@ func rpc(timeout time.Duration, args ...string) error {
 }
 
 // nvimAlive reports whether a cx-spawned neovim is listening on the socket.
+// The 3-second timeout is deliberate — the check forks a fresh nvim (100-
+// 500ms of cold start on macOS) and pings via socket, and a 1s budget was
+// racy under real load. False negatives here dropped the user into the
+// in-cx fallback review instead of the diff-in-nvim flow.
 func nvimAlive(sock string) bool {
 	if _, err := os.Stat(sock); err != nil {
 		return false
 	}
-	return rpc(time.Second, "--server", sock, "--remote-expr", "1") == nil
+	return rpc(3*time.Second, "--server", sock, "--remote-expr", "1") == nil
 }
 
 // syncDocs asks the bridged neovim to save any unsaved changes in connected
 // docs, so the disk (what the model sees) always matches the buffer (what the
 // user sees). Undoing past a review's save no longer desyncs the two.
+//
+// Runs the RPC in a goroutine and returns immediately. Each `nvim --server
+// --remote-expr` call forks a fresh nvim (100-500ms on macOS), and blocking
+// enter for that cost was the biggest source of felt lag on every send. The
+// tradeoff: if nvim hasn't flushed by the time the message hits the model,
+// the model reads the last-saved version. In practice users `:w` before
+// switching to cx; syncDocs is a safety net, not a load-bearing sync.
 func syncDocs(paths []string) {
 	sock := nvimSockPath()
 	if _, err := os.Stat(sock); err != nil || len(paths) == 0 {
 		return
 	}
 	os.WriteFile(filepath.Join(config.DataDir(), "docs.txt"), []byte(strings.Join(paths, "\n")+"\n"), 0o644)
-	rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxSyncDocs()")
+	go rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxSyncDocs()")
 }
 
 // pokeChecktime asks the bridged neovim to re-read changed files from disk.
+// Async — nobody waits on the return.
 func pokeChecktime() {
 	sock := nvimSockPath()
 	if _, err := os.Stat(sock); err != nil {
 		return
 	}
-	rpc(2*time.Second, "--server", sock, "--remote-expr", "v:lua.CxChecktime()")
+	go rpc(2*time.Second, "--server", sock, "--remote-expr", "v:lua.CxChecktime()")
 }
 
 // openDocEditor opens a connected document in the editor. Inside tmux it
@@ -569,10 +581,15 @@ func isKnownEditSearch(groups []editGroup, search string) bool {
 
 // startExternalReview hands the edits to neovim. Returns false (caller falls
 // back to the in-cx review) if the bridge isn't up.
+//
+// No pre-flight nvimAlive() check here anymore — that fork burned another
+// nvim cold-start every review, and its 1-second timeout misdiagnosed the
+// bridge as dead under load. The actual RPC below fails cleanly if nvim
+// isn't listening; that's an authoritative answer, not a probe.
 func startExternalReview(docPath string, edits []docEdit) bool {
 	sock := nvimSockPath()
-	if !nvimAlive(sock) {
-		return false
+	if _, err := os.Stat(sock); err != nil {
+		return false // no socket = definitely no bridge
 	}
 	type reqEdit struct {
 		Search  string `json:"search"`
