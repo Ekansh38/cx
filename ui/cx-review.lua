@@ -110,8 +110,15 @@ local function split_diff(old, new)
     oe = oe - 1
     ne = ne - 1
   end
-  while p > 0 and old:sub(p, p) ~= " " do
-    p = p - 1
+  -- Word-boundary snap-back: only when BOTH lines still have differing
+  -- content past p. When one line is a strict prefix/suffix of the other,
+  -- the common region already covers everything on that side; snapping
+  -- back would falsely paint an unchanged word (e.g. "action.") as
+  -- part of the diff on the shorter line.
+  if p < #old and p < #new then
+    while p > 0 and old:sub(p, p) ~= " " do
+      p = p - 1
+    end
   end
   while oe < #old and ne < #new and old:sub(oe + 1, oe + 1) ~= " " do
     oe = oe + 1
