@@ -309,10 +309,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dbSyncTickMsg:
 		// Cheap cross-instance sync: stat the DB, and if another cx has
 		// touched it since our last check, pull the current conv's fresh
-		// messages, docs, and title. We deliberately skip during any
-		// activity that mutates in-flight state (streaming, active edit
-		// review, overlays) — the reload would fight with those.
-		if m.state == stateChat && !m.streaming && !m.docReview && !m.dictating && !m.dictationBusy {
+		// messages, docs, and title. Skip whenever a reload would fight
+		// in-flight state: streaming, in-cx review, nvim review (extGroups
+		// or extNotes active), dictation, or any overlay/picker.
+		reviewingInNvim := len(m.extGroups) > 0 || len(m.extNotes) > 0
+		if m.state == stateChat && !m.streaming && !m.docReview &&
+			!reviewingInNvim && !m.dictating && !m.dictationBusy {
 			m.dbSyncNow()
 		}
 		return m, dbSyncTick()
@@ -2085,18 +2087,17 @@ func (m *Model) reloadSystemPrompt() {
 }
 
 // dbSyncNow is the reload half of the cross-instance sync. Called from the
-// dbSyncTickMsg handler when the runtime state is safe to mutate. Compares
-// the DB mtime; on change, pulls fresh conv metadata, messages, and docs
-// for the currently-open conversation.
+// dbSyncTickMsg handler when the runtime state is safe to mutate.
 //
-// Design notes:
-//   - Reload happens ONLY for the currently-open conv. Other conversations'
-//     changes surface at the next /list + switch, as they always have.
-//   - We keep new messages appended by other instances but don't try to
-//     merge concurrent local edits — cx doesn't have any (typing in the
-//     input box doesn't persist).
-//   - Incognito mode is exempt: the ephemeral chat isn't shared with any
-//     other cx and reloading it would be pointless overhead.
+// Compares against the DB by PERSISTED message IDs only. m.messages carries
+// display-only injected system lines (ID=0) — review placeholders, sync
+// notes, error banners — which never live in SQLite. Comparing raw lengths
+// caused false "history rewritten" alerts every time a display-only note
+// was on screen.
+//
+// The sync is silent: reloaded state just appears in the view. No injected
+// system line either way — a spurious notice on every idle chat is worse
+// than the user never being told an invisible refresh happened.
 func (m *Model) dbSyncNow() {
 	if m.incognito || m.conv == nil {
 		return
@@ -2106,9 +2107,6 @@ func (m *Model) dbSyncNow() {
 		return
 	}
 	if m.lastDBMod.IsZero() {
-		// First check: just capture the current mtime as the baseline. Any
-		// legitimate change since startup was already reflected in the
-		// snapshot the ui/model.New picked up.
 		m.lastDBMod = mt
 		return
 	}
@@ -2117,46 +2115,41 @@ func (m *Model) dbSyncNow() {
 	}
 	m.lastDBMod = mt
 
-	// Conv metadata (title, model). Auto-title from another instance is the
-	// common case; picking up model swaps is a bonus.
+	// Conv metadata (title from auto-title, model swap by another instance).
 	if conv, err := m.store.GetConversation(m.conv.ID); err == nil {
-		if conv.Title != m.conv.Title {
-			m.conv.Title = conv.Title
-		}
+		m.conv.Title = conv.Title
 		m.conv.UpdatedAt = conv.UpdatedAt
 	}
 
-	// Messages: refetch and detect appended tail. We compare by count first
-	// (fast), then splice-in. Deletions (fork's in-place rewrite) collapse
-	// to a full replacement.
-	msgs, err := m.store.GetMessages(m.conv.ID)
+	// Messages: refetch and compare by persisted IDs, ignoring the
+	// display-only entries we've injected locally.
+	dbMsgs, err := m.store.GetMessages(m.conv.ID)
 	if err != nil {
 		return
 	}
-	changed := false
-	switch {
-	case len(msgs) > len(m.messages):
-		added := len(msgs) - len(m.messages)
-		m.messages = msgs
-		m.injectSystemLine(fmt.Sprintf("↻ synced %d new message(s) from another cx instance", added))
-		changed = true
-	case len(msgs) < len(m.messages):
-		// The other instance rewrote history (fork in-place) or deleted
-		// something. Adopt the shorter tail.
-		m.messages = msgs
-		m.injectSystemLine("↻ synced: history was rewritten by another cx instance")
-		changed = true
-	default:
-		// Same length; the tail could still differ if messages were
-		// swapped somehow. Cheap check: compare the last row's ID.
-		if len(msgs) > 0 && len(m.messages) > 0 && msgs[len(msgs)-1].ID != m.messages[len(m.messages)-1].ID {
-			m.messages = msgs
-			changed = true
+	dbIDs := make(map[int64]bool, len(dbMsgs))
+	for _, msg := range dbMsgs {
+		if msg.ID != 0 {
+			dbIDs[msg.ID] = true
 		}
 	}
+	localIDs := make(map[int64]bool)
+	for _, msg := range m.messages {
+		if msg.ID != 0 {
+			localIDs[msg.ID] = true
+		}
+	}
+	changed := false
+	if !sameIDSet(dbIDs, localIDs) {
+		// Adopt the DB's persisted set. Local display-only notes are dropped
+		// here — that's fine, they're display-only. The alternative
+		// (splicing DB rows in between existing local notes) is fragile
+		// and the notes are ephemeral anyway.
+		m.messages = dbMsgs
+		changed = true
+	}
 
-	// Docs: another instance may have connected/disconnected. loadConvDocs
-	// re-reads conversation_docs from SQLite.
+	// Docs: another instance may have connected/disconnected.
 	prevDocs := len(m.docs)
 	m.loadConvDocs()
 	if len(m.docs) != prevDocs {
@@ -2169,6 +2162,19 @@ func (m *Model) dbSyncNow() {
 			m.viewport.GotoBottom()
 		}
 	}
+}
+
+// sameIDSet reports whether two int64 sets have identical keys.
+func sameIDSet(a, b map[int64]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
 }
 
 // ── Auto-title ────────────────────────────────────────────────────────────────
