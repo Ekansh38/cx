@@ -1004,9 +1004,24 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 
 	// Auto-detect image paths: if the input (or first word) is a file path
 	// ending in an image extension, treat it like /img <path> [rest as text].
-	// This makes drag-and-drop work — terminals paste the file path.
+	// Multi-drag: peel additional image paths off the front and attach them
+	// as pendingImages before routing the primary path through /img.
 	if imgPath, text, ok := m.detectImagePath(input); ok {
-		return m.handleCommand(`/img "` + imgPath + `" ` + text)
+		// Greedily strip any further image paths from the leading text so a
+		// two-image (or N-image) drag doesn't lose everything but the first.
+		remaining := text
+		for {
+			extra, rest, ok2 := m.detectImagePath(remaining)
+			if !ok2 {
+				break
+			}
+			if dataURL, err := encodeAttachment(extra); err == nil {
+				m.pendingImages = append(m.pendingImages, dataURL)
+				m.injectSystemLine("attached " + filepath.Base(extra))
+			}
+			remaining = rest
+		}
+		return m.handleCommand(`/img "` + imgPath + `" ` + remaining)
 	}
 
 	if m.provider == nil {
@@ -3658,6 +3673,11 @@ func completionsFor(input string) []string {
 // splitPathToken extracts a leading file path from input, handling quoted
 // paths ('...' or "...") and backslash-escaped spaces (foo\ bar.png) the way
 // terminals produce them on drag-and-drop. Returns the path and the rest.
+//
+// Also handles the macOS-Terminal quirk where dragging multiple files at
+// once concatenates the paths with NO separator between them: after we
+// take one path, if it contains an image extension followed by a "/"
+// (start of the next path), we split there.
 func splitPathToken(s string) (string, string) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -3685,7 +3705,26 @@ func splitPathToken(s string) (string, string) {
 		b.WriteByte(s[i])
 		i++
 	}
-	return b.String(), strings.TrimSpace(s[i:])
+	head := b.String()
+	rest := strings.TrimSpace(s[i:])
+
+	// Multi-drag concatenation guard: if `head` contains an image extension
+	// followed by a slash (start of another absolute path), split there and
+	// push the tail back onto rest.
+	for _, ext := range []string{".png/", ".jpg/", ".jpeg/", ".gif/", ".webp/", ".pdf/"} {
+		if idx := strings.Index(strings.ToLower(head), ext); idx >= 0 {
+			// Split just before the "/" so the tail starts with an absolute path
+			cut := idx + len(ext) - 1
+			if rest == "" {
+				rest = head[cut:]
+			} else {
+				rest = head[cut:] + " " + rest
+			}
+			head = head[:cut]
+			break
+		}
+	}
+	return head, rest
 }
 
 // detectImagePath checks if the input starts with a file path ending in an image extension.
