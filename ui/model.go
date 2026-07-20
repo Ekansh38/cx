@@ -1493,13 +1493,15 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 			m.errMsg = "image: " + err.Error()
 			return m, nil
 		}
-		// Save with image path, display placeholder
-		display := text + "\n[image: " + filepath.Base(absPath) + "]"
-		if saved, err := m.store.AddMessageWithImage(m.conv.ID, "user", display, absPath); err == nil {
+		// Save with the image path; no placeholder line in the message
+		// body. The image is delivered via ImagePath (see buildLLMMessages);
+		// echoing the filename inside the transcript was noise the user
+		// already knows because they just dragged the file.
+		if saved, err := m.store.AddMessageWithImage(m.conv.ID, "user", text, absPath); err == nil {
 			saved.ImagePath = absPath
 			m.messages = append(m.messages, saved)
 		} else {
-			m.messages = append(m.messages, &store.Message{Role: "user", Content: display, ImagePath: absPath})
+			m.messages = append(m.messages, &store.Message{Role: "user", Content: text, ImagePath: absPath})
 		}
 		// The saved ImagePath is attached by buildLLMMessages; adding the
 		// data URL to pendingImages too would send the image twice.
