@@ -1002,26 +1002,20 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 		}
 	}
 
-	// Auto-detect image paths: if the input (or first word) is a file path
-	// ending in an image extension, treat it like /img <path> [rest as text].
-	// Multi-drag: peel additional image paths off the front and attach them
-	// as pendingImages before routing the primary path through /img.
-	if imgPath, text, ok := m.detectImagePath(input); ok {
-		// Greedily strip any further image paths from the leading text so a
-		// two-image (or N-image) drag doesn't lose everything but the first.
-		remaining := text
-		for {
-			extra, rest, ok2 := m.detectImagePath(remaining)
-			if !ok2 {
-				break
-			}
+	// Auto-detect image paths from drag-drop. detectImagePathsInInput handles
+	// the messy real-world cases: escape-space (`\ `), unescaped spaces mid-
+	// filename, multi-line drops (one path per line), and multi-path
+	// concatenation. Any resolvable image paths are peeled out; the leftover
+	// text (if any) becomes the message body.
+	if imgs, rest := m.detectImagePathsInInput(input); len(imgs) > 0 {
+		primary := imgs[0]
+		for _, extra := range imgs[1:] {
 			if dataURL, err := encodeAttachment(extra); err == nil {
 				m.pendingImages = append(m.pendingImages, dataURL)
 				m.injectSystemLine("attached " + filepath.Base(extra))
 			}
-			remaining = rest
 		}
-		return m.handleCommand(`/img "` + imgPath + `" ` + remaining)
+		return m.handleCommand(`/img "` + primary + `" ` + rest)
 	}
 
 	if m.provider == nil {
@@ -3725,6 +3719,66 @@ func splitPathToken(s string) (string, string) {
 		}
 	}
 	return head, rest
+}
+
+// detectImagePathsInInput extracts every resolvable image path from a drag-
+// drop input, tolerant of terminal escape quirks:
+//
+//   - one path per line (macOS Terminal drops multi-file drags on separate
+//     lines)
+//   - `\ ` escape sequences (macOS default) unescaped to space
+//   - unescaped mid-filename spaces (some terminals lose the escape on the
+//     last few chars, e.g. `Screenshot\ 2026-07-20\ at\ 9.24.42 PM.png`)
+//   - trailing-newline / blank-line noise
+//
+// Any line that isn't a resolvable image path stays in the returned rest
+// string, joined with spaces, so a normal drag-then-question flow works:
+// drag the image, type "what's in this?", hit enter.
+func (m Model) detectImagePathsInInput(input string) (paths []string, rest string) {
+	var kept []string
+	for _, ln := range strings.Split(input, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		if abs, ok := resolveDraggedImagePath(ln); ok {
+			paths = append(paths, abs)
+			continue
+		}
+		kept = append(kept, ln)
+	}
+	rest = strings.TrimSpace(strings.Join(kept, " "))
+	return paths, rest
+}
+
+// resolveDraggedImagePath tries to interpret a single line as an image path
+// dropped from a terminal drag. Applies both escape-space and no-escape
+// interpretations because different terminals disagree.
+func resolveDraggedImagePath(ln string) (string, bool) {
+	candidates := []string{
+		strings.ReplaceAll(ln, `\ `, ` `),
+		ln,
+	}
+	for _, cand := range candidates {
+		cand = strings.TrimSpace(cand)
+		if _, isImg := imageExts[strings.ToLower(filepath.Ext(cand))]; !isImg {
+			continue
+		}
+		p := cand
+		if strings.HasPrefix(p, "~") {
+			if home, err := os.UserHomeDir(); err == nil {
+				p = home + p[1:]
+			}
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			continue
+		}
+		if _, err := os.Stat(abs); err == nil {
+			return abs, true
+		}
+	}
+	return "", false
 }
 
 // detectImagePath checks if the input starts with a file path ending in an image extension.
