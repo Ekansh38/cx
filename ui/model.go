@@ -3722,26 +3722,38 @@ func splitPathToken(s string) (string, string) {
 }
 
 // detectImagePathsInInput extracts every resolvable image path from a drag-
-// drop input, tolerant of terminal escape quirks:
+// drop input, tolerant of every terminal escape quirk we've hit:
 //
-//   - one path per line (macOS Terminal drops multi-file drags on separate
-//     lines)
-//   - `\ ` escape sequences (macOS default) unescaped to space
-//   - unescaped mid-filename spaces (some terminals lose the escape on the
-//     last few chars, e.g. `Screenshot\ 2026-07-20\ at\ 9.24.42 PM.png`)
-//   - trailing-newline / blank-line noise
+//   - one path per line (macOS Terminal on multi-file drags via one route)
+//   - multiple paths concatenated on ONE line with no separator (macOS
+//     Terminal on multi-file drags via another route), e.g.
+//     `/a/foo.png/b/bar.png` — the `.png/` boundary is our only cue.
+//   - `\ ` escape sequences unescaped to space
+//   - mixed escaping: some spaces escaped, some not, in the same filename
+//   - trailing whitespace / blank lines
 //
-// Any line that isn't a resolvable image path stays in the returned rest
-// string, joined with spaces, so a normal drag-then-question flow works:
-// drag the image, type "what's in this?", hit enter.
+// Approach: unescape, then normalize every `<image-ext>/` sequence to
+// `<image-ext>\n/` so a concatenated multi-drag collapses into the
+// one-path-per-line case. Then process each line as a candidate; keep
+// lines that resolve to real image files. Anything left over becomes the
+// message body.
 func (m Model) detectImagePathsInInput(input string) (paths []string, rest string) {
+	s := strings.ReplaceAll(input, `\ `, ` `)
+	// Split concatenated paths: `foo.png/bar/...` -> `foo.png\n/bar/...`.
+	// Case-preserving replace via manual scan (strings.ReplaceAll is
+	// case-sensitive but real terminals only emit lowercase extensions
+	// on macOS by default; still, cover the common cases).
+	for _, ext := range []string{".png", ".jpg", ".jpeg", ".gif", ".webp", ".PNG", ".JPG", ".JPEG", ".GIF", ".WEBP"} {
+		s = strings.ReplaceAll(s, ext+"/", ext+"\n/")
+	}
+
 	var kept []string
-	for _, ln := range strings.Split(input, "\n") {
+	for _, ln := range strings.Split(s, "\n") {
 		ln = strings.TrimSpace(ln)
 		if ln == "" {
 			continue
 		}
-		if abs, ok := resolveDraggedImagePath(ln); ok {
+		if abs, ok := resolveImagePathLine(ln); ok {
 			paths = append(paths, abs)
 			continue
 		}
@@ -3751,34 +3763,26 @@ func (m Model) detectImagePathsInInput(input string) (paths []string, rest strin
 	return paths, rest
 }
 
-// resolveDraggedImagePath tries to interpret a single line as an image path
-// dropped from a terminal drag. Applies both escape-space and no-escape
-// interpretations because different terminals disagree.
-func resolveDraggedImagePath(ln string) (string, bool) {
-	candidates := []string{
-		strings.ReplaceAll(ln, `\ `, ` `),
-		ln,
+// resolveImagePathLine takes a single unescaped line and returns the
+// absolute path if the line looks like an existing image file, else "".
+func resolveImagePathLine(ln string) (string, bool) {
+	if _, isImg := imageExts[strings.ToLower(filepath.Ext(ln))]; !isImg {
+		return "", false
 	}
-	for _, cand := range candidates {
-		cand = strings.TrimSpace(cand)
-		if _, isImg := imageExts[strings.ToLower(filepath.Ext(cand))]; !isImg {
-			continue
-		}
-		p := cand
-		if strings.HasPrefix(p, "~") {
-			if home, err := os.UserHomeDir(); err == nil {
-				p = home + p[1:]
-			}
-		}
-		abs, err := filepath.Abs(p)
-		if err != nil {
-			continue
-		}
-		if _, err := os.Stat(abs); err == nil {
-			return abs, true
+	p := ln
+	if strings.HasPrefix(p, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = home + p[1:]
 		}
 	}
-	return "", false
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", false
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return "", false
+	}
+	return abs, true
 }
 
 // detectImagePath checks if the input starts with a file path ending in an image extension.
