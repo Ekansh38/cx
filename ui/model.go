@@ -1861,6 +1861,7 @@ func runAgent(ctx context.Context, prov llm.Provider, model string, msgs []llm.M
 		}
 		defer close(ch)
 		var full strings.Builder
+		cappedOut := true
 		for round := 0; round < maxToolRounds; round++ {
 			content, calls, err := prov.StreamTools(ctx, model, msgs, tools, emit)
 			if err != nil && ctx.Err() == nil {
@@ -1868,6 +1869,7 @@ func runAgent(ctx context.Context, prov llm.Provider, model string, msgs []llm.M
 			}
 			full.WriteString(content)
 			if len(calls) == 0 || ctx.Err() != nil {
+				cappedOut = false
 				break
 			}
 			msgs = append(msgs, llm.Message{Role: "assistant", Content: content, ToolCalls: calls})
@@ -1878,6 +1880,21 @@ func runAgent(ctx context.Context, prov llm.Provider, model string, msgs []llm.M
 				full.WriteString(line)
 				msgs = append(msgs, llm.Message{Role: "tool", ToolCallID: call.ID, Content: result})
 			}
+		}
+		// If we exited by hitting the tool-round cap, the last round's tool
+		// results never got a follow-up call — the model spent all its
+		// rounds tool-calling and never synthesized an answer, leaving the
+		// user staring at a wall of "searching..." lines and no reply. Do
+		// one final tool-less call so it MUST answer from what it has.
+		if cappedOut && ctx.Err() == nil {
+			nudge := "\n\n*tool budget reached; writing the answer now*\n\n"
+			emit(nudge)
+			full.WriteString(nudge)
+			content, _, err := prov.StreamTools(ctx, model, msgs, nil, emit)
+			if err != nil && ctx.Err() == nil {
+				return streamErrMsg{gen: gen, err: err.Error()}
+			}
+			full.WriteString(content)
 		}
 		return streamEndMsg{gen: gen, content: strings.TrimSpace(full.String())}
 	}
