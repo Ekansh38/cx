@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -1884,12 +1885,34 @@ func runAgent(ctx context.Context, prov llm.Provider, model string, msgs []llm.M
 				break
 			}
 			msgs = append(msgs, llm.Message{Role: "assistant", Content: content, ToolCalls: calls})
-			for _, call := range calls {
-				status, result := execWebTool(ctx, cfg, call)
-				line := "\n\n*" + status + "*\n\n"
-				emit(line)
-				full.WriteString(line)
-				msgs = append(msgs, llm.Message{Role: "tool", ToolCallID: call.ID, Content: result})
+			// Run this round's tool calls IN PARALLEL. Wall-clock latency
+			// drops from sum(individual) to max(individual). Results are
+			// preserved in the original call order so tool_call_id lookups
+			// stay deterministic. Each finished call emits its italic
+			// status line the moment it completes, so the user sees live
+			// progress instead of a frozen "searching..." block.
+			type toolResult struct {
+				status, result string
+			}
+			results := make([]toolResult, len(calls))
+			var wg sync.WaitGroup
+			var emitMu sync.Mutex
+			for i := range calls {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					status, result := execWebTool(ctx, cfg, calls[i])
+					results[i] = toolResult{status: status, result: result}
+					line := "\n\n*" + status + "*\n\n"
+					emitMu.Lock()
+					emit(line)
+					full.WriteString(line)
+					emitMu.Unlock()
+				}(i)
+			}
+			wg.Wait()
+			for i, r := range results {
+				msgs = append(msgs, llm.Message{Role: "tool", ToolCallID: calls[i].ID, Content: r.result})
 			}
 		}
 		// If we exited by hitting the tool-round cap, the last round's tool
