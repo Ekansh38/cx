@@ -171,7 +171,11 @@ func runGroundedSearch(ctx context.Context, cfg *config.Config, query string) st
 	if err != nil {
 		return "error: search unavailable: " + err.Error()
 	}
-	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	// 30s per search. 60s was too generous — a stalled OpenRouter :online
+	// call would freeze the whole conversation while the user stared at a
+	// motionless "searching the web:" line. Fail fast, let the agent loop
+	// keep going with the searches that did return.
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	prompt := fmt.Sprintf(
 		"Search the web for: %q\n\nToday's date: %s. Report the most relevant, current findings as concise bullet points. Include a source URL for every claim. If results look off-topic, say so instead of inventing.",
