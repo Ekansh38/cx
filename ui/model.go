@@ -3747,67 +3747,97 @@ func splitPathToken(s string) (string, string) {
 }
 
 // detectImagePathsInInput extracts every resolvable image path from a drag-
-// drop input, tolerant of every terminal escape quirk we've hit:
+// drop input. Handles every terminal quirk we've hit:
 //
-//   - one path per line (macOS Terminal on multi-file drags via one route)
-//   - multiple paths concatenated on ONE line with no separator (macOS
-//     Terminal on multi-file drags via another route), e.g.
-//     `/a/foo.png/b/bar.png` — the `.png/` boundary is our only cue.
-//   - `\ ` escape sequences unescaped to space
-//   - mixed escaping: some spaces escaped, some not, in the same filename
-//   - trailing whitespace / blank lines
+//   - one path per line
+//   - N paths concatenated on ONE line with no separator (`foo.png/bar.png`)
+//   - `\ ` escape sequences
+//   - mixed escaping in the same filename
+//   - path appended directly to prose with no separator (`...end./var/...png`)
 //
-// Approach: unescape, then normalize every `<image-ext>/` sequence to
-// `<image-ext>\n/` so a concatenated multi-drag collapses into the
-// one-path-per-line case. Then process each line as a candidate; keep
-// lines that resolve to real image files. Anything left over becomes the
-// message body.
+// Approach: unescape. For each occurrence of an image extension in the
+// input, walk BACKWARD through every `/` (or `~` at a word boundary) trying
+// each as a candidate path start. First candidate substring that `os.Stat`
+// resolves to an existing file wins. Consumed spans are removed from the
+// leftover text so a "drag image + type prose" send still delivers both.
 func (m Model) detectImagePathsInInput(input string) (paths []string, rest string) {
 	s := strings.ReplaceAll(input, `\ `, ` `)
-	// Split concatenated paths: `foo.png/bar/...` -> `foo.png\n/bar/...`.
-	// Case-preserving replace via manual scan (strings.ReplaceAll is
-	// case-sensitive but real terminals only emit lowercase extensions
-	// on macOS by default; still, cover the common cases).
-	for _, ext := range []string{".png", ".jpg", ".jpeg", ".gif", ".webp", ".PNG", ".JPG", ".JPEG", ".GIF", ".WEBP"} {
-		s = strings.ReplaceAll(s, ext+"/", ext+"\n/")
+
+	exts := []string{".png", ".jpg", ".jpeg", ".gif", ".webp"}
+	lower := strings.ToLower(s)
+
+	type span struct{ start, end int }
+	var consumed []span
+
+	cursor := 0
+	for cursor < len(s) {
+		// Find next earliest image-extension hit from cursor.
+		bestIdx := -1
+		bestEnd := 0
+		for _, ext := range exts {
+			if i := strings.Index(lower[cursor:], ext); i >= 0 {
+				abs := cursor + i
+				end := abs + len(ext)
+				if bestIdx < 0 || abs < bestIdx {
+					bestIdx = abs
+					bestEnd = end
+				}
+			}
+		}
+		if bestIdx < 0 {
+			break
+		}
+		// Walk back from bestIdx through every `/` (or word-boundary `~`)
+		// trying each as a candidate path start. First stat that resolves
+		// is our path. Path resolution is O(N) per candidate, but paths
+		// are short so total cost is negligible.
+		found := -1
+		for i := bestIdx; i >= 0; i-- {
+			isPathStart := false
+			switch {
+			case s[i] == '/':
+				isPathStart = true
+			case s[i] == '~':
+				if i == 0 || s[i-1] == ' ' || s[i-1] == '\n' || s[i-1] == '\t' {
+					isPathStart = true
+				}
+			}
+			if !isPathStart {
+				continue
+			}
+			cand := s[i:bestEnd]
+			p := cand
+			if strings.HasPrefix(p, "~") {
+				if home, err := os.UserHomeDir(); err == nil {
+					p = home + p[1:]
+				}
+			}
+			if _, statErr := os.Stat(p); statErr == nil {
+				found = i
+				paths = append(paths, p)
+				break
+			}
+		}
+		if found >= 0 {
+			consumed = append(consumed, span{start: found, end: bestEnd})
+		}
+		cursor = bestEnd
 	}
 
-	var kept []string
-	for _, ln := range strings.Split(s, "\n") {
-		ln = strings.TrimSpace(ln)
-		if ln == "" {
-			continue
+	// Build leftover text by removing consumed spans.
+	var leftover strings.Builder
+	prev := 0
+	for _, sp := range consumed {
+		if sp.start > prev {
+			leftover.WriteString(s[prev:sp.start])
 		}
-		if abs, ok := resolveImagePathLine(ln); ok {
-			paths = append(paths, abs)
-			continue
-		}
-		kept = append(kept, ln)
+		prev = sp.end
 	}
-	rest = strings.TrimSpace(strings.Join(kept, " "))
+	if prev < len(s) {
+		leftover.WriteString(s[prev:])
+	}
+	rest = strings.TrimSpace(strings.Join(strings.Fields(leftover.String()), " "))
 	return paths, rest
-}
-
-// resolveImagePathLine takes a single unescaped line and returns the
-// absolute path if the line looks like an existing image file, else "".
-func resolveImagePathLine(ln string) (string, bool) {
-	if _, isImg := imageExts[strings.ToLower(filepath.Ext(ln))]; !isImg {
-		return "", false
-	}
-	p := ln
-	if strings.HasPrefix(p, "~") {
-		if home, err := os.UserHomeDir(); err == nil {
-			p = home + p[1:]
-		}
-	}
-	abs, err := filepath.Abs(p)
-	if err != nil {
-		return "", false
-	}
-	if _, err := os.Stat(abs); err != nil {
-		return "", false
-	}
-	return abs, true
 }
 
 // detectImagePath checks if the input starts with a file path ending in an image extension.
