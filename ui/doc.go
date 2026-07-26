@@ -902,6 +902,13 @@ func (m *Model) advanceDocReview() {
 // display. An unterminated trailing block (mid-stream, or a model that forgot
 // the closing tag) is hidden too — raw SEARCH/REPLACE markers render as
 // blockquote garbage otherwise.
+//
+// Also strips BARE conflict-marker blocks (`<<<<<<< SEARCH` / `=======` /
+// `>>>>>>> REPLACE`) that the model emits without the `<edit>` wrapper.
+// This shows up when a doc was disconnected mid-conversation and the model
+// keeps mimicking the edit format from history — cx has no doc to apply
+// the edit to, so all the user sees is `>>>>>>>` rendered by glamour as
+// seven nested blockquote bars. Hide the whole block behind a placeholder.
 func stripEditBlocks(s string) string {
 	n := 0
 	for {
@@ -916,6 +923,25 @@ func stripEditBlocks(s string) string {
 		}
 		n++
 		s = s[:start] + fmt.Sprintf("*[proposed edit %d]*", n) + s[start+rel+len("</edit>"):]
+	}
+	// Bare conflict-marker blocks (no <edit> wrapper). We look for the
+	// SEARCH-line marker and swallow through the matching REPLACE-line
+	// marker. An unterminated block gets hidden the same way as an
+	// unterminated <edit> would.
+	for {
+		start := strings.Index(s, "<<<<<<< SEARCH")
+		if start < 0 {
+			break
+		}
+		// End marker can be on its own line as ">>>>>>> REPLACE".
+		endMarker := ">>>>>>> REPLACE"
+		endRel := strings.Index(s[start:], endMarker)
+		if endRel < 0 {
+			s = s[:start] + "*[bare edit block dropped — no doc connected]*"
+			break
+		}
+		n++
+		s = s[:start] + fmt.Sprintf("*[bare edit block %d dropped — no doc connected]*", n) + s[start+endRel+len(endMarker):]
 	}
 	return s
 }
