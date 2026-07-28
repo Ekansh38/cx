@@ -41,6 +41,7 @@ const (
 	stateForkPicker             // past-prompt picker for /fork
 	stateMemAddPicker           // filesystem picker for /mem
 	stateMemRemovePicker        // current external-memory list picker for /mem off
+	stateCopyPicker             // fuzzy search over messages for /copy
 )
 
 // ── tea.Msg types ─────────────────────────────────────────────────────────────
@@ -200,6 +201,12 @@ type Model struct {
 	memFilter string
 	memCursor int
 	memMode   string // "add" or "remove"
+
+	// copy picker state (/copy with no args opens fuzzy search)
+	copyItems   []searchResult // messages from current conv (or all if toggled)
+	copyFilter  string
+	copyCursor  int
+	copyAllConvs bool // if true, search across all convs
 
 	// system
 	systemPrompt string
@@ -797,6 +804,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateForkPicker(msg)
 		case stateMemAddPicker, stateMemRemovePicker:
 			return m.updateMemPicker(msg)
+		case stateCopyPicker:
+			return m.updateCopyPicker(msg)
 		default:
 			return m.updateChat(msg)
 		}
@@ -1350,6 +1359,11 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		return m, nil
 
 	case "/copy":
+		// /copy with no args opens the fuzzy copy picker.
+		// /copy [response|prompt|all] [n] keeps the old shortcut.
+		if len(parts) == 1 {
+			return m.enterCopyPicker()
+		}
 		what, n := "response", 1
 		if len(parts) > 1 {
 			args := strings.Fields(parts[1])
@@ -3189,6 +3203,8 @@ func (m Model) View() string {
 		return m.forkPickerView()
 	case stateMemAddPicker, stateMemRemovePicker:
 		return m.memPickerView()
+	case stateCopyPicker:
+		return m.copyPickerView()
 	default:
 		return m.chatView()
 	}
@@ -4445,4 +4461,213 @@ func (m Model) handleVocabCommand(parts []string) (Model, tea.Cmd) {
 		m.errMsg = "usage: /vocab [add <hint> | remove <substr>]"
 		return m, nil
 	}
+}
+
+// ── Copy picker (/copy with no args) ─────────────────────────────────────────
+
+func (m Model) enterCopyPicker() (Model, tea.Cmd) {
+	items := m.copyItemsForConv()
+	if len(items) == 0 {
+		m.errMsg = "no messages to copy in this chat"
+		return m, nil
+	}
+	m.state = stateCopyPicker
+	m.copyItems = items
+	m.copyFilter = ""
+	m.copyCursor = 0
+	m.copyAllConvs = false
+	return m, nil
+}
+
+func (m Model) copyItemsForConv() []searchResult {
+	var items []searchResult
+	for _, msg := range m.messages {
+		if msg.Role != "user" && msg.Role != "assistant" {
+			continue
+		}
+		if msg.ID == 0 {
+			continue // display-only
+		}
+		items = append(items, searchResult{conv: m.conv, msg: msg})
+	}
+	return items
+}
+
+func (m Model) copyItemsAllConvs() []searchResult {
+	convs, _ := m.store.ListConversations()
+	convMap := make(map[int64]*store.Conversation, len(convs))
+	for _, c := range convs {
+		convMap[c.ID] = c
+	}
+	allMsgs, _ := m.store.SearchMessages("")
+	var items []searchResult
+	for _, msg := range allMsgs {
+		if msg.Role != "user" && msg.Role != "assistant" {
+			continue
+		}
+		c := convMap[msg.ConvID]
+		if c == nil {
+			continue
+		}
+		items = append(items, searchResult{conv: c, msg: msg})
+	}
+	return items
+}
+
+func (m Model) filteredCopyItems() []searchResult {
+	if m.copyFilter == "" {
+		return m.copyItems
+	}
+	q := strings.ToLower(m.copyFilter)
+	var out []searchResult
+	for _, r := range m.copyItems {
+		if strings.Contains(strings.ToLower(r.msg.Content), q) ||
+			strings.Contains(strings.ToLower(r.conv.Title), q) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (m Model) updateCopyPicker(msg tea.KeyMsg) (Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.state = stateChat
+		return m, nil
+
+	case tea.KeyEnter:
+		filtered := m.filteredCopyItems()
+		if len(filtered) == 0 {
+			m.state = stateChat
+			return m, nil
+		}
+		sel := filtered[m.copyCursor]
+		text := sel.msg.Content
+		if sel.msg.Role == "assistant" {
+			text = stripEditBlocks(text)
+		} else {
+			text = stripPlaceholders(text)
+		}
+		m.state = stateChat
+		if err := copyToClipboard(text); err != nil {
+			m.errMsg = "copy failed: " + err.Error()
+			return m, nil
+		}
+		role := "response"
+		if sel.msg.Role == "user" {
+			role = "prompt"
+		}
+		m.injectSystemLine("copied " + role + " to clipboard")
+		return m, nil
+
+	case tea.KeyTab:
+		if m.copyAllConvs {
+			m.copyAllConvs = false
+			m.copyItems = m.copyItemsForConv()
+		} else {
+			m.copyAllConvs = true
+			m.copyItems = m.copyItemsAllConvs()
+		}
+		m.copyFilter = ""
+		m.copyCursor = 0
+		return m, nil
+
+	case tea.KeyUp:
+		if m.copyCursor > 0 {
+			m.copyCursor--
+		}
+		return m, nil
+
+	case tea.KeyDown:
+		filtered := m.filteredCopyItems()
+		if m.copyCursor < len(filtered)-1 {
+			m.copyCursor++
+		}
+		return m, nil
+
+	case tea.KeyBackspace, tea.KeyDelete:
+		if len(m.copyFilter) > 0 {
+			_, size := utf8.DecodeLastRuneInString(m.copyFilter)
+			m.copyFilter = m.copyFilter[:len(m.copyFilter)-size]
+			m.copyCursor = 0
+		}
+		return m, nil
+
+	case tea.KeySpace:
+		m.copyFilter += " "
+		m.copyCursor = 0
+		return m, nil
+
+	case tea.KeyRunes:
+		m.copyFilter += string(msg.Runes)
+		m.copyCursor = 0
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) copyPickerView() string {
+	filtered := m.filteredCopyItems()
+	maxVisible := max(m.height-10, 1)
+	start := 0
+	if m.copyCursor >= maxVisible {
+		start = m.copyCursor - maxVisible + 1
+	}
+	end := min(start+maxVisible, len(filtered))
+
+	scope := "this chat"
+	if m.copyAllConvs {
+		scope = "all chats"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("\n\n")
+	sb.WriteString(pickerTitleStyle.Render("   Copy message  ") + dimStyle.Render("("+scope+")") + "\n\n")
+
+	filterText := m.copyFilter
+	if filterText == "" {
+		filterText = dimStyle.Render("type to filter...")
+	}
+	sb.WriteString(promptStyle.Render("   > ") + filterText + "\n\n")
+
+	if len(m.copyItems) == 0 {
+		sb.WriteString(dimStyle.Render("   no messages") + "\n")
+	} else if len(filtered) == 0 {
+		sb.WriteString(dimStyle.Render("   no matches") + "\n")
+	} else {
+		for i := start; i < end; i++ {
+			r := filtered[i]
+			role := "cx "
+			if r.msg.Role == "user" {
+				role = "you"
+			}
+			preview := r.msg.Content
+			if r.msg.Role == "assistant" {
+				preview = stripEditBlocks(preview)
+			} else {
+				preview = stripPlaceholders(preview)
+			}
+			if nl := strings.IndexByte(preview, '\n'); nl >= 0 {
+				preview = preview[:nl]
+			}
+			preview = strings.TrimSpace(preview)
+			maxPreview := max(m.width-16, 20)
+			if utf8.RuneCountInString(preview) > maxPreview {
+				preview = string([]rune(preview)[:maxPreview-1]) + "…"
+			}
+			roleStyled := dimStyle.Render(role)
+			if i == m.copyCursor {
+				sb.WriteString(" › " + roleStyled + "  " + pickerSelectedStyle.Render(preview) + "\n")
+			} else {
+				sb.WriteString(pickerRowStyle.Render("   "+role+"  "+preview) + "\n")
+			}
+		}
+		if len(filtered) > maxVisible {
+			sb.WriteString("\n" + dimStyle.Render(fmt.Sprintf("   … %d more", len(filtered)-maxVisible)) + "\n")
+		}
+	}
+
+	sb.WriteString("\n\n")
+	sb.WriteString(dimStyle.Render("   up/down navigate  enter copy  tab all-chats  esc back"))
+	return sb.String()
 }
