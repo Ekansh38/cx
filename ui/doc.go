@@ -499,7 +499,9 @@ func applyAllExternalReview() {
 	if _, err := os.Stat(sock); err != nil {
 		return
 	}
-	reloadReviewLua()
+	// No lua reload here: CxApplyAll runs DURING an active review. Re-sourcing
+	// the lua resets S (the review state) to {hunks=nil} and destroys the
+	// running review. The lua was already loaded when the review started.
 	rpc(10*time.Second, "--server", sock, "--remote-expr", "v:lua.CxApplyAll()")
 }
 
@@ -527,14 +529,14 @@ func appendExternalReview(docPath string, edits []docEdit) bool {
 	if err != nil {
 		return false
 	}
-	// Clear the previous review's results file before writing the new
-	// request. Without this, extReviewTick could pick up stale edits-done
-	// from the last review and skip polling for the new one.
 	os.Remove(editsDonePath())
 	if err := os.WriteFile(editsReqPath(), buf, 0o644); err != nil {
 		return false
 	}
-	reloadReviewLua()
+	// NO lua reload: CxAddEdits runs inside a live review. Re-sourcing the lua
+	// resets S to {hunks=nil}, destroying the active review's hunk state. The
+	// lua was loaded when the review started and doesn't need to be reloaded
+	// just to inject additional hunks.
 	return rpc(10*time.Second, "--server", sock, "--remote-expr", "v:lua.CxAddEdits()") == nil
 }
 
@@ -545,7 +547,7 @@ func applyPendingEditByIndex(idx int) bool {
 	if _, err := os.Stat(sock); err != nil {
 		return false
 	}
-	reloadReviewLua()
+	// No lua reload mid-review (same reason as appendExternalReview).
 	return rpc(10*time.Second, "--server", sock, "--remote-expr",
 		fmt.Sprintf("v:lua.CxApplyIndex(%d)", idx)) == nil
 }
@@ -557,7 +559,7 @@ func rejectPendingEditByIndex(idx int, reason string) bool {
 	if _, err := os.Stat(sock); err != nil {
 		return false
 	}
-	reloadReviewLua()
+	// No lua reload mid-review (same reason as appendExternalReview).
 	esc := strings.ReplaceAll(reason, "'", "''")
 	return rpc(10*time.Second, "--server", sock, "--remote-expr",
 		fmt.Sprintf("v:lua.CxRejectIndex(%d, '''%s''')", idx, esc)) == nil
