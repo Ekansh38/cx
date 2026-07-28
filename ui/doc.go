@@ -311,12 +311,17 @@ func EditorArgs(docPath string) []string {
 	}
 	os.WriteFile(reviewLuaPath(), []byte(reviewLua), 0o644)
 	sock := nvimSockPath()
-	if !nvimAlive(sock) {
-		os.Remove(sock) // stale socket would block --listen
-		return []string{editor, "--listen", sock, "-c", "luafile " + reviewLuaPath(), docPath}
+	if nvimAlive(sock) {
+		// A cx-bridged nvim is already running. Send the file to it and
+		// reload the review lua so it picks up any cx upgrade. Returning
+		// these args opens the file in the existing nvim rather than
+		// spawning a new one WITHOUT --listen (which would break the
+		// bridge for future reviews).
+		reloadReviewLua()
+		return []string{editor, "--server", sock, "--remote", docPath}
 	}
-	// An earlier cx-spawned nvim already owns the socket — plain open.
-	return []string{editor, docPath}
+	os.Remove(sock) // stale socket file would block --listen
+	return []string{editor, "--listen", sock, "-c", "luafile " + reviewLuaPath(), docPath}
 }
 
 // rpc runs an nvim remote command with a hard timeout so a busy editor
