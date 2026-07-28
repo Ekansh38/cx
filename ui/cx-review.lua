@@ -922,9 +922,15 @@ function CxReview()
     if h.notfound then nf = nf + 1 end
   end
   if nf == #S.hunks then
-    vim.notify(string.format("cx: %d/%d edits could not be anchored — buffer content changed since the model saw it. cx will auto-retry.", nf, #S.hunks), vim.log.levels.WARN)
+    -- ALL edits notfound: cx auto-retries with updated anchors. No notify
+    -- here because vim.notify with a long message triggers the blocking
+    -- "Press ENTER or type command to continue" prompt, which causes
+    -- nvim's event loop to stall and the retry's CxReview() RPC to time
+    -- out — which is exactly the "bridge unavailable" fallback the user
+    -- sees. cx handles this silently via the extRetry mechanism.
   elseif nf > 0 then
-    vim.notify(string.format("cx: %d of %d edits could not be anchored — reviewing the rest", nf, #S.hunks), vim.log.levels.WARN)
+    -- Short enough to not wrap and trigger "Press ENTER".
+    vim.notify(string.format("cx: %d/%d edits unlocated, reviewing the rest", nf, #S.hunks), vim.log.levels.WARN)
   end
 
   repaint()
