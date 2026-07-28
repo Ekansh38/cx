@@ -511,7 +511,7 @@ func applyAllExternalReview() {
 // to starting a fresh review.
 func appendExternalReview(docPath string, edits []docEdit) bool {
 	sock := nvimSockPath()
-	if !nvimAlive(sock) {
+	if _, err := os.Stat(sock); err != nil {
 		return false
 	}
 	type reqEdit struct {
