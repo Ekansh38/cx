@@ -482,7 +482,7 @@ func applyAllExternalReview() {
 		return
 	}
 	reloadReviewLua()
-	rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxApplyAll()")
+	rpc(10*time.Second, "--server", sock, "--remote-expr", "v:lua.CxApplyAll()")
 }
 
 // appendExternalReview injects new edits into the live in-editor review
@@ -517,7 +517,7 @@ func appendExternalReview(docPath string, edits []docEdit) bool {
 		return false
 	}
 	reloadReviewLua()
-	return rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxAddEdits()") == nil
+	return rpc(10*time.Second, "--server", sock, "--remote-expr", "v:lua.CxAddEdits()") == nil
 }
 
 // applyPendingEditByIndex applies a specific pending hunk by its 1-based
@@ -528,7 +528,7 @@ func applyPendingEditByIndex(idx int) bool {
 		return false
 	}
 	reloadReviewLua()
-	return rpc(3*time.Second, "--server", sock, "--remote-expr",
+	return rpc(10*time.Second, "--server", sock, "--remote-expr",
 		fmt.Sprintf("v:lua.CxApplyIndex(%d)", idx)) == nil
 }
 
@@ -541,7 +541,7 @@ func rejectPendingEditByIndex(idx int, reason string) bool {
 	}
 	reloadReviewLua()
 	esc := strings.ReplaceAll(reason, "'", "''")
-	return rpc(3*time.Second, "--server", sock, "--remote-expr",
+	return rpc(10*time.Second, "--server", sock, "--remote-expr",
 		fmt.Sprintf("v:lua.CxRejectIndex(%d, '''%s''')", idx, esc)) == nil
 }
 
@@ -617,7 +617,10 @@ func startExternalReview(docPath string, edits []docEdit) bool {
 	// Re-write the lua file too, in case cx was upgraded since spawn
 	os.WriteFile(reviewLuaPath(), []byte(reviewLua), 0o644)
 	reloadReviewLua()
-	return rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxReview()") == nil
+	// 10s timeout: CxReview does real work (locate text in buffer, insert
+	// green blocks, set up keymaps). 3s was too tight on a loaded machine
+	// or a large file and silently caused fallback to in-cx review.
+	return rpc(10*time.Second, "--server", sock, "--remote-expr", "v:lua.CxReview()") == nil
 }
 
 // readExternalReviewResults returns the decisions once neovim wrote them.
