@@ -16,6 +16,12 @@ local ns = vim.api.nvim_create_namespace("cx_review")        -- invisible tracki
 local paint = vim.api.nvim_create_namespace("cx_review_paint") -- highlights + footers, redrawn
 local aug = vim.api.nvim_create_augroup("cx_review", { clear = true })
 local datadir = vim.fn.expand("~/.local/share/cx")
+-- cx_session_id is injected at the top of this file by cx (sessionedLua())
+-- before it is written to disk. When set, all IPC files use the per-session
+-- suffix so multiple cx doc sessions don't fight over shared file names.
+local sid = (type(cx_session_id) == "string" and cx_session_id ~= "") and ("-" .. cx_session_id) or ""
+local function ipc(name) return datadir .. "/" .. name .. sid .. ".json" end
+local function ipcjsonl(name) return datadir .. "/" .. name .. sid .. ".jsonl" end
 
 local S = { hunks = nil, buf = nil, total = 0 }
 
@@ -246,7 +252,7 @@ local function paint_hunk(h, idx)
       virt_lines = {
         {
           {
-            string.format("cx %d/%d · y apply  n skip  N reject+note  a all  q finish", idx, S.total),
+            string.format("cx %d/%d · y apply  n skip  N reject+note  a apply-all  q skip-rest", idx, S.total),
             "Comment",
           },
         },
@@ -408,7 +414,7 @@ local function finish()
     vim.notify("cx: buffer write failed, edits not applied to disk")
   end
   pcall(vim.fn.setqflist, {}, "r")
-  vim.fn.writefile({ vim.json.encode({ results = results }) }, datadir .. "/edits-done.json")
+  vim.fn.writefile({ vim.json.encode({ results = results }) }, ipc("edits-done"))
   vim.notify(string.format("cx: %d/%d applied", applied, #results))
   if S.restore_plugins then
     S.restore_plugins()
@@ -567,7 +573,7 @@ local function decide(action)
           -- consume so the next chat message doesn't re-send it
           pcall(os.remove, datadir .. "/selection.txt")
         end
-        local f = io.open(datadir .. "/reject-now.jsonl", "a")
+        local f = io.open(ipcjsonl("reject-now"), "a")
         if f then
           f:write(vim.json.encode(ev) .. "\n")
           f:close()
@@ -637,7 +643,7 @@ function CxRejectIndex(i, reason)
   h.reason = reason or ""
   if reason and reason ~= "" then
     h.reported = true
-    local f = io.open(datadir .. "/reject-now.jsonl", "a")
+    local f = io.open(ipcjsonl("reject-now"), "a")
     if f then
       f:write(vim.json.encode({
         reason = reason,
@@ -703,7 +709,7 @@ end
 -- CxSyncDocs: cx calls this before every prompt so unsaved buffer changes in
 -- connected docs reach disk (and therefore the model). Paths in docs.txt.
 function CxSyncDocs()
-  local ok, paths = pcall(vim.fn.readfile, datadir .. "/docs.txt")
+  local ok, paths = pcall(vim.fn.readfile, datadir .. "/docs" .. sid .. ".txt")
   if not ok then
     return 0
   end
@@ -791,7 +797,7 @@ function CxAddEdits()
   if not S.hunks or not S.buf or not vim.api.nvim_buf_is_valid(S.buf) then
     return 0
   end
-  local ok, raw = pcall(vim.fn.readfile, datadir .. "/edits.json")
+  local ok, raw = pcall(vim.fn.readfile, ipc("edits"))
   if not ok or #raw == 0 then
     return 0
   end
@@ -828,7 +834,7 @@ function CxAddEdits()
 end
 
 function CxReview()
-  local ok, raw = pcall(vim.fn.readfile, datadir .. "/edits.json")
+  local ok, raw = pcall(vim.fn.readfile, ipc("edits"))
   if not ok or #raw == 0 then
     return 0
   end
@@ -952,6 +958,6 @@ function CxReview()
   })
 
   local word = S.total == 1 and "edit" or "edits"
-  vim.notify(string.format("cx: %d %s · y/n/N/a/q · ]q next", S.total, word))
+  vim.notify(string.format("cx: %d %s · y apply  n skip  N reject+note  a apply-all  q skip-rest  ]q next", S.total, word))
   return 1
 end

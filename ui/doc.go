@@ -290,12 +290,17 @@ func (m Model) disconnectDocFlow() (Model, tea.Cmd) {
 //go:embed cx-review.lua
 var reviewLua string
 
+// sessionID is set once at startup. Using the cx PID means each cx doc
+// session gets its own socket, lua, and IPC files, so two tmux windows
+// running cx doc simultaneously can't fight over shared files.
+var sessionID = fmt.Sprintf("%d", os.Getpid())
+
 func nvimSockPath() string {
-	return filepath.Join(config.DataDir(), "nvim.sock")
+	return filepath.Join(config.DataDir(), "nvim-"+sessionID+".sock")
 }
 
 func reviewLuaPath() string {
-	return filepath.Join(config.DataDir(), "cx-review.lua")
+	return filepath.Join(config.DataDir(), "cx-review-"+sessionID+".lua")
 }
 
 // EditorArgs builds the command to open the doc in the user's editor.
@@ -309,7 +314,7 @@ func EditorArgs(docPath string) []string {
 	if !strings.Contains(filepath.Base(editor), "nvim") {
 		return []string{editor, docPath}
 	}
-	os.WriteFile(reviewLuaPath(), []byte(reviewLua), 0o644)
+	os.WriteFile(reviewLuaPath(), []byte(sessionedLua()), 0o644)
 	sock := nvimSockPath()
 	if nvimAlive(sock) {
 		// A cx-bridged nvim is already running. Send the file to it and
@@ -359,7 +364,7 @@ func syncDocs(paths []string) {
 	if _, err := os.Stat(sock); err != nil || len(paths) == 0 {
 		return
 	}
-	os.WriteFile(filepath.Join(config.DataDir(), "docs.txt"), []byte(strings.Join(paths, "\n")+"\n"), 0o644)
+	os.WriteFile(filepath.Join(config.DataDir(), "docs-"+sessionID+".txt"), []byte(strings.Join(paths, "\n")+"\n"), 0o644)
 	go rpc(3*time.Second, "--server", sock, "--remote-expr", "v:lua.CxSyncDocs()")
 }
 
@@ -405,9 +410,17 @@ func (m *Model) autoEditorSplit(path string) {
 // edits-done.json. Neovim renders the inline diff, applies approved hunks to
 // the buffer itself (no reload races), and records rejection reasons.
 
-func editsReqPath() string  { return filepath.Join(config.DataDir(), "edits.json") }
-func editsDonePath() string { return filepath.Join(config.DataDir(), "edits-done.json") }
-func rejectNowPath() string { return filepath.Join(config.DataDir(), "reject-now.jsonl") }
+func editsReqPath() string  { return filepath.Join(config.DataDir(), "edits-"+sessionID+".json") }
+func editsDonePath() string { return filepath.Join(config.DataDir(), "edits-done-"+sessionID+".json") }
+func rejectNowPath() string { return filepath.Join(config.DataDir(), "reject-now-"+sessionID+".jsonl") }
+
+// sessionedLua prepends a `local cx_session_id = "<pid>"` line to the
+// embedded review lua so CxSyncDocs and other lua functions that read IPC
+// files use the per-session filenames (docs-<pid>.txt, edits-<pid>.json…)
+// instead of the shared legacy paths.
+func sessionedLua() string {
+	return fmt.Sprintf("local cx_session_id = %q\n", sessionID) + reviewLua
+}
 
 type editResult struct {
 	Applied  bool   `json:"applied"`
@@ -620,7 +633,7 @@ func startExternalReview(docPath string, edits []docEdit) bool {
 		return false
 	}
 	// Re-write the lua file too, in case cx was upgraded since spawn
-	os.WriteFile(reviewLuaPath(), []byte(reviewLua), 0o644)
+	os.WriteFile(reviewLuaPath(), []byte(sessionedLua()), 0o644)
 	reloadReviewLua()
 	// 10s timeout: CxReview does real work (locate text in buffer, insert
 	// green blocks, set up keymaps). 3s was too tight on a loaded machine

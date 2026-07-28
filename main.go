@@ -38,10 +38,18 @@ func main() {
 	// would be replayed against a new session, leaking test-fixture text
 	// or stale rejections into a real conversation. Clean them at startup.
 	dd := config.DataDir()
-	os.Remove(filepath.Join(dd, "edits.json"))
-	os.Remove(filepath.Join(dd, "edits-done.json"))
-	os.Remove(filepath.Join(dd, "reject-now.jsonl"))
+	pid := fmt.Sprintf("%d", os.Getpid())
+	// Clean up both the legacy shared paths (for old cx installs) and this
+	// session's per-PID files in case we crashed and left stale IPC files.
+	for _, f := range []string{
+		"edits.json", "edits-done.json", "reject-now.jsonl",
+		"edits-" + pid + ".json", "edits-done-" + pid + ".json",
+		"reject-now-" + pid + ".jsonl",
+	} {
+		os.Remove(filepath.Join(dd, f))
+	}
 	os.Remove(filepath.Join(dd, "selection.txt")) // stale editor highlight from a crashed nvim / prior tests
+	cleanupOrphanedSessionFiles(dd)
 
 	// cx vim [file] — open a document in the user's editor with the cx bridge
 	// (RPC socket + review lua when neovim), but WITHOUT a tmux split. Use
@@ -426,4 +434,48 @@ func binaryPathOfPID(pid int) string {
 		}
 	}
 	return ""
+}
+
+// cleanupOrphanedSessionFiles removes per-PID IPC files (nvim-*.sock,
+// edits-*.json, etc.) whose PID no longer exists. Silently no-ops on errors.
+func cleanupOrphanedSessionFiles(dd string) {
+	entries, err := os.ReadDir(dd)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Match files that embed a PID: "nvim-12345.sock", "edits-12345.json", etc.
+		var pidStr string
+		for _, prefix := range []string{"nvim-", "edits-", "edits-done-", "reject-now-", "cx-review-", "docs-"} {
+			if strings.HasPrefix(name, prefix) {
+				rest := strings.TrimPrefix(name, prefix)
+				// strip extension
+				if dot := strings.LastIndex(rest, "."); dot >= 0 {
+					rest = rest[:dot]
+				}
+				pidStr = rest
+				break
+			}
+		}
+		if pidStr == "" {
+			continue
+		}
+		var pid int
+		if _, err := fmt.Sscanf(pidStr, "%d", &pid); err != nil || pid <= 0 {
+			continue
+		}
+		// Check if the process is alive by sending signal 0.
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			os.Remove(filepath.Join(dd, name))
+			continue
+		}
+		if err := p.Signal(syscall.Signal(0)); err != nil {
+			os.Remove(filepath.Join(dd, name))
+		}
+	}
 }
