@@ -565,11 +565,28 @@ func rejectPendingEditByIndex(idx int, reason string) bool {
 		fmt.Sprintf("v:lua.CxRejectIndex(%d, '''%s''')", idx, esc)) == nil
 }
 
-// reviewSignal carries model-tool decisions (discard, apply-all) from the
-// tool goroutine to the extReviewTick handler in Update.
+// reviewSignal carries model-tool decisions (discard, apply-all, undo) from
+// the tool goroutine to the extReviewTick handler in Update.
 var reviewSignal struct {
 	mu      sync.Mutex
 	discard bool
+	undo    bool // request to revert the last-applied review (same as /undo)
+}
+
+// RequestReviewUndo asks the Update loop to revert the last applied review.
+func RequestReviewUndo() {
+	reviewSignal.mu.Lock()
+	reviewSignal.undo = true
+	reviewSignal.mu.Unlock()
+}
+
+// consumeReviewUndo clears the undo flag and returns whether it was set.
+func consumeReviewUndo() bool {
+	reviewSignal.mu.Lock()
+	defer reviewSignal.mu.Unlock()
+	u := reviewSignal.undo
+	reviewSignal.undo = false
+	return u
 }
 
 // RequestReviewDiscard marks the current review to be dropped on the next
