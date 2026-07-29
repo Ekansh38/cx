@@ -395,7 +395,10 @@ local function finish()
   vim.api.nvim_buf_clear_namespace(S.buf, ns, 0, -1)
   vim.api.nvim_buf_clear_namespace(S.buf, paint, 0, -1)
   vim.api.nvim_clear_autocmds({ group = aug, buffer = S.buf })
-  for _, lhs in ipairs({ "y", "n", "N", "a", "q", "<Esc>" }) do
+  for _, lhs in ipairs({ "y", "n", "N", "a", "q",
+      "<Esc>", "x", "X", "d", "D", "c", "C", "s", "S",
+      "r", "R", "p", "P", "~", "i", "I", "o", "O",
+      "J", "<Del>", "<BS>" }) do
     pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
   end
   pcall(vim.api.nvim_buf_call, S.buf, function()
@@ -687,7 +690,10 @@ function CxAbort()
   vim.api.nvim_buf_clear_namespace(S.buf, ns, 0, -1)
   vim.api.nvim_buf_clear_namespace(S.buf, paint, 0, -1)
   pcall(vim.api.nvim_clear_autocmds, { group = aug, buffer = S.buf })
-  for _, lhs in ipairs({ "y", "n", "N", "a", "q", "<Esc>" }) do
+  for _, lhs in ipairs({ "y", "n", "N", "a", "q",
+      "<Esc>", "x", "X", "d", "D", "c", "C", "s", "S",
+      "r", "R", "p", "P", "~", "i", "I", "o", "O",
+      "J", "<Del>", "<BS>" }) do
     pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
   end
   pcall(vim.fn.setqflist, {}, "r")
@@ -945,11 +951,33 @@ function CxReview()
       decide(action)
     end, { buffer = buf, nowait = true })
   end
-  -- Defensive: swallow <Esc> in the review buffer. Some user configs map
-  -- <Esc><Esc> globally (clear highlights, close popups, etc.) and one of
-  -- those turned out to bleed into review-buffer state as an "apply all".
-  -- The review has no legitimate <Esc> action, so make it a hard no-op.
-  vim.keymap.set("n", "<Esc>", "<Nop>", { buffer = buf, nowait = true, silent = true })
+  -- Swallow <Esc> (already defended) and every common destructive normal-mode
+  -- key. Accidental x / dd / s in the review buffer deletes lines from the
+  -- red or green blocks; the extmark then becomes invalid and state() derives
+  -- the hunk as "applied", so cx writes edits-done as applied = true and
+  -- treats the edit as accepted. The user never explicitly decided anything.
+  --
+  -- We map everything that modifies buffer content to <Nop>. Review operations
+  -- (y/n/N/a/q) do their own nvim_buf_set_lines internally, so they don't
+  -- need these keys. Cursor-movement keys (j/k/h/l/gg/G/) and search (/)
+  -- are intentionally left unrestricted so the user can scroll and read.
+  local nop_keys = {
+    "<Esc>",
+    "x", "X",                          -- delete char
+    "d", "D",                          -- delete operator / delete to EOL
+    "c", "C",                          -- change operator / change to EOL
+    "s", "S",                          -- substitute char / line
+    "r", "R",                          -- replace char / replace mode
+    "p", "P",                          -- paste
+    "~",                               -- toggle case
+    "i", "I", "o", "O",               -- enter insert mode
+    "J",                               -- join lines
+    "<Del>",                           -- forward-delete
+    "<BS>",                            -- backward-delete (common in remapped configs)
+  }
+  for _, lhs in ipairs(nop_keys) do
+    vim.keymap.set("n", lhs, "<Nop>", { buffer = buf, nowait = true, silent = true })
+  end
 
   -- vim-native undo/redo (or any edit) repaints the review state
   vim.api.nvim_clear_autocmds({ group = aug, buffer = buf })
