@@ -396,9 +396,8 @@ local function finish()
   vim.api.nvim_buf_clear_namespace(S.buf, paint, 0, -1)
   vim.api.nvim_clear_autocmds({ group = aug, buffer = S.buf })
   for _, lhs in ipairs({ "y", "n", "N", "a", "q",
-      "<Esc>", "x", "X", "d", "D", "c", "C", "s", "S",
-      "r", "R", "p", "P", "~", "i", "I", "o", "O",
-      "J", "<Del>", "<BS>" }) do
+      "<Esc>", "x", "X", "d", "D", "s", "S",
+      "p", "P", "~", "J", "<Del>", "<BS>" }) do
     pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
   end
   pcall(vim.api.nvim_buf_call, S.buf, function()
@@ -691,9 +690,8 @@ function CxAbort()
   vim.api.nvim_buf_clear_namespace(S.buf, paint, 0, -1)
   pcall(vim.api.nvim_clear_autocmds, { group = aug, buffer = S.buf })
   for _, lhs in ipairs({ "y", "n", "N", "a", "q",
-      "<Esc>", "x", "X", "d", "D", "c", "C", "s", "S",
-      "r", "R", "p", "P", "~", "i", "I", "o", "O",
-      "J", "<Del>", "<BS>" }) do
+      "<Esc>", "x", "X", "d", "D", "s", "S",
+      "p", "P", "~", "J", "<Del>", "<BS>" }) do
     pcall(vim.keymap.del, "n", lhs, { buffer = S.buf })
   end
   pcall(vim.fn.setqflist, {}, "r")
@@ -961,19 +959,20 @@ function CxReview()
   -- (y/n/N/a/q) do their own nvim_buf_set_lines internally, so they don't
   -- need these keys. Cursor-movement keys (j/k/h/l/gg/G/) and search (/)
   -- are intentionally left unrestricted so the user can scroll and read.
+  -- i/I/o/O are intentionally NOT blocked: the user should be able to enter
+  -- insert mode to tweak the proposed text before deciding. What we block
+  -- are purely destructive NORMAL-mode ops that delete tracking extmarks
+  -- without intent — causing hunks to appear "applied" without a y/a press.
   local nop_keys = {
     "<Esc>",
-    "x", "X",                          -- delete char
+    "x", "X",                          -- delete char under/before cursor
     "d", "D",                          -- delete operator / delete to EOL
-    "c", "C",                          -- change operator / change to EOL
-    "s", "S",                          -- substitute char / line
-    "r", "R",                          -- replace char / replace mode
-    "p", "P",                          -- paste
+    "s", "S",                          -- substitute char / line (same as c+motion)
+    "p", "P",                          -- paste (clipboard can overwrite diff blocks)
     "~",                               -- toggle case
-    "i", "I", "o", "O",               -- enter insert mode
-    "J",                               -- join lines
+    "J",                               -- join lines (merges red/green rows)
     "<Del>",                           -- forward-delete
-    "<BS>",                            -- backward-delete (common in remapped configs)
+    "<BS>",                            -- backward-delete (often remapped to delete)
   }
   for _, lhs in ipairs(nop_keys) do
     vim.keymap.set("n", lhs, "<Nop>", { buffer = buf, nowait = true, silent = true })
