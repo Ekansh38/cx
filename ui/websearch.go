@@ -108,7 +108,7 @@ func execWebTool(ctx context.Context, cfg *config.Config, call llm.ToolCall) (st
 	switch call.Name {
 	case "undo_last_review":
 		RequestReviewUndo()
-		return "reverting applied edits", "OK, queued an undo of the last applied review. The file will be reverted on the next tick."
+		return "reverting applied edits", "OK. The applied edits will be reverted when this response finishes streaming — no further action needed from the user. Respond with a brief confirmation that the revert happened."
 
 	case "discard_pending_edits":
 		RequestReviewDiscard()
