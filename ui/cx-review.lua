@@ -157,7 +157,19 @@ local function mark_info(id)
   return { m[1], endRow }
 end
 
--- state derives a hunk's status from what is actually in the buffer.
+-- state derives a hunk's status.
+--
+-- For MIXED hunks (both red and green blocks), state NEVER derives "applied"
+-- or "skipped" from extmarks alone. An accidental edit (e.g. <BS> at the
+-- block boundary) can invalidate a tracking extmark without deleting the
+-- actual text, causing both blocks to remain in the buffer while state()
+-- returns "applied". The user never pressed y/a, but cx wrote the file with
+-- both blocks combined.
+--
+-- Fix: mixed hunks require an explicit flag (set by do_apply / do_skip) to
+-- leave "pending". The flag is combined with the extmark check so that
+-- pressing vim's u (undo) — which restores both extmarks — correctly resets
+-- the hunk back to "pending" even after an explicit decision.
 local function state(h)
   if h.notfound then
     return "notfound"
@@ -165,12 +177,18 @@ local function state(h)
   local red = h.delN > 0 and mark_info(h.redMark) ~= nil
   local green = h.insN > 0 and mark_info(h.greenMark) ~= nil
   if h.delN > 0 and h.insN > 0 then
+    -- If undo restored both blocks, clear the explicit flags and go pending.
     if red and green then
+      h.explicitly_applied = nil
+      h.explicitly_skipped = nil
       return "pending"
-    elseif green then
-      return "applied"
     end
-    return "skipped"
+    -- Require an explicit y/a press to be "applied", not just missing extmark.
+    if h.explicitly_applied then return "applied" end
+    if h.explicitly_skipped then return "skipped" end
+    -- No explicit decision and blocks are in an ambiguous state (accidental
+    -- edit?): treat as pending so the user can still decide.
+    return "pending"
   elseif h.delN == 0 then -- pure insertion
     if not green then
       return "skipped"
@@ -449,6 +467,9 @@ local function do_apply(h)
     h.accepted = true
   end
   h.reason = nil
+  -- Explicit decision flag: prevents accidental extmark invalidation
+  -- (e.g. <BS> at block boundary) from being misread as "applied".
+  h.explicitly_applied = true
 end
 
 local function do_skip(h)
@@ -457,6 +478,7 @@ local function do_skip(h)
   else
     h.skipped = true
   end
+  h.explicitly_skipped = true
 end
 
 -- ask_reason opens a bordered floating buffer to capture a rejection note.
