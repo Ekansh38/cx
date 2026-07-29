@@ -566,6 +566,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.atBottom = true
 		m.primeContextTokens() // status bar reflects the fresh total
 
+		// Drain any undo request queued by the undo_last_review tool during
+		// this stream. The extReviewTick chain only runs while a review is
+		// active; if the review finished before the model's response, the
+		// tick is dead and the signal would never be consumed.
+		if consumeReviewUndo() {
+			m.reloadDocs()
+			reverted, failed := 0, 0
+			for i := len(m.lastApplied) - 1; i >= 0; i-- {
+				e := m.lastApplied[i]
+				doc := m.findDoc(e.file)
+				if doc == nil {
+					failed++
+					continue
+				}
+				newContent, ok := applyEditTo(doc.content, e.replace, e.search)
+				if !ok {
+					failed++
+					continue
+				}
+				if err := os.WriteFile(doc.path, []byte(newContent), 0o644); err != nil {
+					failed++
+					continue
+				}
+				doc.content = newContent
+				reverted++
+			}
+			m.lastApplied = nil
+			note := fmt.Sprintf("reverted %d applied edit(s)", reverted)
+			if failed > 0 {
+				note += fmt.Sprintf(" (%d couldn't — text changed)", failed)
+			}
+			m.injectSystemLine(note)
+			pokeChecktime()
+		}
+
 		// Doc mode: hand proposed edits to neovim for review (per file, in
 		// sequence), or fall back to the in-cx y/n flow without the bridge.
 		var reviewCmd tea.Cmd
