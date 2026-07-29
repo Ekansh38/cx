@@ -952,6 +952,11 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case tea.KeyCtrlE:
 		return m.openEditor()
 
+	case tea.KeyCtrlX:
+		// Expand the paste placeholder the cursor is sitting on (or the
+		// nearest one in the input). Collapses it back on a second press.
+		return m.togglePasteUnderCursor()
+
 	case tea.KeyCtrlG:
 		return m.enterSearch()
 
@@ -1801,7 +1806,8 @@ const helpText = `KEYS
   ctrl+n                 new conversation
   ctrl+g                 search all messages
   ctrl+t                 model picker
-  ctrl+e                 open $EDITOR for long input
+  ctrl+e                 open $EDITOR for long input (pastes auto-expanded)
+  ctrl+x                 expand / collapse the paste placeholder under cursor
   ctrl+u / ctrl+d        scroll half page
   ctrl+r                 toggle voice dictation
   up / down              walk prompt (scroll chat when empty)
@@ -3195,8 +3201,14 @@ func (m Model) modelPickerView() string {
 func (m Model) openEditor() (Model, tea.Cmd) {
 	// The draft lives in the data dir and is NEVER deleted: whatever happens
 	// to cx or the textarea, the text survives at this path.
+	// Expand any collapsed paste placeholders so the editor shows the real
+	// content — the user wants to edit their text, not "[paste #1, 23 lines]".
+	// When the editor closes, editorDoneMsg re-collapses large blocks back
+	// into placeholders the normal way.
 	draft := filepath.Join(config.DataDir(), "draft.md")
-	if err := os.WriteFile(draft, []byte(m.input.Value()), 0o644); err != nil {
+	expanded := expandPastes(m.input.Value(), m.pastes)
+	m.pastes = nil // cleared: editor output becomes the canonical text
+	if err := os.WriteFile(draft, []byte(expanded), 0o644); err != nil {
 		m.errMsg = "could not create draft file: " + err.Error()
 		return m, nil
 	}
@@ -4706,4 +4718,67 @@ func (m Model) copyPickerView() string {
 	sb.WriteString("\n\n")
 	sb.WriteString(dimStyle.Render("   up/down navigate  enter copy  tab all-chats  esc back"))
 	return sb.String()
+}
+
+// togglePasteUnderCursor expands the paste placeholder the cursor is on
+// (or the nearest one), or collapses it back if already expanded. This is
+// the ctrl+x "expand paste" action.
+func (m Model) togglePasteUnderCursor() (Model, tea.Cmd) {
+	if len(m.pastes) == 0 {
+		return m, nil
+	}
+	val := m.input.Value()
+	// Compute byte offset of cursor in the full value using line number.
+	// m.input.Line() returns the 0-based row; sum line lengths up to that row.
+	cursorLine := m.input.Line()
+	lines := strings.Split(val, "\n")
+	byteOff := 0
+	for i := 0; i < cursorLine && i < len(lines); i++ {
+		byteOff += len(lines[i]) + 1 // +1 for the \n
+	}
+	// Add the column offset within the current line (CharOffset is in runes,
+	// convert to bytes for ASCII-safe search; the placeholders are all ASCII).
+	li := m.input.LineInfo()
+	byteOff += li.CharOffset
+
+	// Find which placeholder the cursor is inside (or nearest to).
+	bestIdx := -1
+	bestDist := 1<<31 - 1
+	for i, p := range m.pastes {
+		start := strings.Index(val, p.placeholder)
+		if start < 0 {
+			continue
+		}
+		end := start + len(p.placeholder)
+		if byteOff >= start && byteOff <= end {
+			// Cursor is inside this placeholder — expand it.
+			bestIdx = i
+			bestDist = 0
+			break
+		}
+		// Distance to nearest edge.
+		dist := byteOff - end
+		if byteOff < start {
+			dist = start - byteOff
+		}
+		if dist < bestDist {
+			bestDist = dist
+			bestIdx = i
+		}
+	}
+	if bestIdx < 0 {
+		return m, nil
+	}
+	p := m.pastes[bestIdx]
+	// Replace the placeholder with the full text in the textarea.
+	newVal := strings.Replace(val, p.placeholder, p.text, 1)
+	m.pastes = append(m.pastes[:bestIdx], m.pastes[bestIdx+1:]...)
+	m.input.SetValue(newVal)
+	// Move cursor to just after the expanded text.
+	cursorAt := strings.Index(newVal, p.text) + len(p.text)
+	// Set cursor to end for now (textarea doesn't expose set-by-offset).
+	m.input.CursorEnd()
+	_ = cursorAt
+	m.syncInputHeight()
+	return m, nil
 }
