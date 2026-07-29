@@ -23,7 +23,15 @@ func webTools() []llm.Tool {
 	return []llm.Tool{
 		{
 			Name:        "discard_pending_edits",
-			Description: "Discard EVERY edit currently under review (in the user's editor) and any queued behind it. NARROW USE: only when the user explicitly asks to cancel, undo, or forget the pending proposals — 'cancel these', 'never mind', 'discard those', 'let's abandon this and just discuss', 'wait, I want to talk about something else first'. Do NOT call this when the user wants MORE edits, DIFFERENT edits, ADDITIONAL edits (including edits that remove content from the doc, e.g. 'also remove X' or 'trim these too'), or when they're asking a question about the doc while still expecting the review to continue. In those cases just emit the new SEARCH/REPLACE edit blocks — cx will INJECT them into the running review alongside the existing pending ones, no discard needed. After discarding, respond in prose only; do NOT propose new edits in the same response.",
+			Description: "Discard edits that are STILL PENDING under review (not yet applied). Use only when the user explicitly cancels — 'never mind', 'cancel those', 'let's not change anything'. Do NOT call this when edits have already been applied (you'll see 'applied N/N edits' in the transcript) — those are already in the file and need undo_last_review, not discard. Do NOT call this when the user wants more or different edits; just propose new blocks instead.",
+			Parameters: map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+		},
+		{
+			Name:        "undo_last_review",
+			Description: "Revert ALL edits that were applied during the PREVIOUS review — i.e. edits that are already IN the file (you'll see 'applied N/N edits' in the transcript). Use when the user asks to undo, revert, or take back changes after a review has finished: 'undo that', 'revert those changes', 'i didn't get to review it', 'go back'. This is the correct tool when edits were already applied; discard_pending_edits cannot reach already-applied edits.",
 			Parameters: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
@@ -98,6 +106,10 @@ func webTools() []llm.Tool {
 // transcript) and the result text handed back to the model.
 func execWebTool(ctx context.Context, cfg *config.Config, call llm.ToolCall) (status, result string) {
 	switch call.Name {
+	case "undo_last_review":
+		RequestReviewUndo()
+		return "reverting applied edits", "OK, queued an undo of the last applied review. The file will be reverted on the next tick."
+
 	case "discard_pending_edits":
 		RequestReviewDiscard()
 		return "discarding pending edits", "OK, discarded every pending edit. The user's editor is clean."

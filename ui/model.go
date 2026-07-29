@@ -366,6 +366,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.injectSystemLine("discarded pending edits (via cx)")
 			return m, nil
 		}
+		if consumeReviewUndo() {
+			// Same logic as /undo — revert the last-applied review.
+			if len(m.lastApplied) == 0 {
+				m.injectSystemLine("nothing to undo")
+			} else {
+				m.reloadDocs()
+				reverted, failed := 0, 0
+				for i := len(m.lastApplied) - 1; i >= 0; i-- {
+					e := m.lastApplied[i]
+					doc := m.findDoc(e.file)
+					if doc == nil {
+						failed++
+						continue
+					}
+					newContent, ok := applyEditTo(doc.content, e.replace, e.search)
+					if !ok {
+						failed++
+						continue
+					}
+					if err := os.WriteFile(doc.path, []byte(newContent), 0o644); err != nil {
+						failed++
+						continue
+					}
+					doc.content = newContent
+					reverted++
+				}
+				pokeChecktime()
+				m.lastApplied = nil
+				note := fmt.Sprintf("reverted %d applied edit(s) (via model tool)", reverted)
+				if failed > 0 {
+					note += fmt.Sprintf("; %d couldn't be reverted (text changed)", failed)
+				}
+				m.injectSystemLine(note)
+			}
+			return m, nil
+		}
 		if len(m.extGroups) == 0 {
 			return m, nil
 		}
