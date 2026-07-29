@@ -392,13 +392,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					doc.content = newContent
 					reverted++
 				}
-				pokeChecktime()
 				m.lastApplied = nil
 				note := fmt.Sprintf("reverted %d applied edit(s) (via model tool)", reverted)
 				if failed > 0 {
 					note += fmt.Sprintf("; %d couldn't be reverted (text changed)", failed)
 				}
 				m.injectSystemLine(note)
+				pokeChecktime() // tell nvim to reload the file from disk
 			}
 			return m, nil
 		}
