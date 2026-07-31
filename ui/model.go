@@ -497,17 +497,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.extNotes = nil
 		m.extRetry = false
 		if retry {
-			// Inject the CURRENT file content directly into the retry note.
-			// "re-read the content above" doesn't work: the LLM payload was
-			// already built with the pre-edit snapshot. After edit 1 applies
-			// and shifts lines, edits 2-4 anchor against old text → all fail
-			// → infinite loop. Pasting the live file content here means the
-			// retry stream sees what's actually on disk right now.
+			// Inject the CURRENT file content directly into the retry note so
+			// the model anchors its revised edits against what's actually on
+			// disk now. Also summarise which edits from the last batch were
+			// already applied so the model doesn't re-propose them.
+			var alreadyApplied []string
+			for i, r := range results {
+				if r.Applied && i < len(g.edits) {
+					alreadyApplied = append(alreadyApplied, fmt.Sprintf("%q", clip(g.edits[i].search, 60)))
+				}
+			}
 			var freshDocs strings.Builder
 			for _, d := range m.docs {
 				data, err := os.ReadFile(d.path)
 				if err == nil {
-					d.content = string(data) // sync m.docs so buildLLMMessages also sees fresh
+					d.content = string(data)
 					fmt.Fprintf(&freshDocs, "\nCurrent content of %s (line numbers for reference):\n<document>\n", d.path)
 					for i, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
 						fmt.Fprintf(&freshDocs, "%d│%s\n", i+1, ln)
@@ -515,7 +519,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					freshDocs.WriteString("</document>\n")
 				}
 			}
-			note += ". One or more edits could not be located — the document changed after earlier edits were applied. Revise the unlocated edits anchored against the CURRENT document content shown below.\n" + freshDocs.String()
+			skipNote := ""
+			if len(alreadyApplied) > 0 {
+				skipNote = fmt.Sprintf(" The following edits were already applied and must NOT be re-proposed: %s.", strings.Join(alreadyApplied, ", "))
+			}
+			note += fmt.Sprintf(". %d edit(s) could not be located in the current document.%s Re-propose ONLY the unlocated edits anchored against the CURRENT document content shown below.\n%s", len(results)-len(alreadyApplied)-func() int {
+				n := 0
+				for _, r := range results {
+					if !r.Applied && r.Reason == "" {
+						n++ // explicitly skipped
+					}
+				}
+				return n
+			}(), skipNote, freshDocs.String())
 		}
 		if saved, err := m.store.AddMessage(m.conv.ID, "note", note); err == nil {
 			m.messages = append(m.messages, saved)
