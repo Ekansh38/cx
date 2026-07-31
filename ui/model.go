@@ -456,11 +456,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.reloadDocs() // neovim wrote the file
 
-		// Retry once all groups are reviewed when a rejection carried a note
-		// (unless it already fired via reject-now) or an edit failed to
-		// locate, which means the model anchored on stale text.
+		// Retry when an edit could not be located (stale anchor after a
+		// previous edit shifted lines). Do NOT retry when the user
+		// explicitly skipped hunks via q/n — those are intentional.
+		// A skip has Reason="" and Applied=false; notfound has
+		// Reason="not found in buffer". Only retry for notfound.
 		for _, r := range results {
-			if !r.Applied && !r.Reported && r.Reason != "" {
+			if !r.Applied && !r.Reported && r.Reason == "not found in buffer" {
 				m.extRetry = true
 			}
 		}
@@ -495,7 +497,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.extNotes = nil
 		m.extRetry = false
 		if retry {
-			note += ". Revise the rejected or unlocated edits: re-read the current document content above, anchor on text that exists NOW, and propose updated <edit> blocks."
+			// Inject the CURRENT file content directly into the retry note.
+			// "re-read the content above" doesn't work: the LLM payload was
+			// already built with the pre-edit snapshot. After edit 1 applies
+			// and shifts lines, edits 2-4 anchor against old text → all fail
+			// → infinite loop. Pasting the live file content here means the
+			// retry stream sees what's actually on disk right now.
+			var freshDocs strings.Builder
+			for _, d := range m.docs {
+				data, err := os.ReadFile(d.path)
+				if err == nil {
+					d.content = string(data) // sync m.docs so buildLLMMessages also sees fresh
+					fmt.Fprintf(&freshDocs, "\nCurrent content of %s (line numbers for reference):\n<document>\n", d.path)
+					for i, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+						fmt.Fprintf(&freshDocs, "%d│%s\n", i+1, ln)
+					}
+					freshDocs.WriteString("</document>\n")
+				}
+			}
+			note += ". One or more edits could not be located — the document changed after earlier edits were applied. Revise the unlocated edits anchored against the CURRENT document content shown below.\n" + freshDocs.String()
 		}
 		if saved, err := m.store.AddMessage(m.conv.ID, "note", note); err == nil {
 			m.messages = append(m.messages, saved)
