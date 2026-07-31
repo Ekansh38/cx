@@ -983,6 +983,18 @@ func stripEditBlocks(s string) string {
 		n++
 		s = s[:start] + fmt.Sprintf("*[bare edit block %d dropped — no doc connected]*", n) + s[start+endRel+len(endMarker):]
 	}
+	// Final pass: strip any orphaned conflict-marker tokens that survived the
+	// above (e.g. a lone `>>>>>>> REPLACE` without a preceding `<<<<<<< SEARCH`,
+	// or a dangling `</edit>`). These happen when the model formats one big
+	// edit block but the SEARCH portion was already consumed, leaving the
+	// REPLACE line and closing tag exposed. They render as garbage.
+	s = strings.ReplaceAll(s, ">>>>>>> REPLACE", "")
+	s = strings.ReplaceAll(s, "</edit>", "")
+	s = strings.ReplaceAll(s, "======= ", "")
+	// Collapse multiple blank lines that the above removals can leave behind.
+	for strings.Contains(s, "\n\n\n") {
+		s = strings.ReplaceAll(s, "\n\n\n", "\n\n")
+	}
 	return s
 }
 
