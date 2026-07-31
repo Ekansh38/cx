@@ -456,15 +456,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.reloadDocs() // neovim wrote the file
 
-		// Retry when an edit could not be located (stale anchor after a
-		// previous edit shifted lines). Do NOT retry when the user
-		// explicitly skipped hunks via q/n — those are intentional.
-		// A skip has Reason="" and Applied=false; notfound has
-		// Reason="not found in buffer". Only retry for notfound.
+		// Count notfound vs applied vs skipped so we can show a clear
+		// cx-pane note BEFORE the retry — the nvim notify is easy to miss.
+		var nfCount, appliedCount int
 		for _, r := range results {
-			if !r.Applied && !r.Reported && r.Reason == "not found in buffer" {
+			switch {
+			case r.Applied:
+				appliedCount++
+			case r.Reason == "not found in buffer":
+				nfCount++
 				m.extRetry = true
 			}
+		}
+		// Visible cx-side system line when some edits couldn't be located.
+		// The nvim notify is inside the editor which the user may not be
+		// watching; this keeps them informed in the cx pane.
+		if nfCount > 0 && appliedCount > 0 {
+			m.injectSystemLine(fmt.Sprintf("%d of %d edits couldn't be located in the file (not shown in nvim) — cx will re-propose them", nfCount, len(results)))
+		} else if nfCount > 0 {
+			// 0 applied, all notfound — the silent retry case. Shown by the
+			// retry note already, but surface it here too so the user knows
+			// why the chat appears to hang.
+			m.injectSystemLine(fmt.Sprintf("none of the %d edits could be located — cx is re-proposing with fresh anchors", len(results)))
 		}
 		g := m.extGroups[0]
 		m.extGroups = m.extGroups[1:]
