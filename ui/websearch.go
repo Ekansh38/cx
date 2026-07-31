@@ -39,7 +39,7 @@ func webTools() []llm.Tool {
 		},
 		{
 			Name:        "apply_all_pending_edits",
-			Description: "Apply every edit currently under review at once. Use only when the user has clearly approved everything ('apply all', 'looks good, do it', 'yes to all').",
+			Description: "ONLY FOR ACTIVE REVIEWS: Accept every hunk currently shown in the user's neovim review buffer. This only works when a review is already on screen — it does NOT propose or create new edits. Use only when the user has clearly approved everything already under review ('apply all', 'looks good, do it', 'yes to all').",
 			Parameters: map[string]any{
 				"type":       "object",
 				"properties": map[string]any{},
@@ -47,13 +47,13 @@ func webTools() []llm.Tool {
 		},
 		{
 			Name:        "apply_pending_edit",
-			Description: "Apply ONE specific pending edit by its 1-based number (the same number shown in the neovim review footer 'cx X/N'). Use when the user says 'yes to edit 3', 'accept that one', 'apply the Backlog change', etc. — you decide which index they mean based on context.",
+			Description: "ONLY FOR ACTIVE REVIEWS: Accept one specific hunk by its 1-based number from the current neovim review buffer (the same number shown in the footer 'cx X/N'). This only works when a review is already on screen — it does NOT propose or create new edits. Do NOT call this to 'apply' edits you just wrote in the same response — those become pending via the <edit> blocks you emit, not via this tool. Use only when the user says 'yes to edit 3', 'accept that one', 'apply the Backlog change' while a review is open.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"index": map[string]any{
 						"type":        "integer",
-						"description": "1-based edit number",
+						"description": "1-based edit number shown in the neovim footer",
 					},
 				},
 				"required": []string{"index"},
@@ -61,11 +61,11 @@ func webTools() []llm.Tool {
 		},
 		{
 			Name:        "reject_pending_edit",
-			Description: "Reject ONE specific pending edit by its 1-based number, with an optional reason. If a reason is given, cx sends it back to you so you can propose a revised edit in the same response. Use for 'no not that one', 'skip edit 4', 'reject the OSTEP change because ...'.",
+			Description: "ONLY FOR ACTIVE REVIEWS: Reject one specific hunk by its 1-based number from the current neovim review buffer, with an optional reason. If a reason is given, cx sends it back so you can propose a revised edit. Use for 'no not that one', 'skip edit 4', 'reject the OSTEP change because ...' while a review is open.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"index":  map[string]any{"type": "integer", "description": "1-based edit number"},
+					"index":  map[string]any{"type": "integer", "description": "1-based edit number shown in the neovim footer"},
 					"reason": map[string]any{"type": "string", "description": "why (optional)"},
 				},
 				"required": []string{"index"},
@@ -126,7 +126,7 @@ func execWebTool(ctx context.Context, cfg *config.Config, call llm.ToolCall) (st
 			return "applying edit", "error: apply_pending_edit needs a positive 1-based index"
 		}
 		if !applyPendingEditByIndex(args.Index) {
-			return fmt.Sprintf("applying edit %d", args.Index), fmt.Sprintf("could not reach neovim to apply edit %d", args.Index)
+			return fmt.Sprintf("applying edit %d", args.Index), fmt.Sprintf("ERROR: no active neovim review — apply_pending_edit only works while a review is open in the editor. To make changes to the document, emit <edit> SEARCH/REPLACE blocks in your response instead of calling this tool.")
 		}
 		return fmt.Sprintf("applying edit %d", args.Index), fmt.Sprintf("OK, applied edit %d.", args.Index)
 
@@ -139,7 +139,7 @@ func execWebTool(ctx context.Context, cfg *config.Config, call llm.ToolCall) (st
 			return "rejecting edit", "error: reject_pending_edit needs a positive 1-based index"
 		}
 		if !rejectPendingEditByIndex(args.Index, args.Reason) {
-			return fmt.Sprintf("rejecting edit %d", args.Index), fmt.Sprintf("could not reach neovim to reject edit %d", args.Index)
+			return fmt.Sprintf("rejecting edit %d", args.Index), fmt.Sprintf("ERROR: no active neovim review — reject_pending_edit only works while a review is open in the editor.")
 		}
 		note := fmt.Sprintf("OK, rejected edit %d", args.Index)
 		if args.Reason != "" {
