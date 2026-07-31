@@ -2789,9 +2789,21 @@ func (m Model) startCompaction() (Model, tea.Cmd) {
 	}
 	oldText := sb.String()
 
-	// Use the MAIN model for compaction (quality matters)
-	prov := m.provider
-	model := m.model
+	// Use memory_model for compaction — same cheap model used for curation.
+	// Using the main (expensive) model to summarise old turns burns real
+	// money on low-value work; the memory model is fast and cheap.
+	compactModel := m.cfg.MemoryModel
+	if compactModel == "" {
+		compactModel = "google/gemini-2.5-flash"
+	}
+	compactProv, err := llm.ForModel(compactModel, m.cfg)
+	if err != nil {
+		// Fall back to main provider if the cheap model isn't configured.
+		compactProv = m.provider
+		compactModel = m.model
+	}
+	prov := compactProv
+	model := compactModel
 	convID := m.conv.ID
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	m.cancelStream = cancel // ctrl+c / /stop / switching aborts compaction too
