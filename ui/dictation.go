@@ -177,6 +177,22 @@ func sampleWaveform(sess *dictationSession) {
 // the pipeline can reach it without threading state.
 var currentDictation *dictationSession
 
+// transcribeCancel aborts the in-flight transcription (ctrl+c). Set by
+// transcribeWAV while it runs, cleared when it returns. Same global pattern
+// as currentDictation: one transcription at a time by construction.
+var transcribeCancel context.CancelFunc
+
+// cancelTranscription aborts the in-flight transcription, if any. The
+// interrupted transcribeWAV still delivers a dictationDoneMsg (with the WAV
+// kept for /retry-voice), so callers only need to fire this and wait.
+func cancelTranscription() bool {
+	if c := transcribeCancel; c != nil {
+		c()
+		return true
+	}
+	return false
+}
+
 // dictationElapsed returns "MM:SS" since the current recording started,
 // or "" when nothing's recording.
 func dictationElapsed() string {
@@ -191,8 +207,9 @@ func dictationElapsed() string {
 type (
 	dictationStartedMsg struct{ err error }
 	dictationDoneMsg    struct {
-		text string
-		err  error
+		text    string
+		err     error
+		wavPath string // non-empty on transcription failure: saved for /retry-voice
 	}
 	// dictationTickMsg fires every ~500ms while recording so the status bar
 	// can show elapsed time (see statusView / model.go).
@@ -252,7 +269,8 @@ func startDictationCmd(_ *config.Config) tea.Cmd {
 
 // stopDictationCmd returns a tea.Cmd that stops the active recording,
 // transcribes it, cleans it up, and delivers the final text back to the
-// model via dictationDoneMsg.
+// model via dictationDoneMsg. On transcription failure the WAV is kept and
+// its path is returned in dictationDoneMsg.wavPath so /retry-voice can reuse it.
 func stopDictationCmd(cfg *config.Config) tea.Cmd {
 	return func() tea.Msg {
 		sess := currentDictation
@@ -276,56 +294,102 @@ func stopDictationCmd(cfg *config.Config) tea.Cmd {
 			_ = sess.cmd.Process.Kill()
 			<-done
 		}
-		defer os.Remove(sess.wavPath)
 
 		fi, err := os.Stat(sess.wavPath)
 		if err != nil {
+			os.Remove(sess.wavPath)
 			return dictationDoneMsg{err: fmt.Errorf("recording missing: %w (ffmpeg stderr: %s)", err, strings.TrimSpace(sess.stderr.String()))}
 		}
 		if fi.Size() < 4000 {
-			// Too short to contain audible speech; likely the user tapped
-			// ctrl+r twice by accident. Fail quietly instead of paying for
-			// an empty transcription.
+			os.Remove(sess.wavPath)
 			return dictationDoneMsg{err: errors.New("recording too short — hold the mic key longer")}
 		}
-		// audioBytes is 16 kHz mono S16 PCM = 32,000 bytes/sec. So a 3-second
-		// recording is ~96 KB. Below ~2s of net audio we consider it
-		// "short" and apply the hallucination filter below.
-		wavShort := fi.Size() < 64_000
-
-		key := cfg.Groq.APIKey
-		if key == "" {
-			return dictationDoneMsg{err: errors.New("groq api key missing — set groq.api_key in config.toml or export GROQ_API_KEY")}
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-
-		raw, err := transcribeGroq(ctx, sess.wavPath, key)
-		if err != nil {
-			return dictationDoneMsg{err: fmt.Errorf("transcribe: %w", err)}
-		}
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			return dictationDoneMsg{err: errors.New("empty transcript")}
-		}
-		if wavShort && isWhisperHallucination(raw) {
-			// Silence into whisper reliably comes back as "Thank you." /
-			// "Thanks for watching." / etc. Drop those on short recordings
-			// so you can ctrl+r-twice-by-accident without garbage landing
-			// in your prompt.
-			return dictationDoneMsg{err: errors.New("nothing heard — silence hallucination filtered")}
-		}
-
-		clean, err := cleanupTranscript(ctx, cfg, raw)
-		if err != nil || strings.TrimSpace(clean) == "" {
-			// Cleanup failure isn't fatal — return the raw transcript so the
-			// user still gets their words back. A malformed cleanup that
-			// swallows the input is worse than raw text.
-			return dictationDoneMsg{text: raw}
-		}
-		return dictationDoneMsg{text: strings.TrimSpace(clean)}
+		return transcribeWAV(sess.wavPath, cfg)
 	}
+}
+
+// cancelDictationCmd aborts an active recording without transcribing:
+// ffmpeg is stopped and the WAV discarded. Used by ctrl+c while recording —
+// quitting cx there would orphan ffmpeg until the 5-minute cap.
+func cancelDictationCmd() tea.Cmd {
+	return func() tea.Msg {
+		sess := currentDictation
+		currentDictation = nil
+		if sess == nil {
+			return nil
+		}
+		if sess.cmd.Process != nil {
+			_ = sess.cmd.Process.Signal(os.Interrupt)
+		}
+		done := make(chan error, 1)
+		go func() { done <- sess.cmd.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			_ = sess.cmd.Process.Kill()
+			<-done
+		}
+		os.Remove(sess.wavPath)
+		return nil
+	}
+}
+
+// retryVoiceCmd re-transcribes a previously saved WAV (left on disk after a
+// failed stopDictationCmd). On success the WAV is deleted; on failure it is
+// kept so the user can /retry-voice again.
+func retryVoiceCmd(wavPath string, cfg *config.Config) tea.Cmd {
+	return func() tea.Msg {
+		if _, err := os.Stat(wavPath); err != nil {
+			return dictationDoneMsg{err: fmt.Errorf("saved recording not found: %w", err)}
+		}
+		return transcribeWAV(wavPath, cfg)
+	}
+}
+
+// transcribeWAV runs Groq whisper + LLM cleanup on wavPath. On success it
+// removes the file; on transcription failure it keeps it and returns the path
+// in dictationDoneMsg.wavPath so the caller can offer /retry-voice.
+func transcribeWAV(wavPath string, cfg *config.Config) dictationDoneMsg {
+	fi, _ := os.Stat(wavPath)
+	// audioBytes is 16 kHz mono S16 PCM = 32,000 bytes/sec. Below ~2s of net
+	// audio we apply the hallucination filter.
+	wavShort := fi != nil && fi.Size() < 64_000
+
+	key := cfg.Groq.APIKey
+	if key == "" {
+		os.Remove(wavPath)
+		return dictationDoneMsg{err: errors.New("groq api key missing — set groq.api_key in config.toml or export GROQ_API_KEY")}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	transcribeCancel = cancel
+	defer func() { transcribeCancel = nil; cancel() }()
+
+	raw, err := transcribeGroq(ctx, wavPath, key)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			// ctrl+c — keep the WAV so /retry-voice can pick it up.
+			return dictationDoneMsg{err: errors.New("cancelled"), wavPath: wavPath}
+		}
+		// Keep the WAV — network/VPN failure is transient; /retry-voice can reuse it.
+		return dictationDoneMsg{err: fmt.Errorf("transcribe: %w", err), wavPath: wavPath}
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		os.Remove(wavPath)
+		return dictationDoneMsg{err: errors.New("empty transcript")}
+	}
+	if wavShort && isWhisperHallucination(raw) {
+		os.Remove(wavPath)
+		return dictationDoneMsg{err: errors.New("nothing heard — silence hallucination filtered")}
+	}
+
+	clean, err := cleanupTranscript(ctx, cfg, raw)
+	os.Remove(wavPath)
+	if err != nil || strings.TrimSpace(clean) == "" {
+		return dictationDoneMsg{text: raw}
+	}
+	return dictationDoneMsg{text: strings.TrimSpace(clean)}
 }
 
 // whisperHallucinations catches the well-known set of phrases the Whisper
@@ -578,7 +642,7 @@ func (m Model) dictationBannerView() string {
 		}
 		spin := string(brailleSpinner(m.dictationFrame))
 		label := fmt.Sprintf("%s  REC  %s", spin, elapsed)
-		hint := "ctrl+r to stop"
+		hint := "ctrl+r stop · ctrl+c discard"
 		labelStyled := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")).Render(label)
 		hintStyled := bannerDimStyle.Render(hint)
 		// Compose header row: label on left, hint on right, pad in between
@@ -601,7 +665,7 @@ func (m Model) dictationBannerView() string {
 	// Busy / transcribing
 	spin := string(brailleSpinner(m.dictationFrame))
 	label := fmt.Sprintf("%s  TRANSCRIBING%s", spin, transcribeDots(m.dictationFrame))
-	hint := "cleaning up + custom vocab…"
+	hint := "ctrl+c to cancel"
 	labelStyled := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Render(label)
 	hintStyled := bannerDimStyle.Render(hint)
 	headerW := lipgloss.Width(labelStyled) + lipgloss.Width(hintStyled)

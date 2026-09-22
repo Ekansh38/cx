@@ -109,7 +109,7 @@ var commands = []string{
 	"/edit", "/forget ", "/grep", "/help", "/img ",
 	"/list", "/mem", "/mem list", "/mem off ", "/memory", "/model ", "/models", "/new",
 	"/paste", "/quit", "/r", "/remember ",
-	"/rename ", "/retry", "/sel", "/stop", "/tokens", "/undo",
+	"/rename ", "/retry", "/retry-voice", "/sel", "/stop", "/tokens", "/undo",
 	"/vocab", "/vocab add ", "/vocab remove ",
 	"/web", "/wipe",
 }
@@ -171,8 +171,9 @@ type Model struct {
 	extGroups   []editGroup   // per-file edit batches queued for in-editor review
 	extNotes    []string      // per-file review summaries accumulated across groups
 	extRetry    bool          // a rejection carried a note: auto-retry when done
-	lastApplied []docEdit     // applied edits of the last finished review, for /undo
-	pendingSel  *docSelection // editor highlight riding along the next message
+	lastApplied  []docEdit        // applied edits of the last finished review, for /undo
+	docLastSent  map[string]string // path → content sent in the previous turn, for change-diff
+	pendingSel   *docSelection    // editor highlight riding along the next message
 	curating    bool          // a memory-curation request is in flight
 	memPending  []int64       // IDs of assistant turns awaiting memory curation
 	lastCurated int64         // newest assistant msg ID the memory model has seen (per conv)
@@ -214,9 +215,10 @@ type Model struct {
 	webSearch    bool // web tools offered to the model (default on; /web toggles)
 
 	// voice dictation state (ctrl+r)
-	dictating      bool
-	dictationBusy  bool // between stop and text-in-box: transcription/cleanup in flight
-	dictationFrame int  // monotonic tick counter for the banner animation
+	dictating          bool
+	dictationBusy      bool   // between stop and text-in-box: transcription/cleanup in flight
+	dictationFrame     int    // monotonic tick counter for the banner animation
+	dictationRetryPath string // WAV saved on transcription failure; /retry-voice retries it
 
 	// incognito mode (cx incognito): no memory injection, no external
 	// memory, no memory curation, no /remember. Conversation is deleted
@@ -338,10 +340,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.dictationBusy = false
 		if msg.err != nil {
 			playSound(soundError)
-			m.errMsg = "dictation: " + msg.err.Error()
+			errText := "dictation: " + msg.err.Error()
+			if msg.wavPath != "" {
+				m.dictationRetryPath = msg.wavPath
+				errText += " — /retry-voice to retry"
+			}
+			m.errMsg = errText
 			m.syncInputHeight() // banner gone, viewport reclaims rows
 			return m, nil
 		}
+		m.dictationRetryPath = "" // success: discard any saved retry
 		playSound(soundTextReady)
 		m.syncInputHeight()
 		// Splice the transcribed text at the cursor position in the input
@@ -497,10 +505,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.extGroups = nil
 		}
 
-		// Sweep any reject events that raced the final results
+		// Sweep any reject events that raced the final results. These carry
+		// the SEARCH text of the edit that was rejected; check against the
+		// COMPLETED group (g), not the remaining m.extGroups — after the
+		// m.extGroups[1:] shift above those edits are no longer in the slice.
 		for _, ev := range consumeRejectNow() {
-			if !isKnownEditSearch(m.extGroups, ev.Search) {
-				continue // stale event from a previous session
+			found := false
+			for _, e := range g.edits {
+				if e.search == ev.Search {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue // stale event from a previous or different review
 			}
 			m.extNotes = append(m.extNotes, fmt.Sprintf("edit rejected: %q", ev.Reason))
 			m.extRetry = true
@@ -536,15 +554,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if len(alreadyApplied) > 0 {
 				skipNote = fmt.Sprintf(" The following edits were already applied and must NOT be re-proposed: %s.", strings.Join(alreadyApplied, ", "))
 			}
-			note += fmt.Sprintf(". %d edit(s) could not be located in the current document.%s Re-propose ONLY the unlocated edits anchored against the CURRENT document content shown below.\n%s", len(results)-len(alreadyApplied)-func() int {
-				n := 0
-				for _, r := range results {
-					if !r.Applied && r.Reason == "" {
-						n++ // explicitly skipped
-					}
-				}
-				return n
-			}(), skipNote, freshDocs.String())
+			note += fmt.Sprintf(". %d edit(s) could not be located in the current document.%s Re-propose ONLY the unlocated edits anchored against the CURRENT document content shown below.\n%s",
+				nfCount, skipNote, freshDocs.String())
 		}
 		if saved, err := m.store.AddMessage(m.conv.ID, "note", note); err == nil {
 			m.messages = append(m.messages, saved)
@@ -689,17 +700,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// review, no queueing behind unfinished decisions, no user
 				// waiting to finish before the fix appears.
 				groups := groupEditsByFile(edits)
-				injected := 0
 				for _, g := range groups {
 					if appendExternalReview(g.file, g.edits) {
-						m.extGroups[len(m.extGroups)-1].edits = append(m.extGroups[len(m.extGroups)-1].edits, g.edits...)
-						injected += len(g.edits)
+						// Track injected edits in extGroups[0] — the active
+						// group whose results we'll read when the review ends.
+						// Using the last group was wrong: results are indexed
+						// against extGroups[0].edits, so injected edits beyond
+						// the original count would be silently skipped in the
+						// lastApplied tracking and /undo couldn't revert them.
+						m.extGroups[0].edits = append(m.extGroups[0].edits, g.edits...)
+					} else {
+						// Per-group fallback: only queue the groups that
+						// couldn't be injected. The all-or-nothing check
+						// (injected == 0) was silently dropping groups whose
+						// peers succeeded.
+						m.extGroups = append(m.extGroups, g)
 					}
-				}
-				if injected == 0 {
-					// Append failed (bridge down mid-session): fall back to
-					// the old queue path so the retry isn't lost entirely.
-					m.extGroups = append(m.extGroups, groups...)
 				}
 				reviewCmd = extReviewTick(0)
 			} else if len(edits) > 0 {
@@ -964,6 +980,21 @@ func (m Model) updateChat(msg tea.KeyMsg) (Model, tea.Cmd) {
 	switch msg.Type {
 
 	case tea.KeyCtrlC:
+		if m.dictationBusy {
+			// Abort the in-flight transcription instead of quitting cx.
+			// transcribeWAV keeps the WAV and delivers a dictationDoneMsg
+			// ("cancelled — /retry-voice to retry"), so nothing else to do.
+			cancelTranscription()
+			return m, nil
+		}
+		if m.dictating {
+			// Discard the recording entirely — ctrl+r is stop-and-transcribe,
+			// ctrl+c is never-mind. Quitting here would orphan ffmpeg.
+			m.dictating = false
+			m.errMsg = "recording discarded"
+			m.syncInputHeight()
+			return m, cancelDictationCmd()
+		}
 		if m.streaming {
 			// Keep whatever was streamed so far
 			partial := m.streamBuf.String()
@@ -1255,6 +1286,13 @@ func (m Model) handleInput(input string) (Model, tea.Cmd) {
 	// review round.
 	m.lastApplied = nil
 
+	// Discard any saved retry WAV — the user committed to a new prompt, so
+	// the old recording is no longer needed.
+	if m.dictationRetryPath != "" {
+		os.Remove(m.dictationRetryPath)
+		m.dictationRetryPath = ""
+	}
+
 	// Refresh the cached token count for the status bar's next render, so
 	// it can skip the O(n) walk during streaming.
 	m.primeContextTokens()
@@ -1361,7 +1399,7 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-		msgs := m.buildLLMMessages()
+		msgs, _ := m.buildLLMMessages()
 		var sb strings.Builder
 		fmt.Fprintf(&sb, "── debug: %s ──\n", m.model)
 		fmt.Fprintf(&sb, "── %d messages in payload ──\n\n", len(msgs))
@@ -1604,6 +1642,32 @@ func (m Model) handleCommand(input string) (Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		m.atBottom = true
 		return m.startStream()
+
+	case "/retry-voice":
+		if m.streaming {
+			m.errMsg = "wait for the response to finish (or /stop)"
+			return m, nil
+		}
+		if m.dictating {
+			m.errMsg = "still recording — ctrl+r to stop first"
+			return m, nil
+		}
+		if m.dictationBusy {
+			m.errMsg = "transcription already in progress"
+			return m, nil
+		}
+		if m.dictationRetryPath == "" {
+			m.errMsg = "no saved recording — /retry-voice only works after a failed transcription"
+			return m, nil
+		}
+		m.dictationBusy = true
+		m.dictationFrame = 0
+		m.errMsg = ""
+		m.syncInputHeight()
+		return m, tea.Batch(
+			retryVoiceCmd(m.dictationRetryPath, m.cfg),
+			dictationTick(),
+		)
 
 	case "/img":
 		if m.streaming {
@@ -1885,7 +1949,7 @@ const helpText = `KEYS
   enter                  send
   alt+enter              newline
   esc                    dismiss error banner
-  ctrl+c                 cancel stream / quit
+  ctrl+c                 cancel stream / cancel dictation / quit
   ctrl+l                 conversation picker
   ctrl+n                 new conversation
   ctrl+g                 search all messages
@@ -1941,6 +2005,10 @@ MEMORY
   /mem list              list attached
   /mem off [path]        detach — picker if no path
 
+DICTATION
+  ctrl+r                 start / stop voice recording
+  /retry-voice           re-transcribe last failed recording (VPN/network retry)
+
 DICTATION VOCAB
   /vocab                 show current entries
   /vocab add <hint>      append a line
@@ -1984,12 +2052,13 @@ func (m Model) startStream() (Model, tea.Cmd) {
 	m.streamCh = ch
 	m.streamBuf.Reset()
 
-	msgs := m.buildLLMMessages()
+	msgs, snapshots := m.buildLLMMessages()
+	m.docLastSent = snapshots
 	m.pendingImages = nil // consumed
 	m.pendingFiles = nil  // consumed
 	m.pendingSel = nil    // consumed
 	var tools []llm.Tool
-	if m.webSearch && strings.Contains(m.model, "/") {
+	if m.webSearch && modelSupportsTools(m.model) {
 		tools = webTools()
 	}
 	return m, tea.Batch(
@@ -2014,7 +2083,8 @@ func runAgent(ctx context.Context, prov llm.Provider, model string, msgs []llm.M
 		defer close(ch)
 		var full strings.Builder
 		cappedOut := true
-		for round := 0; round < maxToolRounds; round++ {
+		var searches, fetches, rounds int
+		for round := 0; round < toolRounds(cfg); round++ {
 			content, calls, err := prov.StreamTools(ctx, model, msgs, tools, emit)
 			if err != nil && ctx.Err() == nil {
 				return streamErrMsg{gen: gen, err: err.Error()}
@@ -2023,6 +2093,15 @@ func runAgent(ctx context.Context, prov llm.Provider, model string, msgs []llm.M
 			if len(calls) == 0 || ctx.Err() != nil {
 				cappedOut = false
 				break
+			}
+			rounds++
+			for _, c := range calls {
+				switch c.Name {
+				case "web_search":
+					searches++
+				case "fetch_url":
+					fetches++
+				}
 			}
 			msgs = append(msgs, llm.Message{Role: "assistant", Content: content, ToolCalls: calls})
 			// Run this round's tool calls IN PARALLEL. Wall-clock latency
@@ -2070,6 +2149,14 @@ func runAgent(ctx context.Context, prov llm.Provider, model string, msgs []llm.M
 			}
 			full.WriteString(content)
 		}
+		// Proof-of-work footer: when web tools ran, show what was actually
+		// done so the user can tell a real research pass from a from-memory
+		// answer at a glance.
+		if searches+fetches > 0 {
+			footer := fmt.Sprintf("\n\n*── %d search(es), %d page fetch(es) across %d round(s) ──*", searches, fetches, rounds)
+			emit(footer)
+			full.WriteString(footer)
+		}
 		return streamEndMsg{gen: gen, content: strings.TrimSpace(full.String())}
 	}
 }
@@ -2090,18 +2177,23 @@ func listenToken(ch <-chan string, gen int) tea.Cmd {
 	}
 }
 
-func (m Model) buildLLMMessages() []llm.Message {
+// buildLLMMessages assembles the API payload and returns it alongside a
+// snapshot of each doc's current content (used to diff against next turn).
+func (m Model) buildLLMMessages() ([]llm.Message, map[string]string) {
 	out := []llm.Message{{Role: "system", Content: m.systemPrompt}}
+	snapshots := map[string]string{}
 	// Attach the live documents (read fresh so external edits are picked up)
 	if len(m.docs) > 0 {
 		docs := make([]*attachedDoc, 0, len(m.docs))
 		for _, d := range m.docs {
 			if data, err := os.ReadFile(d.path); err == nil {
-				docs = append(docs, &attachedDoc{path: d.path, content: string(data)})
+				content := string(data)
+				docs = append(docs, &attachedDoc{path: d.path, content: content})
+				snapshots[d.path] = content
 			}
 		}
 		if len(docs) > 0 {
-			out = append(out, llm.Message{Role: "system", Content: docsContextMsg(docs)})
+			out = append(out, llm.Message{Role: "system", Content: docsContextMsg(docs, m.docLastSent)})
 		}
 	}
 	// Editor highlight riding along this turn
@@ -2152,7 +2244,7 @@ func (m Model) buildLLMMessages() []llm.Message {
 		}
 		out = append(out, lm)
 	}
-	return out
+	return out, snapshots
 }
 
 // tokenStatsView renders a breakdown of what's going to the model on the
